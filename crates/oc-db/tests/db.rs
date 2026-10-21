@@ -87,6 +87,24 @@ fn upsert_inserts_then_updates_the_same_path() {
 }
 
 #[test]
+fn all_entries_returns_every_path_ordered() {
+    let db = StatusDb::open_in_memory().unwrap();
+    db.upsert_entry(&NewEntry::new("b.txt", false, EntryState::Synced))
+        .unwrap();
+    db.upsert_entry(&NewEntry::new("a/Dokumente", true, EntryState::Synced))
+        .unwrap();
+    db.upsert_entry(&NewEntry::new("a/a.txt", false, EntryState::Error))
+        .unwrap();
+
+    let all = db.all_entries().unwrap();
+    assert_eq!(all.len(), 3);
+    let paths: Vec<&str> = all.iter().map(|e| e.entry.path.as_str()).collect();
+    assert_eq!(paths, vec!["a/Dokumente", "a/a.txt", "b.txt"]);
+    assert!(all[0].entry.is_dir);
+    assert_eq!(all[2].entry.state, EntryState::Synced);
+}
+
+#[test]
 fn delete_subtree_removes_only_the_prefix_tree() {
     let db = StatusDb::open_in_memory().unwrap();
     for (path, is_dir) in [

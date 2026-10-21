@@ -60,6 +60,65 @@ versioning follows [Semantic Versioning](https://semver.org/).
   Idempotenz, Roundtrips, Subtree-Löschung, Konflikt-Lebenszyklus,
   Statistiken, WAL-Modus.
 
+### Added (Phase 5 — Sync-Engine, `oc-sync`)
+
+- **Drei-Stufen-Vergleich** (`diff`): lokaler Scan vs. Remote-Scan vs.
+  letzter synchronisierter Zustand aus der Statusdatenbank → Aktionsplan
+  (`SyncAction`): Upload mit `If-Match`, Download, Löschung auf die
+  jeweils andere Seite, Löschung-vs.-Änderung als Konflikt, beidseitig
+  neu mit gleicher Größe als `RecordSynced` (Initial-Sync-Heuristik);
+  Ordner werden nur auf Existenz verglichen; Ordner mit konfliktbehafteten
+  Inhalten werden nicht gelöscht.
+- **Initialer Vollsync**: gestaffeltes Remote-Traversal per PROPFIND
+  `Depth: 1` je Ebene (ressourcenschonender als `Depth: infinity`),
+  lokaler Scanner (überspringt Symlinks und `.part`-Tempdateien,
+  legt fehlende Wurzeln an), Aufbau der Datenbank.
+- **Selective Sync** (`Filter`): `include`-Whitelist (Traversal bricht
+  unterhalb nicht enthaltener Ordner ab), `exclude`-Globs je Segment oder
+  Pfad; Filterwechsel entfernt nicht mehr abgedeckte DB-Einträge
+  (lokale Dateien bleiben, GUI-Nachfrage folgt in Phase 7).
+- **Lokale Änderungserkennung** (`watch`): `notify`-Watcher pro Job mit
+  Debouncing (Standard 800 ms), `.part`-Events werden ignoriert;
+  Periodik-Scan (`sync_interval_secs`, Standard 30 s) als Fallback und
+  für Remote-Änderungen.
+- **Remote-Änderungserkennung**: Root-ETag als Shortcut — unveränderter
+  Space-ETag überspringt das Traversal, der Datenbankstand dient als
+  Remote-Snapshot; 404 auf Ordner-PROPFINDs während des Traversals wird
+  toleriert (zwischenzeitlich gelöschte Ordner).
+- **Transfers** (`transfer`): Queue mit `max_parallel_transfers`
+  (Tokio-Semaphore), partielle Downloads per `Range` in Chunks
+  (Standard 8 MiB) mit `.part`-Tempdatei und atomarem Rename;
+  Read-only-Attribute werden beim Überschreiben pro OS behandelt
+  (Unix: nur Owner-Write-Bit, Windows: Read-only-Attribut); PUT ohne
+  ETag in der Antwort löst einen PROPFIND zum Nachlesen aus.
+- **Konflikterkennung** (Auflösung folgt in Phase 6): beidseitig
+  geändert oder Upload mit `If-Match` auf 412 gelaufen → Eintrag in
+  `conflicts` (Status `pending`) + `entries.state = conflict`,
+  betroffene Pfade werden eingefroren und nicht mehr angetastet.
+- **Idempotenz/Absturzsicherheit**: `.part`-Dateien werden zu Beginn
+  jedes Laufs aufgeräumt; DB-Einträge in `uploading`/`downloading`
+  werden beim Start zurückgesetzt und vom Diff neu geplant
+  (Basiswerte bleiben intakt); 404/NotFound bei Löschungen wird als
+  Erfolg gewertet (Elterner bereits gelöscht).
+- **Engine** (`engine`): ein Tokio-Task pro Job, Läufe werden
+  serialisiert; Befehle `Pause`/`Resume` (mit Catch-up-Lauf)/`SyncNow`/
+  `Stop` pro Job, globales `pause_all`/`resume_all`/`stop`; Events
+  (`RunStarted`, `RunFinished` mit Zusammenfassung, `Failed`,
+  `Conflict`, `Stopped`) für GUI und Headless-Modus; StatusDb pro Job
+  hinter `std::sync::Mutex` (Guard nie über `await` gehalten).
+- **Headless-Modus in `oc-app`**: `--headless` lädt `config.json`/
+  `jobs.json`, startet pro aktivem Job die Engine (Token aus Phase 2
+  via Keyring-Refresh), gibt Events auf stdout aus, beendet mit Ctrl-C.
+- `oc-api`: `get_range()` für `Range`-Downloads (inkl. Toleranz für
+  Server, die den Header ignorieren und 200 liefern).
+- Tests (43 neue in `oc-sync`): Engine-Szenarien gegen Mock-WebDAV
+  (`wiremock`) — Initialsync, neue/geänderte/gelöschte Dateien auf
+  beiden Seiten, Ordnerumbenennung, Include-/Exclude-Filter,
+  Filterwechsel, Range-Chunk-Downloads, parallele Transfers,
+  Konflikte (beidseitig + 412), Root-ETag-Shortcut, Absturz-Recovery,
+  Pause/Resume/Stop, Watcher; dazu Unit-Tests für Diff, Scan, Filter,
+  Transfers und zwei `oc-api`-Tests für `get_range`.
+
 ### Added (Phase 2 — Authentifizierung, `oc-auth`)
 
 - OIDC Discovery über `<server>/.well-known/openid-configuration` mit den

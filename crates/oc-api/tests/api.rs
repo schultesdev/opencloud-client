@@ -579,3 +579,36 @@ async fn invalid_paths_are_rejected_before_any_request() {
         .unwrap_err();
     assert!(matches!(err, ApiError::InvalidPath { .. }));
 }
+
+#[tokio::test]
+async fn get_range_sends_bytes_header_and_accepts_partial_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/big.bin"))
+        .and(header("Range", "bytes=0-3"))
+        .respond_with(ResponseTemplate::new(206).set_body_string("abcd"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = dav_client(&server.uri());
+    let response = client.get_range("big.bin", 0, 3).await.expect("range");
+    assert_eq!(response.status().as_u16(), 206);
+    assert_eq!(response.bytes().await.expect("body"), "abcd");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn get_range_tolerates_servers_that_ignore_the_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/big.bin"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("whole file"))
+        .mount(&server)
+        .await;
+
+    let client = dav_client(&server.uri());
+    let response = client.get_range("big.bin", 4, 7).await.expect("range");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.bytes().await.expect("body"), "whole file");
+}

@@ -23,7 +23,7 @@ url = "2"
 dirs = "6"
 tempfile = "3"
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 sha2 = "0.10"
 base64 = "0.22"
@@ -35,6 +35,7 @@ wiremock = "0.6"
 quick-xml = "0.37"
 percent-encoding = "2"
 unicode-normalization = "0.1"
+notify = "8"
 
 # Workspace-internal crates
 oc-config = { version = "0.1.0", path = "crates/oc-config" }

@@ -234,7 +234,7 @@ CREATE TABLE conflicts (
 
 ### Phase 5 — Sync-Engine (`oc-sync`, ca. 1–2 Wochen, Kernstück)
 
-- [ ] **Drei-Stufen-Vergleich** pro Datei (Basis: letzter synchronisierter
+- [x] **Drei-Stufen-Vergleich** pro Datei (Basis: letzter synchronisierter
       Zustand aus DB):
 
 ```
@@ -248,26 +248,26 @@ Remote geändert? = ETag != DB-Werte
    Pfad weg + kein Eintrag in DB-Delete-Log = gelöscht)
 ```
 
-- [ ] **Initialer Vollsync**: rekursives PROPFIND (Depth:1 je Ebene,
+- [x] **Initialer Vollsync**: rekursives PROPFIND (Depth:1 je Ebene,
       ressourcenschonender als Depth:infinity), lokaler Scanner, DB aufbauen.
-- [ ] **Selective Sync**: Traversal bricht unterhalb nicht-`include`ter Ordner
+- [x] **Selective Sync**: Traversal bricht unterhalb nicht-`include`ter Ordner
       ab; `exclude`-Muster beim lokalen Scan und remote-Traversal filtern.
       Wird der Filter geändert → betroffene Pfade aus DB entfernen und lokale
       Dateien optional bereinigen (GUI-Nachfrage).
-- [ ] **Lokale Änderungserkennung**: `notify`-Watcher pro Job + Debouncing;
+- [x] **Lokale Änderungserkennung**: `notify`-Watcher pro Job + Debouncing;
       zusätzlicher Periodik-Scan (`sync_interval_secs`) als Fallback und für
       remote-Änderungen.
-- [ ] **Remote-Änderungserkennung**: PROPFIND Depth:1 pro beobachtetem Ordner,
+- [x] **Remote-Änderungserkennung**: PROPFIND Depth:1 pro beobachtetem Ordner,
       gestaffelt; Root-ETag als Shortcut. (Später Ausbaustufe: Server-Events
       via Notifications-API statt Polling.)
-- [ ] **Transfers**: Queue mit `max_parallel_transfers`, partielle Downloads
+- [x] **Transfers**: Queue mit `max_parallel_transfers`, partielle Downloads
       (`Range`) mit `.part`-Tempdateien, atomares Umbenennen nach Abschluss,
       Read-Only-Attribute/Permissions pro OS behandeln (Windows: hidden,
       System-Attribute; Unix: Mode-Bits).
-- [ ] Idempotenz: Absturz-sicher (`.part`-Dateien aufräumen, DB-Status
+- [x] Idempotenz: Absturz-sicher (`.part`-Dateien aufräumen, DB-Status
       `uploading`/`downloading` beim Start prüfen und Transfers neu anstoßen).
-- [ ] Pause/Resume pro Job, globales Stop.
-- [ ] Tests: Engine-Szenarien als Integrationstests mit Mock-WebDAV
+- [x] Pause/Resume pro Job, globales Stop.
+- [x] Tests: Engine-Szenarien als Integrationstests mit Mock-WebDAV
       (`httpmock`): neuer File lokal/remote, Änderung lokal/remote, Löschung,
       Ordnerumbenennung, Filter, parallele Transfers.
 

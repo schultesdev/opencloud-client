@@ -174,6 +174,20 @@ impl StatusDb {
         Ok(removed)
     }
 
+    /// Lists all tracked entries, ordered by path. The snapshot the sync
+    /// engine diffs its local and remote scans against.
+    pub fn all_entries(&self) -> Result<Vec<Entry>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, is_dir, local_mtime, local_size, remote_etag,
+                    remote_size, checksum, last_synced_at, state
+             FROM entries ORDER BY path",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_entry)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Lists up to `limit` entries in the given state, ordered by path;
     /// used by startup recovery and the UI error list.
     pub fn entries_with_state(&self, state: EntryState, limit: i64) -> Result<Vec<Entry>, DbError> {

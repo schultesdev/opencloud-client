@@ -172,6 +172,25 @@ impl<P: TokenProvider> WebDavClient<P> {
             .await
     }
 
+    /// Downloads a byte range of a file (`Range: bytes=<start>-<end>`,
+    /// `end` inclusive) — the basis for partial downloads. A server may
+    /// ignore the header and answer with the full body (HTTP 200 instead
+    /// of 206), so callers must check the response status before
+    /// appending the chunk.
+    pub async fn get_range(&self, path: &str, start: u64, end: u64) -> Result<Response, ApiError> {
+        let url = build_url(&self.base, path)?;
+        let timeout = self.http.transfer_timeout();
+        self.http
+            .send(timeout, |token| {
+                self.http
+                    .http()
+                    .get(url.clone())
+                    .bearer_auth(token)
+                    .header("Range", format!("bytes={start}-{end}"))
+            })
+            .await
+    }
+
     /// Uploads a file without a write condition (overwrite).
     /// Returns the new remote ETag, if the server reports one.
     pub async fn put(

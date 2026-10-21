@@ -7,7 +7,13 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+oc-api.workspace = true
+oc-auth.workspace = true
+oc-config.workspace = true
+oc-db.workspace = true
+oc-sync.workspace = true
 clap.workspace = true
+tokio.workspace = true
 
 [[bin]]
 name = "opencloud-sync"

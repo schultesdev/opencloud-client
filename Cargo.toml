@@ -23,7 +23,14 @@ url = "2"
 dirs = "6"
 tempfile = "3"
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+webbrowser = "1"
+wiremock = "0.6"
 
 # Workspace-internal crates
 oc-config = { version = "0.1.0", path = "crates/oc-config" }

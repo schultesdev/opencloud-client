@@ -107,17 +107,17 @@ Jede Phase endet mit lauffähigem, testbarem Code (Commits pro Phase).
 
 ### Phase 0 — Projekt-Setup (ca. 1–2 Tage)
 
-- [ ] Cargo-Workspace mit den sechs Crates anlegen, CI (GitHub Actions) mit
+- [x] Cargo-Workspace mit den sechs Crates anlegen, CI (GitHub Actions) mit
       Build + `cargo test` auf `ubuntu-latest`, `windows-latest`, `macos-latest`.
-- [ ] Clippy + rustfmt konfigurieren, `deny(warnings)` in CI.
-- [ ] `--headless`-Flag in `oc-app` vorsehen (Engine ohne GUI startbar).
-- [ ] Versions-/Releasestrategie festlegen (semverutag, Changelog).
+- [x] Clippy + rustfmt konfigurieren, `deny(warnings)` in CI.
+- [x] `--headless`-Flag in `oc-app` vorsehen (Engine ohne GUI startbar).
+- [x] Versions-/Releasestrategie festlegen (semverutag, Changelog).
 
 ### Phase 1 — Konfiguration (`oc-config`, ca. 2–3 Tage)
 
-- [ ] Config-Verzeichnis pro OS via `dirs`:
+- [x] Config-Verzeichnis pro OS via `dirs`:
       Linux `~/.config/opencloud-sync/`, macOS `~/Library/Application Support/opencloud-sync/`, Windows `%APPDATA%\opencloud-sync\`
-- [ ] `config.json` (globale Einstellungen + Konten):
+- [x] `config.json` (globale Einstellungen + Konten):
 
 ```json
 {
@@ -138,7 +138,7 @@ Jede Phase endet mit lauffähigem, testbarem Code (Commits pro Phase).
 }
 ```
 
-- [ ] `jobs.json` (Sync-Jobs, beliebig viele):
+- [x] `jobs.json` (Sync-Jobs, beliebig viele):
 
 ```json
 {
@@ -159,22 +159,22 @@ Jede Phase endet mit lauffähigem, testbarem Code (Commits pro Phase).
 
   - `include` = Ordner-Whitelist pro Space (Selective Sync, Requirement 6);
     leere Liste = alles synchronisieren. `exclude` = Exclude-Muster.
-- [ ] Atomares Schreiben (temp file + rename), Validierung mit`serde`,
+- [x] Atomares Schreiben (temp file + rename), Validierung mit`serde`,
       Schema-Migration über `version`-Feld.
-- [ ] Unit-Tests: runden laden/speichern, ungültige Pfade, Version-Migration.
+- [x] Unit-Tests: runden laden/speichern, ungültige Pfade, Version-Migration.
 
 ### Phase 2 — Authentifizierung (`oc-auth`, ca. 3–4 Tage)
 
-- [ ] OIDC Discovery über `https://<server>/.well-known/openid-configuration`.
-- [ ] Authorization Code Flow + PKCE: lokaler Loopback-HTTP-Listener auf
+- [x] OIDC Discovery über `https://<server>/.well-known/openid-configuration`.
+- [x] Authorization Code Flow + PKCE: lokaler Loopback-HTTP-Listener auf
       `127.0.0.1:<freier Port>`, Browser öffnen (`open`/`xdg-open`/`start`), Code
       abfangen, Token holen.
-- [ ] Access-Token im Speicher; Refresh-Token im OS-Keyring (`keyring`-Crate)
+- [x] Access-Token im Speicher; Refresh-Token im OS-Keyring (`keyring`-Crate)
       speichern, **nicht** in JSON.
-- [ ] Automatischer Refresh bei 401, Expiry-Tracking, parallele Requests
+- [x] Automatischer Refresh bei 401, Expiry-Tracking, parallele Requests
       teilen sich einen Refresh (Single-Flight).
-- [ ] Logout (Refresh-Token invalidieren, Keyring leeren).
-- [ ] Tests: Token-Refresh-Logik mit Mock-Server, PKCE-Helper, Expiry-Handling.
+- [x] Logout (Refresh-Token invalidieren, Keyring leeren).
+- [x] Tests: Token-Refresh-Logik mit Mock-Server, PKCE-Helper, Expiry-Handling.
       Hinweis: volles Login nur manuell testbar (Browser nötig).
 
 ### Phase 3 — API-Client (`oc-api`, ca. 4–6 Tage)

@@ -348,9 +348,40 @@ Remote geändert? = ETag != DB-Werte
 | M6 | Phase 7 | GUI komplett: Konfiguration, Status, Konfliktlösung |
 | M7 | Phasen 8–9 | Stabilität, Installer für alle drei Plattformen |
 
-Nach jedem Meilenstein: manuelles Testen gegen eine echte OpenCloud-Instanz
-(docker-compose opencloud) mit Testfällen (Dual-Client-Konflikt erzeugen,
-Ordnerfilter ändern, Netzwerk ziehen).
+Nach jedem Meilenstein: manuelles Testen gegen die Testinstanz (siehe unten)
+bzw. eine eigene `docker-compose`-Instanz mit Testfällen (Dual-Client-Konflikt
+erzeugen, Ordnerfilter ändern, Netzwerk ziehen).
+
+### Testinstanz für manuelle Tests
+
+Für die Tests nach den Meilensteinen steht eine öffentliche
+OpenCloud-Testinstanz bereit:
+
+| Feld | Wert |
+| --- | --- |
+| Server-URL | `https://cloud.schultes.dev` |
+| Benutzer | `test` |
+| Passwort | `tester1234!` |
+| Login | ausschließlich OIDC Authorization Code Flow (`oc-auth`, Browser) |
+
+Geprüft am 2026-10-21:
+
+- OIDC-Discovery (`/.well-known/openid-configuration`) erreichbar:
+  `authorization_endpoint` `/signin/v1/identifier/_/authorize`,
+  `token_endpoint` `/konnect/v1/token` — entspricht den Fallbacks aus
+  Phase 2.
+- `GET /graph/v1.0/me/drives` und `PROPFIND /dav/spaces/<id>/` antworten
+  ohne Token mit 401 (Endpunkte und URL-Pfade bestätigt).
+- `grant_type=password` (Konnect) und HTTP Basic Auth sind **deaktiviert**:
+  Token gibt es nur über den Browser-Login — ein vollautomatisierter
+  Test ohne GUI ist nur über einmalig interaktives Login + Refresh-Token
+  im Keyring möglich.
+- Ein zweiter Client (z. B. Web-UI oder ein anderer Rechner mit demselben
+  Benutzer) erzeugt Testfälle für Dual-Client-Konflikte.
+
+Bei Veröffentlichung des Repositories: Zugangsdaten sind Wegwerf-Testdaten,
+vor einem öffentlichen Release rotieren (Instanz sperren oder Passwort
+ändern).
 
 ## 5. Risiken & offene Punkte
 

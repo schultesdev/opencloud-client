@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "jobs": [
+    {
+      "id": "job-1",
+      "account_id": "konto-1",
+      "space_id": "storage-users-1$89ad5ad2-0000-0000-0000-000000000000",
+      "local_path": "/home/max/OpenCloud/projekt-mars",
+      "enabled": true,
+      "include": ["Dokumente", "Bilder/2026"],
+      "exclude": ["tmp", "*.tmp", ".git"]
+    }
+  ]
+}

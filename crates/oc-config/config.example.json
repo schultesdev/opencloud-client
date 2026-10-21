@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "accounts": [
+    {
+      "id": "konto-1",
+      "server_url": "https://cloud.example.com",
+      "username": "max@example.com"
+    }
+  ],
+  "settings": {
+    "sync_interval_secs": 30,
+    "max_parallel_transfers": 4,
+    "conflict_policy": "ask",
+    "log_level": "info"
+  }
+}

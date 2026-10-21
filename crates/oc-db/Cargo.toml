@@ -1,0 +1,10 @@
+[package]
+name = "oc-db"
+description = "SQLite status database per sync job: schema, migrations, queries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

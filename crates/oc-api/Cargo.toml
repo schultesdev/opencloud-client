@@ -1,0 +1,10 @@
+[package]
+name = "oc-api"
+description = "HTTP client: Graph API (spaces) and WebDAV"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

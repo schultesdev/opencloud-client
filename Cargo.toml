@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oc-config",
+    "crates/oc-auth",
+    "crates/oc-api",
+    "crates/oc-db",
+    "crates/oc-sync",
+    "crates/oc-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+url = "2"
+dirs = "6"
+tempfile = "3"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+# Workspace-internal crates
+oc-config = { version = "0.1.0", path = "crates/oc-config" }
+oc-auth = { version = "0.1.0", path = "crates/oc-auth" }
+oc-api = { version = "0.1.0", path = "crates/oc-api" }
+oc-db = { version = "0.1.0", path = "crates/oc-db" }
+oc-sync = { version = "0.1.0", path = "crates/oc-sync" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

@@ -1,0 +1,10 @@
+[package]
+name = "oc-auth"
+description = "OIDC login (code flow + PKCE), token refresh, OS keyring storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

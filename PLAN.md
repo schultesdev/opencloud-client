@@ -179,19 +179,19 @@ Jede Phase endet mit lauffähigem, testbarem Code (Commits pro Phase).
 
 ### Phase 3 — API-Client (`oc-api`, ca. 4–6 Tage)
 
-- [ ] `GraphClient`: `list_spaces()` (`GET /graph/v1.0/me/drives`), Space-Typ
+- [x] `GraphClient`: `list_spaces()` (`GET /graph/v1.0/me/drives`), Space-Typ
       mit `id`, `name`, `driveType`, `driveAlias`, `webDavUrl`, `quota`.
-- [ ] `WebDavClient`:
-  - [ ] `propfind(path, depth)` → geparste Ressourcen-Liste (Name, Typ, Größe,
+- [x] `WebDavClient`:
+  - [x] `propfind(path, depth)` → geparste Ressourcen-Liste (Name, Typ, Größe,
         ETag, Last-Modified, Quota-available für Ordner)
-  - [ ] `get()`, `put()` (mit `If-Match`/`If-None-Match`), `mkcol()`, `delete()`,
+  - [x] `get()`, `put()` (mit `If-Match`/`If-None-Match`), `mkcol()`, `delete()`,
         `move()`, `copy()`
-  - [ ] URL-Encoding für Pfade, Unicode-Normalisierung (NFC) beim Vergleich
+  - [x] URL-Encoding für Pfade, Unicode-Normalisierung (NFC) beim Vergleich
         lokaler/remote-Namen
-- [ ] Fehlermodell: `ApiError` mit Differenzierung (Netzwerk, 401, 403, 404,
+- [x] Fehlermodell: `ApiError` mit Differenzierung (Netzwerk, 401, 403, 404,
       412 Precondition Failed, 423 Locked, 5xx) → Grundlage für Retry/Conflict.
-- [ ] Retries mit Exponential-Backoff (`backoff`-Logik), Timeout-Konfiguration.
-- [ ] Tests: PROPFIND-Parser gegen XML-Fixtures, URL-Encoding, Retry-Logik mit
+- [x] Retries mit Exponential-Backoff (`backoff`-Logik), Timeout-Konfiguration.
+- [x] Tests: PROPFIND-Parser gegen XML-Fixtures, URL-Encoding, Retry-Logik mit
       `wiremock`/`httpmock`.
 
 ### Phase 4 — SQLite-Statusdatenbank (`oc-db`, ca. 3–4 Tage)

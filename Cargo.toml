@@ -31,6 +31,9 @@ rand = "0.8"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 webbrowser = "1"
 wiremock = "0.6"
+quick-xml = "0.37"
+percent-encoding = "2"
+unicode-normalization = "0.1"
 
 # Workspace-internal crates
 oc-config = { version = "0.1.0", path = "crates/oc-config" }

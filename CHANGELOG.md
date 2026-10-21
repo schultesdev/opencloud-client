@@ -61,3 +61,30 @@ versioning follows [Semantic Versioning](https://semver.org/).
   State, Favicon-Störungen, Timeout), Discovery inkl. Fallback, kompletter
   Login-Flow gegen Mock-Server, Refresh/Expiry/Single-Flight,
   `invalid_grant`, Logout — jeweils mit `wiremock`.
+
+### Added (Phase 3 — API-Client, `oc-api`)
+
+- `GraphClient`: `list_spaces()` (`GET /graph/v1.0/me/drives`) mit
+  `Space` (`id`, `name`, `driveType`, `driveAlias`, `root.webDavUrl`,
+  `quota`) — die Basis für die Space-Auswahl in Sync-Jobs.
+- `WebDavClient` pro Space (`https://<server>/dav/spaces/{id}/` oder aus
+  `root.webDavUrl`): `propfind(path, depth)` mit eigenem
+  Multistatus-Parser (`quick-xml`, namespace-agnostisch, nur
+  `propstat`-Status 200), `get()`, `put()`/`put_with()` mit
+  `If-Match`/`If-None-Match` (`WriteCondition`), `mkcol()`, `delete()`,
+  `move()`, `copy()` (Destination-/Overwrite-Header).
+- Pfade: Prozent-Encoding je Segment (inkl. `&`, Leerzeichen, Unicode),
+  Hrefs werden dekodiert, NFD→NFC-normalisiert und relativ zum Space
+  aufgelöst; `.`/`..`-Segmente werden abgelehnt.
+- Fehlermodell `ApiError`: Netzwerk, 401, 403, 404, 412 Precondition
+  Failed (Konflikt-Grundlage), 423 Locked, 429 mit `Retry-After`, 5xx,
+  Protokollfehler — mit `is_retryable()`/`retry_after()`.
+- Retries mit Exponential-Backoff und Jitter (`RetryConfig`,
+  konfigurierbare Timeouts für Metadaten vs. Transfers); nach 401 wird
+  der Token einmal per `TokenProvider::refresh` erzwungen erneuert.
+- `TokenProvider`-Trait inkl. `StaticToken` (Tests/CLI) und Implementierung
+  für `oc_auth::TokenManager` (Single-Flight-Refresh aus Phase 2).
+- Tests (45 neue): PROPFIND-Parser gegen XML-Fixtures (Entities,
+  Propstat-404, Namensraumvarianten, malformed), URL-Encoding, NFC,
+  Graph-/WebDAV-Operationen, Fehlermapping, Retry-/Retry-After-Logik und
+  401-Neuanmeldung — jeweils mit `wiremock`.

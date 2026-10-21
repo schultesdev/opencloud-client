@@ -199,7 +199,7 @@ Jede Phase endet mit lauffähigem, testbarem Code (Commits pro Phase).
 Eine Datenbankdatei **pro Sync-Job** (Anforderung: Status pro Verzeichnis):
 `<config-dir>/db/<job-id>.sqlite`.
 
-- [ ] Schema (v1):
+- [x] Schema (v1):
 
 ```sql
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);       -- schema_version, space_etag, last_sync
@@ -226,11 +226,11 @@ CREATE TABLE conflicts (
 );
 ```
 
-- [ ] Migrationen (`rusqlite`-Migrationsrunner), WAL-Modus.
-- [ ] Dao-Layer: `upsert_entry`, `get_entry`, `delete_subtree`, `record_conflict`,
+- [x] Migrationen (`rusqlite`-Migrationsrunner), WAL-Modus.
+- [x] Dao-Layer: `upsert_entry`, `get_entry`, `delete_subtree`, `record_conflict`,
       `resolve_conflict`, Statistik-Abfragen (für UI: Anzahl Dateien,
       Konflikte, Fehler, letzter Sync).
-- [ ] Tests: In-Memory-SQLite (tempfile), Migration von v0 → v1.
+- [x] Tests: In-Memory-SQLite (tempfile), Migration von v0 → v1.
 
 ### Phase 5 — Sync-Engine (`oc-sync`, ca. 1–2 Wochen, Kernstück)
 

@@ -38,6 +38,28 @@ versioning follows [Semantic Versioning](https://semver.org/).
   Duplikate, Konto-Referenzen), Schema-Migration über das `version`-Feld.
 - Unit-/Integrationstests: Roundtrips, ungültige Pfade, Version-Migration.
 
+### Added (Phase 4 — SQLite-Statusdatenbank, `oc-db`)
+
+- Eine Statusdatenbank pro Sync-Job unter `<config-dir>/db/<job-id>.sqlite`
+  (`db_path()` mit Validierung der Job-ID gegen Pfad-Separatoren/`..`).
+- Schema v1: `meta` (schema_version, space_etag, last_sync), `entries`
+  (Pfad, is_dir, lokale mtime/size, Remote-ETag/size, Checksumme,
+  State `synced|uploading|downloading|conflict|error` mit CHECK-Constraints),
+  `conflicts` (lokale/Remote-Metadaten, Status
+  `pending|resolved_server|resolved_local`, resolved_at).
+- Migrationsrunner: Version in `meta`, schrittweise Migration in
+  Transaktionen, Neuöffnen idempotent, neuere Schema-Versionen werden
+  abgelehnt; WAL-Modus + `synchronous=NORMAL` für Datei-Datenbanken.
+- Dao-Layer auf `StatusDb`: `upsert_entry`, `get_entry`, `delete_entry`,
+  `delete_subtree` (Präfix-Baum, berührt keine gleich benannten Geschwister),
+  `entries_with_state`, `record_conflict`, `resolve_conflict` (nur `pending`,
+  Server/lokal), `pending_conflicts`, `conflicts_with_status`, `stats()`
+  (Datei-/Ordnerzahl, aktive Transfers, Konflikte, Fehler, letzter Sync),
+  `meta`/`set_meta`/`set_last_sync`.
+- Tests: In-Memory- und tempfile-Datenbanken, Migration v0 → v1 und
+  Idempotenz, Roundtrips, Subtree-Löschung, Konflikt-Lebenszyklus,
+  Statistiken, WAL-Modus.
+
 ### Added (Phase 2 — Authentifizierung, `oc-auth`)
 
 - OIDC Discovery über `<server>/.well-known/openid-configuration` mit den

@@ -96,6 +96,14 @@ pub struct EngineOptions {
     /// How detected conflicts are treated: `ask` records them pending;
     /// the other policies resolve them right away (Phase 6).
     pub conflict_policy: ConflictPolicy,
+    /// Pause between two folder PROPFINDs of the remote scan — the
+    /// server-load throttle (`propfind_pause_ms`); zero disables it.
+    pub propfind_pause: Duration,
+    /// Delay before the first retry after a connectivity failure; the
+    /// offline backoff doubles from here.
+    pub offline_backoff_base: Duration,
+    /// Upper bound of the offline backoff.
+    pub offline_backoff_cap: Duration,
 }
 
 impl Default for EngineOptions {
@@ -108,6 +116,9 @@ impl Default for EngineOptions {
             download_chunk_size: 8 * 1024 * 1024,
             root_etag_shortcut: true,
             conflict_policy: ConflictPolicy::default(),
+            propfind_pause: Duration::ZERO,
+            offline_backoff_base: Duration::from_secs(10),
+            offline_backoff_cap: Duration::from_secs(60),
         }
     }
 }
@@ -206,6 +217,21 @@ pub enum EngineEvent {
         /// Which side won.
         resolution: ConflictResolution,
     },
+    /// The server is unreachable; the job pauses its passes and retries
+    /// with exponential backoff (Phase 8). Watcher and interval triggers
+    /// stay queued and are applied once the connection is back.
+    Offline {
+        /// The job's identifier.
+        job_id: String,
+        /// How long the job waits before its next attempt.
+        retry_in: Duration,
+    },
+    /// The server is reachable again after an offline phase; the job
+    /// resumes its normal sync schedule.
+    Online {
+        /// The job's identifier.
+        job_id: String,
+    },
     /// The job task stopped (Stop command or channel closed).
     Stopped {
         /// The job's identifier.
@@ -258,6 +284,14 @@ impl fmt::Display for EngineEvent {
                     ConflictResolution::Local => "local wins",
                 }
             ),
+            Self::Offline { job_id, retry_in } => write!(
+                f,
+                "[{job_id}] server unreachable; pausing (next attempt in {}s)",
+                retry_in.as_secs()
+            ),
+            Self::Online { job_id } => {
+                write!(f, "[{job_id}] connection restored; resuming sync")
+            }
             Self::Stopped { job_id } => write!(f, "[{job_id}] stopped"),
         }
     }
@@ -409,7 +443,11 @@ impl Engine {
 }
 
 /// The task body of one job: serializes sync passes, honors commands,
-/// and reacts to watcher triggers and the periodic interval.
+/// reacts to watcher triggers and the periodic interval, and rides out
+/// offline phases with exponential backoff (Phase 8). While the server
+/// is unreachable no passes run; triggers stay pending and are applied
+/// once the connection is back (the queue survives). Explicit commands
+/// (`SyncNow`, `Resume`) cancel a running backoff.
 async fn job_loop<P: TokenProvider + 'static>(
     job: JobTask<P>,
     options: EngineOptions,
@@ -420,6 +458,11 @@ async fn job_loop<P: TokenProvider + 'static>(
 ) {
     let mut paused = false;
     let mut pending = true; // one pass right after startup
+    // Offline bookkeeping: `backoff` doubles per failed attempt, capped;
+    // no pass starts before `next_attempt` while the server is down.
+    let mut offline = false;
+    let mut backoff = options.offline_backoff_base;
+    let mut next_attempt = tokio::time::Instant::now();
     // The first tick of `interval` fires immediately; the startup pass
     // must not be followed by a second one.
     let mut ticker = tokio::time::interval_at(
@@ -428,16 +471,48 @@ async fn job_loop<P: TokenProvider + 'static>(
     );
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        if pending && !paused {
+        if pending && !paused && tokio::time::Instant::now() >= next_attempt {
             pending = false;
             let _ = events.send(EngineEvent::RunStarted {
                 job_id: job.id.clone(),
             });
-            let summary = run_once(&job, &options, &events).await;
+            let (summary, aborted) = run_once(&job, &options, &events).await;
             let _ = events.send(EngineEvent::RunFinished {
                 job_id: job.id.clone(),
                 summary,
             });
+            match aborted.filter(|error| error.is_connectivity()) {
+                Some(_) => {
+                    // Unreachable server: pause the schedule, retry with
+                    // a doubled backoff. Queued triggers stay pending.
+                    let delay = if offline {
+                        backoff.saturating_mul(2).min(options.offline_backoff_cap)
+                    } else {
+                        options.offline_backoff_base
+                    };
+                    offline = true;
+                    backoff = delay;
+                    next_attempt = tokio::time::Instant::now() + delay;
+                    // The retry probe is the next run; without pending
+                    // the loop would wait for the (possibly long)
+                    // periodic interval instead.
+                    pending = true;
+                    let _ = events.send(EngineEvent::Offline {
+                        job_id: job.id.clone(),
+                        retry_in: delay,
+                    });
+                }
+                None => {
+                    if offline {
+                        offline = false;
+                        backoff = options.offline_backoff_base;
+                        let _ = events.send(EngineEvent::Online {
+                            job_id: job.id.clone(),
+                        });
+                    }
+                    next_attempt = tokio::time::Instant::now();
+                }
+            }
             continue;
         }
         tokio::select! {
@@ -451,16 +526,18 @@ async fn job_loop<P: TokenProvider + 'static>(
                     pending = true;
                 }
             }
+            // Wake for the next offline retry attempt.
+            _ = tokio::time::sleep_until(next_attempt), if pending && !paused => {}
             command = commands.recv() => match command {
                 Some(JobCommand::Pause) => paused = true,
-                Some(JobCommand::Resume) => {
-                    // Catch up on what changed while the job was paused.
+                Some(JobCommand::Resume) | Some(JobCommand::SyncNow) => {
+                    // Catch up on what changed while the job was paused;
+                    // an explicit run also cancels an offline backoff.
                     paused = false;
                     pending = true;
-                }
-                Some(JobCommand::SyncNow) => {
-                    paused = false;
-                    pending = true;
+                    offline = false;
+                    backoff = options.offline_backoff_base;
+                    next_attempt = tokio::time::Instant::now();
                 }
                 Some(JobCommand::Stop) | None => break,
             },
@@ -507,13 +584,17 @@ impl PendingTransfer {
 
 /// One sync pass: recovery, scans, diff, plan execution, bookkeeping.
 /// Failures of individual paths are reported as [`EngineEvent::Failed`]
-/// and counted; only a failing scan or database aborts the pass early.
+/// and counted; only a failing scan or database aborts the pass early —
+/// the aborting error is returned alongside the summary so the job loop
+/// can classify it (a connectivity failure switches the job to offline
+/// backoff, Phase 8).
 async fn run_once<P: TokenProvider + 'static>(
     job: &JobTask<P>,
     options: &EngineOptions,
     events: &UnboundedSender<EngineEvent>,
-) -> RunSummary {
+) -> (RunSummary, Option<SyncError>) {
     let mut summary = RunSummary::default();
+    let mut aborted = None;
     let now = unix_now();
 
     let fail = |summary: &mut RunSummary, path: &str, error: &SyncError| {
@@ -524,33 +605,38 @@ async fn run_once<P: TokenProvider + 'static>(
             error: error.to_string(),
         });
     };
+    // Reports the run-level failure and marks the pass aborted.
+    let abort = |summary: &mut RunSummary, aborted: &mut Option<SyncError>, error: SyncError| {
+        fail(summary, "", &error);
+        *aborted = Some(error);
+    };
 
     // Crash recovery: interrupted transfers keep their recorded baseline,
     // so the diff re-plans them; the stale state must not linger.
     if let Err(error) = recover_interrupted(&job.db) {
-        fail(&mut summary, "", &error);
-        return summary;
+        abort(&mut summary, &mut aborted, error);
+        return (summary, aborted);
     }
 
     // A changed filter (include/exclude) removes paths from the database
     // that no longer belong to the synced set; local files stay (the GUI
     // asks before cleaning them up, see PLAN.md Phase 5/7).
     if let Err(error) = drop_uncovered(&job.db, &job.filter) {
-        fail(&mut summary, "", &error);
-        return summary;
+        abort(&mut summary, &mut aborted, error);
+        return (summary, aborted);
     }
 
     // Stale .part files from a crash never become real files.
     if let Err(error) = scan::remove_part_files(&job.local_root) {
-        fail(&mut summary, "", &error);
-        return summary;
+        abort(&mut summary, &mut aborted, error);
+        return (summary, aborted);
     }
 
     let local = match scan::scan_local(&job.local_root, &job.filter) {
         Ok(local) => local,
         Err(error) => {
-            fail(&mut summary, "", &error);
-            return summary;
+            abort(&mut summary, &mut aborted, error);
+            return (summary, aborted);
         }
     };
 
@@ -560,8 +646,9 @@ async fn run_once<P: TokenProvider + 'static>(
             .map(|entry| (entry.entry.path.clone(), entry.entry))
             .collect::<HashMap<_, _>>(),
         Err(error) => {
-            fail(&mut summary, "", &SyncError::from(error));
-            return summary;
+            let error = SyncError::from(error);
+            abort(&mut summary, &mut aborted, error);
+            return (summary, aborted);
         }
     };
 
@@ -570,8 +657,9 @@ async fn run_once<P: TokenProvider + 'static>(
     let root = match job.dav.propfind("", Depth::Zero).await {
         Ok(root) => root,
         Err(error) => {
-            fail(&mut summary, "", &SyncError::from(error));
-            return summary;
+            let error = SyncError::from(error);
+            abort(&mut summary, &mut aborted, error);
+            return (summary, aborted);
         }
     };
     let root_etag = root.first().and_then(|resource| resource.etag.clone());
@@ -586,15 +674,23 @@ async fn run_once<P: TokenProvider + 'static>(
         let listing = match job.dav.propfind("", Depth::One).await {
             Ok(listing) => listing,
             Err(error) => {
-                fail(&mut summary, "", &SyncError::from(error));
-                return summary;
+                let error = SyncError::from(error);
+                abort(&mut summary, &mut aborted, error);
+                return (summary, aborted);
             }
         };
-        match scan::scan_remote_from_root(job.dav.as_ref(), &job.filter, &listing).await {
+        match scan::scan_remote_from_root(
+            job.dav.as_ref(),
+            &job.filter,
+            &listing,
+            options.propfind_pause,
+        )
+        .await
+        {
             Ok(snapshot) => snapshot.entries,
             Err(error) => {
-                fail(&mut summary, "", &error);
-                return summary;
+                abort(&mut summary, &mut aborted, error);
+                return (summary, aborted);
             }
         }
     };
@@ -604,8 +700,9 @@ async fn run_once<P: TokenProvider + 'static>(
     match db_lock(&job.db).pending_conflicts() {
         Ok(conflicts) => frozen.extend(conflicts.into_iter().map(|conflict| conflict.path)),
         Err(error) => {
-            fail(&mut summary, "", &SyncError::from(error));
-            return summary;
+            let error = SyncError::from(error);
+            abort(&mut summary, &mut aborted, error);
+            return (summary, aborted);
         }
     }
     frozen.extend(
@@ -881,7 +978,7 @@ async fn run_once<P: TokenProvider + 'static>(
     if let Err(error) = db_lock(&job.db).set_last_sync(now) {
         fail(&mut summary, "", &SyncError::from(error));
     }
-    summary
+    (summary, aborted)
 }
 
 /// Spawns one transfer task; the semaphore caps the number of concurrent

@@ -37,6 +37,9 @@ percent-encoding = "2"
 unicode-normalization = "0.1"
 futures-util = "0.3"
 notify = "8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 # Workspace-internal crates
 oc-config = { version = "0.1.0", path = "crates/oc-config" }

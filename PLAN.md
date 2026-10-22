@@ -132,6 +132,7 @@ Jede Phase endet mit lauffähigem, testbarem Code (Commits pro Phase).
   "settings": {
     "sync_interval_secs": 30,
     "max_parallel_transfers": 4,
+    "propfind_pause_ms": 0,
     "conflict_policy": "ask",
     "log_level": "info"
   }
@@ -314,14 +315,35 @@ Remote geändert? = ETag != DB-Werte
 
 ### Phase 8 — Robustheit & Reife (kontinuierlich, ca. 1 Woche)
 
-- [ ] Offline-Verhalten: Netzwerk weg → Engine pausiert Jobs automatisch,
-  Backoff beim Wiederverbinden; Queue bleibt erhalten.
-- [ ] Große Dateien: TUS-Upload-Endpoint evaluieren, Download per Range-Resume.
-- [ ] Ratenlimit / Serverlast: serielle PROPFINDs, konfigurierbare Intervalle.
-- [ ] Logging: `tracing` + rotierende Logfiles im Config-Verzeichnis, Level aus
-  `config.json`; Crash-Reporting-Hook optional.
-- [ ] Icon-Overlays (Status pro Verzeichnis im Dateimanager) als spätere
-  Ausbaustufe dokumentieren — nicht Teil von v1.
+- [x] Offline-Verhalten: Netzwerk weg (Connect-/DNS-Fehler, siehe
+  `ApiError::is_connectivity`) → Engine pausiert den Job automatisch und
+  meldet `Offline`-Events mit exponentiellem Backoff (10 s → 60 s, über
+  `EngineOptions` konfigurierbar); Watcher-/Intervall-Trigger bleiben in
+  der Queue und werden beim Wiederverbinden abgearbeitet (`Online`-Event,
+  normaler Takt kehrt zurück). `SyncNow`/`Resume` brechen den Backoff ab.
+  Die GUI zeigt „Server nicht erreichbar“ im Job-Status;
+  Integrationstests decken Backoff-Verdopplung, Cap und Reconnect inkl.
+  Queue-Abarbeitung ab.
+- [x] Große Dateien: Download per Range-Resume ist seit Phase 5 umgesetzt
+  (chunked `Range`-GETs in `.part`-Tempdatei, atomares Rename; ein Abbruch
+  startet den Transfer neu — plattformübergreifendes Resume über Neustarts
+  ist nicht Teil von v1). TUS-Upload-Endpoint (`/tus-upload`) evaluiert:
+  OpenCloud bietet ihn, der Nutzen beschränkt sich aber auf Uploads
+  jenseits mehrerer GB; Aufnahme als Ausbaustufe nach v1 (TUS-Client plus
+  Fallback auf PUT nötig).
+- [x] Ratenlimit / Serverlast: PROPFINDs laufen strikt seriell pro Job;
+  `Retry-After` bei 429 wird bereits beachtet; zusätzlich ist eine Pause
+  zwischen Ordner-PROPFINDs konfigurierbar (`settings.propfind_pause_ms`,
+  Default 0).
+- [x] Logging: `tracing` + `tracing-appender` — täglich rotierende Logfiles
+  unter `<config-dir>/logs/opencloud-sync.log.<Datum>`, Level aus
+  `config.json` (`settings.log_level`), `RUST_LOG` überschreibt für
+  Fehlersuche. Engine-Events (GUI-Forwarder und Headless) werden geloggt.
+  Crash-Reporting-Hook: bewusst nicht in v1.
+- [x] Icon-Overlays (Status pro Verzeichnis im Dateimanager) als spätere
+  Ausbaustufe dokumentiert — nicht Teil von v1 (plattformabhängige
+  Shell-Integration: Windows Explorer-Overlay-Handler, macOS Finder-Badges
+  via Sync-Client-Protokoll, Linux ohne einheitlichen Standard).
 
 ### Phase 9 — Packaging & Distribution (ca. 3–5 Tage)
 

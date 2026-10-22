@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::SystemTime;
 
 use oc_api::{DavResource, Depth, TokenProvider, WebDavClient, normalize_nfc};
@@ -148,12 +149,15 @@ pub fn remove_part_files(root: &Path) -> Result<(), SyncError> {
 }
 
 /// Traverses the remote tree level by level (PROPFIND `Depth: 1` per
-/// folder), starting from an already-fetched root listing. Traversal stops
-/// at folders outside the filter.
+/// folder, strictly serially to keep the server load bounded), starting
+/// from an already-fetched root listing. Traversal stops at folders
+/// outside the filter. `pause` is slept between two folder listings —
+/// the configurable server-load throttle (`propfind_pause_ms`).
 pub async fn scan_remote_from_root<P: TokenProvider>(
     dav: &WebDavClient<P>,
     filter: &Filter,
     root_listing: &[DavResource],
+    pause: Duration,
 ) -> Result<RemoteSnapshot, SyncError> {
     let root_etag = root_listing
         .first()
@@ -164,6 +168,9 @@ pub async fn scan_remote_from_root<P: TokenProvider>(
         add_remote_child(resource, filter, &mut entries, &mut pending);
     }
     while let Some(dir) = pending.pop_front() {
+        if !pause.is_zero() {
+            tokio::time::sleep(pause).await;
+        }
         let children = match dav.propfind(&dir, Depth::One).await {
             Ok(children) => children,
             // The folder vanished between the parent listing and this

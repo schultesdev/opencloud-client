@@ -73,4 +73,11 @@ impl SyncError {
     pub fn invalid_path(path: impl Into<String>) -> Self {
         Self::InvalidPath { path: path.into() }
     }
+
+    /// Whether the server could not be reached at all (DNS/connect
+    /// failure, see [`ApiError::is_connectivity`]): the job should
+    /// switch to offline backoff instead of its normal interval.
+    pub fn is_connectivity(&self) -> bool {
+        matches!(self, Self::Api(error) if error.is_connectivity())
+    }
 }

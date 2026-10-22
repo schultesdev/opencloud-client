@@ -81,6 +81,8 @@ struct JobUi {
     running: bool,
     /// The job was paused via the UI.
     paused: bool,
+    /// The server is unreachable; passes back off until it returns.
+    offline: bool,
     /// What the last finished pass did.
     last_summary: Option<RunSummary>,
     /// Database statistics (refreshed once a second).
@@ -298,6 +300,22 @@ impl SyncApp {
                 state.progress_at = None;
                 state.speed_bps = 0.0;
             }
+            EngineEvent::Offline { job_id, retry_in } => {
+                let state = self.job_states.entry(job_id.clone()).or_default();
+                state.offline = true;
+                state.running = false;
+                state.progress = None;
+                state.speed_bps = 0.0;
+                self.notify(format!(
+                    "Server nicht erreichbar ('{job_id}'): neuer Versuch in {} s",
+                    retry_in.as_secs()
+                ));
+            }
+            EngineEvent::Online { job_id } => {
+                let state = self.job_states.entry(job_id.clone()).or_default();
+                state.offline = false;
+                self.notify(format!("Verbindung wiederhergestellt ('{job_id}')"));
+            }
             EngineEvent::Progress { job_id, progress } => {
                 let state = self.job_states.entry(job_id).or_default();
                 let now = Instant::now();
@@ -365,6 +383,7 @@ impl SyncApp {
         }
         for state in self.job_states.values_mut() {
             state.paused = false;
+            state.offline = false;
         }
     }
 
@@ -1030,6 +1049,8 @@ impl SyncApp {
         let state = self.job_states.entry(job.id.clone()).or_default();
         let (status_color, status_label) = if state.running {
             (theme.accent, "Synchronisiert…".to_string())
+        } else if state.offline {
+            (theme.error, "Server nicht erreichbar".to_string())
         } else if state.paused {
             (theme.warning, "Pausiert".to_string())
         } else if let Some(stats) = state.stats {

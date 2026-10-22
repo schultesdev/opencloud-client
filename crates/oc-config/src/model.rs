@@ -18,6 +18,10 @@ fn default_max_parallel_transfers() -> u32 {
     DEFAULT_MAX_PARALLEL_TRANSFERS
 }
 
+fn default_propfind_pause_ms() -> u64 {
+    0
+}
+
 fn default_log_level() -> LogLevel {
     LogLevel::Info
 }
@@ -106,6 +110,10 @@ pub struct Settings {
     /// Maximum number of transfers (uploads/downloads) running in parallel.
     #[serde(default = "default_max_parallel_transfers")]
     pub max_parallel_transfers: u32,
+    /// Server-load throttle: pause in milliseconds between two folder
+    /// PROPFINDs of a remote scan; 0 disables it.
+    #[serde(default = "default_propfind_pause_ms")]
+    pub propfind_pause_ms: u64,
     /// Conflict resolution policy.
     #[serde(default)]
     pub conflict_policy: ConflictPolicy,
@@ -122,6 +130,7 @@ impl Default for Settings {
         Self {
             sync_interval_secs: DEFAULT_SYNC_INTERVAL_SECS,
             max_parallel_transfers: DEFAULT_MAX_PARALLEL_TRANSFERS,
+            propfind_pause_ms: 0,
             conflict_policy: ConflictPolicy::Ask,
             log_level: LogLevel::Info,
             autostart: false,

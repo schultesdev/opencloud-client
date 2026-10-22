@@ -36,6 +36,7 @@ fn sample_config() -> Config {
         settings: Settings {
             sync_interval_secs: 45,
             max_parallel_transfers: 8,
+            propfind_pause_ms: 250,
             conflict_policy: ConflictPolicy::KeepLocal,
             log_level: LogLevel::Debug,
             autostart: false,

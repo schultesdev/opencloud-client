@@ -139,6 +139,17 @@ impl ApiError {
         }
     }
 
+    /// Whether the server could not be reached at all (DNS or connect
+    /// failure): the caller is likely offline and should back off rather
+    /// than retry at full rate. Timeouts do not count — they usually
+    /// mean a slow server, not a missing network.
+    pub fn is_connectivity(&self) -> bool {
+        match self {
+            Self::Network(source) => source.is_connect(),
+            _ => false,
+        }
+    }
+
     /// A server-provided delay hint (`Retry-After` on 429), if present.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {

@@ -11,6 +11,7 @@
 
 mod assets;
 mod gui;
+mod logging;
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -20,6 +21,7 @@ use std::time::Duration;
 use clap::Parser;
 use oc_auth::{AuthClient, DEFAULT_LOGIN_TIMEOUT, KeyringStore, TokenManager};
 use oc_config::Account;
+use oc_config::LogLevel;
 use oc_db::{StatusDb, db_path};
 
 /// OpenCloud sync client.
@@ -62,6 +64,24 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    // Process logging (Phase 8): level from config.json, daily-rotating
+    // files under <config-dir>/logs. The guard flushes on drop; holding
+    // it until process end.
+    let log_dir = args
+        .config_dir
+        .clone()
+        .or_else(|| oc_config::default_config_dir().ok());
+    let log_level = log_dir
+        .as_deref()
+        .and_then(|dir| oc_config::load_config(dir).ok())
+        .map(|config| config.settings.log_level)
+        .unwrap_or(LogLevel::Info);
+    let _log_guard = logging::init(log_dir.as_deref(), log_level);
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "opencloud-sync starting (headless: {})",
+        args.headless
+    );
     let cli_only = args.headless
         || args.login.is_some()
         || args.list_spaces.is_some()
@@ -403,6 +423,7 @@ async fn run_headless(config_dir: Option<&std::path::Path>) -> Result<(), Box<dy
     let options = oc_sync::EngineOptions {
         sync_interval: Duration::from_secs(config.settings.sync_interval_secs),
         max_parallel_transfers: config.settings.max_parallel_transfers as usize,
+        propfind_pause: Duration::from_millis(config.settings.propfind_pause_ms),
         conflict_policy: config.settings.conflict_policy,
         ..oc_sync::EngineOptions::default()
     };
@@ -415,7 +436,10 @@ async fn run_headless(config_dir: Option<&std::path::Path>) -> Result<(), Box<dy
     loop {
         tokio::select! {
             event = engine.events_mut().recv() => match event {
-                Some(event) => println!("{event}"),
+                Some(event) => {
+                    tracing::info!("{event}");
+                    println!("{event}");
+                }
                 None => break,
             },
             _ = tokio::signal::ctrl_c() => break,

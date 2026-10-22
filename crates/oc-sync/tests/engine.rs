@@ -3,7 +3,8 @@
 //! side, folder renames, selective-sync filters, chunked range downloads,
 //! parallel transfers, conflicts, the root-ETag shortcut, crash recovery,
 //! pause/resume/stop, and the filesystem watcher (see `PLAN.md`, Phase 5) —
-//! plus conflict resolution and the conflict policies (Phase 6).
+//! plus conflict resolution and the conflict policies (Phase 6) and the
+//! offline backoff with reconnect (Phase 8).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -11,12 +12,14 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use oc_api::{StaticToken, WebDavClient};
+use oc_api::{RetryConfig, StaticToken, WebDavClient};
 use oc_config::ConflictPolicy;
 use oc_db::{ConflictResolution, ConflictStatus, EntryState, NewConflict, NewEntry, StatusDb};
 use oc_sync::{
     Engine, EngineEvent, EngineOptions, Job, JobCommand, ResolveOutcome, RunSummary, resolve,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -88,8 +91,8 @@ const ROOT_ZERO: &[(&str, bool, Option<&str>, Option<u64>)] =
 // --- Engine helpers --------------------------------------------------------
 
 /// Options for deterministic tests: no watcher, a long period, a small
-/// download chunk size, and no root-ETag shortcut unless a test asks
-/// for it.
+/// download chunk size, no root-ETag shortcut unless a test asks for
+/// it, and a fast offline backoff so connectivity tests stay quick.
 fn test_options() -> EngineOptions {
     EngineOptions {
         sync_interval: Duration::from_secs(600),
@@ -99,6 +102,9 @@ fn test_options() -> EngineOptions {
         download_chunk_size: 4,
         root_etag_shortcut: false,
         conflict_policy: ConflictPolicy::Ask,
+        propfind_pause: Duration::ZERO,
+        offline_backoff_base: Duration::from_millis(100),
+        offline_backoff_cap: Duration::from_millis(400),
     }
 }
 
@@ -138,6 +144,18 @@ impl Setup {
     fn engine(&self, options: EngineOptions) -> Engine {
         let dav =
             WebDavClient::new(&self.server.uri(), "sid", StaticToken::new("tok")).expect("client");
+        let db = StatusDb::open(&self.db_path).expect("db");
+        let job =
+            Job::new("job-1", &self.root, &self.include, &self.exclude, dav, db).expect("job");
+        Engine::start(vec![job], options).expect("engine")
+    }
+
+    /// Starts the engine with a client pointing at `server_url` instead
+    /// of the fixture's wiremock server (offline tests).
+    fn engine_at(&self, server_url: &str, options: EngineOptions) -> Engine {
+        let dav = WebDavClient::new(server_url, "sid", StaticToken::new("tok"))
+            .expect("client")
+            .with_retry(RetryConfig::immediate());
         let db = StatusDb::open(&self.db_path).expect("db");
         let job =
             Job::new("job-1", &self.root, &self.include, &self.exclude, dav, db).expect("job");
@@ -1635,5 +1653,203 @@ async fn conflict_copy_policy_keeps_a_dated_local_copy() {
     let entry = db.get_entry("a.txt").unwrap().unwrap();
     assert_eq!(entry.entry.state, EntryState::Synced);
     assert!(db.pending_conflicts().unwrap().is_empty());
+    engine.stop().await;
+}
+
+// --- Offline backoff & reconnect (Phase 8) ---------------------------------
+
+/// Binds a listener, notes its port, and drops it again — connections
+/// to that port then fail with "connection refused", like a switched-off
+/// server.
+fn dead_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.local_addr().expect("address").port()
+}
+
+/// The `Content-Length` of a request whose header block is given.
+fn request_body_len(headers: &str) -> usize {
+    headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())
+                .flatten()
+        })
+        .unwrap_or(0)
+}
+
+/// Serves a minimal WebDAV on `port`: every PROPFIND answers with the
+/// space root only (empty tree, ETag `"root-1"`), every other request
+/// (PUT) with `201 Created` + ETag `"created"`. One request per
+/// connection; connections are closed afterwards. It replaces the dead
+/// port of an offline test with a "reconnected" server.
+async fn serve_minimal_dav(port: u16) {
+    tokio::spawn(async move {
+        // The dead-port window may race with the bind; retry briefly.
+        let listener = loop {
+            match TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(listener) => break listener,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        let propfind_body = multistatus(&[("", true, Some("\"root-1\""), None)]);
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                continue;
+            };
+            let body = propfind_body.clone();
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Read until headers and (Content-Length) body arrived.
+                loop {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            buffer.extend_from_slice(&chunk[..read]);
+                            if let Some(split) =
+                                buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                            {
+                                let (headers, _) = buffer.split_at(split);
+                                let headers = String::from_utf8_lossy(headers);
+                                let body_len = request_body_len(&headers);
+                                if buffer.len() >= split + 4 + body_len {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                let response = if buffer.starts_with(b"PROPFIND") {
+                    format!(
+                        "HTTP/1.1 207 Multi-Status\r\n\
+                         Content-Type: application/xml; charset=utf-8\r\n\
+                         Connection: close\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    "HTTP/1.1 201 Created\r\nETag: \"created\"\r\n\
+                     Connection: close\r\nContent-Length: 0\r\n\r\n"
+                        .to_string()
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+}
+
+/// Collects the next `count` Offline events (their retry delays).
+async fn offline_retries(engine: &mut Engine, count: usize) -> Vec<Duration> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut retries = Vec::new();
+        loop {
+            match engine.events_mut().recv().await {
+                Some(EngineEvent::Offline { retry_in, .. }) => {
+                    retries.push(retry_in);
+                    if retries.len() == count {
+                        return retries;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("event stream closed"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for offline events")
+}
+
+#[tokio::test]
+async fn unreachable_server_pauses_with_doubling_backoff() {
+    let f = fixture(&[], &[]).await;
+    let port = dead_port();
+    let mut options = test_options();
+    options.offline_backoff_base = Duration::from_millis(100);
+    options.offline_backoff_cap = Duration::from_millis(400);
+    let mut engine = f.engine_at(&format!("http://127.0.0.1:{port}"), options);
+
+    // The first pass fails: the server is not reachable.
+    let (summary, _) = next_run(&mut engine).await;
+    assert_eq!(summary.errors, 1);
+
+    // Follow-up attempts double the delay up to the cap: 100, 200, 400, 400 ms.
+    let retries = offline_retries(&mut engine, 4).await;
+    assert_eq!(
+        retries,
+        [
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+            Duration::from_millis(400),
+        ]
+    );
+
+    // An explicit SyncNow cancels the backoff and restarts it at the
+    // base delay after the (still failing) run.
+    engine
+        .send("job-1", JobCommand::SyncNow)
+        .await
+        .expect("sync now");
+    let (summary, _) = next_run(&mut engine).await;
+    assert_eq!(summary.errors, 1);
+    let retries = offline_retries(&mut engine, 1).await;
+    assert_eq!(retries, [Duration::from_millis(100)]);
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn reconnect_emits_online_and_drains_the_queue() {
+    let f = fixture(&[], &[]).await;
+    let port = dead_port();
+    let mut options = test_options();
+    options.offline_backoff_base = Duration::from_millis(400);
+    options.offline_backoff_cap = Duration::from_millis(400);
+    let mut engine = f.engine_at(&format!("http://127.0.0.1:{port}"), options);
+
+    // First pass: the server is down, the job goes into backoff.
+    let (summary, _) = next_run(&mut engine).await;
+    assert_eq!(summary.errors, 1);
+    let retries = offline_retries(&mut engine, 1).await;
+    assert_eq!(retries, [Duration::from_millis(400)]);
+
+    // While the job is paused by the backoff, a local change queues up
+    // (nothing syncs yet: the server is still down).
+    std::fs::write(f.root.join("queued.txt"), "queued while offline").expect("write");
+
+    // The server comes back before the next retry.
+    serve_minimal_dav(port).await;
+
+    // The retry pass syncs the queued file and reports the recovery.
+    let (online, summary) = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut summary = None;
+        loop {
+            match engine.events_mut().recv().await {
+                Some(EngineEvent::RunFinished { summary: s, .. }) => summary = Some(s),
+                Some(EngineEvent::Online { job_id }) => return (job_id, summary),
+                Some(_) => {}
+                None => panic!("event stream closed"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for reconnect");
+    assert_eq!(online, "job-1");
+    let summary = summary.expect("a run finished before the Online event");
+    assert_eq!(
+        summary.uploads, 1,
+        "the queued file was synced: {summary:?}"
+    );
+    assert_eq!(summary.errors, 0);
+
+    let db = open_db(&f.db_path);
+    let entry = db
+        .get_entry("queued.txt")
+        .expect("db query")
+        .expect("entry");
+    assert_eq!(entry.entry.state, EntryState::Synced);
+    assert_eq!(entry.entry.remote_etag.as_deref(), Some("\"created\""));
     engine.stop().await;
 }

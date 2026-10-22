@@ -288,10 +288,11 @@ async fn restart_engine(
 }
 
 /// Forwards engine events into the GUI's event channel until the engine
-/// stops (channel closed).
+/// stops (channel closed). Every event also goes to the process log.
 fn spawn_forwarder(mut events: mpsc::UnboundedReceiver<EngineEvent>, gui: Sender<BackendEvent>) {
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
+            tracing::info!("{event}");
             if gui.send(BackendEvent::Engine(event)).is_err() {
                 break;
             }
@@ -312,6 +313,7 @@ fn engine_options(config: &Config) -> EngineOptions {
     EngineOptions {
         sync_interval: Duration::from_secs(config.settings.sync_interval_secs),
         max_parallel_transfers: config.settings.max_parallel_transfers as usize,
+        propfind_pause: Duration::from_millis(config.settings.propfind_pause_ms),
         conflict_policy: config.settings.conflict_policy,
         ..EngineOptions::default()
     }

@@ -217,7 +217,16 @@ impl SyncApp {
                     state.logged_in = Some(result.is_ok());
                 }
                 match result {
-                    Ok(()) => self.notify(format!("Konto '{account_id}' angemeldet")),
+                    Ok(()) => {
+                        self.notify(format!("Konto '{account_id}' angemeldet"));
+                        // Space names for display resolve via the Graph API.
+                        if let Some(state) = self.accounts.get_mut(&account_id) {
+                            state.spaces_pending = true;
+                        }
+                        self.backend.send(UiCommand::ListSpaces {
+                            account_id: account_id.clone(),
+                        });
+                    }
                     Err(error) => self.notify(format!("Login fehlgeschlagen: {error}")),
                 }
                 self.engine_restarted();
@@ -920,14 +929,65 @@ impl SyncApp {
         });
     }
 
+    /// The display name of the job's space: the stored name, or the name
+    /// resolved from the account's spaces list (Graph API). A freshly
+    /// resolved name is written back into `jobs.json` once, so the id
+    /// never surfaces again (also benefits CLI/headless).
+    fn display_space_name(&mut self, job: &SyncJob) -> String {
+        if let Some(name) = &job.space_name {
+            return name.clone();
+        }
+        let Some(name) = self.lookup_space_name(&job.account_id, &job.space_id) else {
+            return job.space_id.clone();
+        };
+        if let Some(stored) = self.jobs.jobs.iter_mut().find(|stored| stored.id == job.id) {
+            stored.space_name = Some(name.clone());
+            // Informational only — the engine does not read it, so no
+            // restart is triggered.
+            if let Err(error) = oc_config::save_jobs(&self.config_dir, &self.jobs) {
+                self.notify(format!("Speichern fehlgeschlagen: {error}"));
+            }
+        }
+        name
+    }
+
+    /// Looks a space name up in the account's loaded spaces list.
+    fn lookup_space_name(&self, account_id: &str, space_id: &str) -> Option<String> {
+        self.accounts
+            .get(account_id)?
+            .spaces
+            .as_ref()?
+            .as_ref()
+            .ok()?
+            .iter()
+            .find(|space| space.id == space_id)
+            .map(|space| space.name.clone())
+    }
+
+    /// Loads the spaces of every logged-in account (Graph API) — the
+    /// source of the space display names and the quota view.
+    fn bootstrap_space_names(&mut self) {
+        let logged_in: Vec<String> = self
+            .accounts
+            .iter()
+            .filter(|(_, state)| state.logged_in == Some(true))
+            .map(|(account_id, _)| account_id.clone())
+            .collect();
+        for account_id in logged_in {
+            if let Some(state) = self.accounts.get_mut(&account_id) {
+                state.spaces_pending = true;
+            }
+            self.backend.send(UiCommand::ListSpaces {
+                account_id: account_id.clone(),
+            });
+        }
+    }
+
     /// One row of the job table with its actions.
     fn show_job_row(&mut self, ui: &mut egui::Ui, job: &SyncJob) {
         let theme = theme::palette();
+        let space = self.display_space_name(job);
         let state = self.job_states.entry(job.id.clone()).or_default();
-        let space = job
-            .space_name
-            .clone()
-            .unwrap_or_else(|| job.space_id.clone());
         let (status_color, status_label) = if state.running {
             (theme.accent, "Synchronisiert…".to_string())
         } else if state.paused {
@@ -1684,7 +1744,8 @@ pub fn run(config_dir: Option<&Path>) -> Result<(), String> {
         None => oc_config::default_config_dir().map_err(|error| error.to_string())?,
     };
     let (backend, events) = crate::gui::backend::spawn(config_dir.clone())?;
-    let app = SyncApp::new(config_dir, backend, events)?;
+    let mut app = SyncApp::new(config_dir, backend, events)?;
+    app.bootstrap_space_names();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1040.0, 720.0])

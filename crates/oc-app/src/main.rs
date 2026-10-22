@@ -4,9 +4,13 @@
 //! via the event/command channels (see `oc-sync`) so that it can run without
 //! the GUI in `--headless` mode.
 //!
-//! Phase 5: headless mode runs the engine over all enabled jobs from
-//! `config.json`/`jobs.json` — one task per job, events printed to stdout,
-//! Ctrl-C to exit. The GUI lands in Phase 7.
+//! Without arguments the GUI starts (Phase 7): accounts, jobs, conflicts,
+//! the new-job wizard, and the tray. `--headless` runs the engine over all
+//! enabled jobs from `config.json`/`jobs.json` — one task per job, events
+//! printed to stdout, Ctrl-C to exit.
+
+mod assets;
+mod gui;
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -64,8 +68,11 @@ async fn main() {
         || args.conflicts
         || args.resolve.is_some();
     if !cli_only {
-        // The GUI lands in Phase 7; until then point users at headless mode.
-        println!("GUI not implemented yet (Phase 7); use --headless for engine-only mode");
+        // The GUI is the default; it blocks until the user quits.
+        if let Err(error) = gui::run(args.config_dir.as_deref()) {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
         return;
     }
     let config_dir = args.config_dir.as_deref();

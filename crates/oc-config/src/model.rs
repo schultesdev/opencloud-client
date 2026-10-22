@@ -112,6 +112,9 @@ pub struct Settings {
     /// Log verbosity.
     #[serde(default = "default_log_level")]
     pub log_level: LogLevel,
+    /// Start the app automatically at login (per-OS mechanism).
+    #[serde(default)]
+    pub autostart: bool,
 }
 
 impl Default for Settings {
@@ -121,6 +124,7 @@ impl Default for Settings {
             max_parallel_transfers: DEFAULT_MAX_PARALLEL_TRANSFERS,
             conflict_policy: ConflictPolicy::Ask,
             log_level: LogLevel::Info,
+            autostart: false,
         }
     }
 }

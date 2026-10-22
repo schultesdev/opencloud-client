@@ -336,6 +336,15 @@ impl Engine {
         &mut self.events
     }
 
+    /// Takes the engine's event stream out — for a consumer that forwards
+    /// it from its own task (the UI bridge, Phase 7). Calling this again,
+    /// or [`Engine::events_mut`] afterwards, yields an immediately closed
+    /// stream; decide on one consumer per engine instance.
+    pub fn take_events(&mut self) -> UnboundedReceiver<EngineEvent> {
+        let (_, closed) = mpsc::unbounded_channel();
+        std::mem::replace(&mut self.events, closed)
+    }
+
     /// Sends a command to one job; errors when the job is unknown or its
     /// task has stopped.
     pub async fn send(

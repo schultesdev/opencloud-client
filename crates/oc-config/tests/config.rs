@@ -17,6 +17,7 @@ fn job(id: &str, account_id: &str) -> SyncJob {
         id: id.into(),
         account_id: account_id.into(),
         space_id: "storage-users-1$89ad5ad2-dead-beef".into(),
+        space_name: Some("Projekt Mars".into()),
         local_path: PathBuf::from(if cfg!(windows) {
             r"C:\Users\max\OpenCloud\projekt-mars"
         } else {
@@ -37,6 +38,7 @@ fn sample_config() -> Config {
             max_parallel_transfers: 8,
             conflict_policy: ConflictPolicy::KeepLocal,
             log_level: LogLevel::Debug,
+            autostart: false,
         },
     }
 }

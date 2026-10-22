@@ -289,7 +289,7 @@ Remote geändert? = ETag != DB-Werte
 
 ### Phase 7 — GUI (`oc-app`, ca. 1–2 Wochen)
 
-- [ ] **Hauptfenster** mit drei Bereichen:
+- [x] **Hauptfenster** mit drei Bereichen:
   1. **Konten & Server**: Server-URL, Login-Button (öffnet Browser, siehe
      Phase 2), Status (Token gültig, Space-Quota), Logout.
   2. **Sync-Jobs**: Tabelle aller Jobs (Space-Name, lokaler Pfad, Status,
@@ -298,18 +298,18 @@ Remote geändert? = ETag != DB-Werte
   3. **Konflikte**: Liste aller offenen Konflikte aller Jobs mit Zeitstempel,
      lokaler/remote mtime+size, Buttons je Zeile: "Server-Datei übernehmen",
      "Client-Datei behalten", "Alle Server / Alle lokal" als Sammelaktion.
-- [ ] **Neuen Job anlegen** (Wizard): Space aus `GET /me/drives` wählen →
+- [x] **Neuen Job anlegen** (Wizard): Space aus `GET /me/drives` wählen →
   lokales Zielverzeichnis wählen → **Ordnerauswahl pro Space**: Remote-Baum via
   PROPFIND laden, Checkboxen je Ordner → schreibt `include`-Liste → Job speichern.
-- [ ] **Statusanzeige pro Verzeichnis**: Fortschritt während Sync
+- [x] **Statusanzeige pro Verzeichnis**: Fortschritt während Sync
   (aktuelle Datei, Warteschlange), Fehlerliste, Konfliktanzahl als Badge im
   Tray-Tooltip.
-- [ ] **Tray-Icon**: Status (Sync läuft / Fehler / Konflikt), Fenster
+- [x] **Tray-Icon**: Status (Sync läuft / Fehler / Konflikt), Fenster
   zeigen/beenden, Pause alles. Fenster-Schließen minimiert in Tray (nicht
   beenden).
-- [ ] Autostart je OS (Registry-Eintrag Windows, LaunchAgent macOS,
+- [x] Autostart je OS (Registry-Eintrag Windows, LaunchAgent macOS,
   `~/.config/autostart` Linux) als Einstellung.
-- [ ] Engine-Anbindung ausschließlich über den Event-/Command-Kanal (kein
+- [x] Engine-Anbindung ausschließlich über den Event-/Command-Kanal (kein
   gemeinsamer State) → GUI-Code dünn und testbar.
 
 ### Phase 8 — Robustheit & Reife (kontinuierlich, ca. 1 Woche)

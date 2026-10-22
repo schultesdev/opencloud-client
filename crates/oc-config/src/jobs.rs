@@ -15,6 +15,9 @@ pub struct SyncJob {
     pub account_id: String,
     /// Id of the OpenCloud space to sync (e.g. `storage-users-1$89ad5ad2-...`).
     pub space_id: String,
+    /// Display name of the space (filled by the GUI; informational only).
+    #[serde(default)]
+    pub space_name: Option<String>,
     /// Absolute local directory that mirrors the space.
     pub local_path: PathBuf,
     /// Whether the job is active.
@@ -130,6 +133,7 @@ mod tests {
             id: "job-1".into(),
             account_id: "konto-1".into(),
             space_id: "storage-users-1$abc".into(),
+            space_name: None,
             local_path: PathBuf::from("/tmp/sync"),
             enabled: false,
             include: vec![],

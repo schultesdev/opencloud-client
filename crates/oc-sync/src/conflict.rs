@@ -117,7 +117,7 @@ async fn resolve_server<P: TokenProvider>(
         etag: Some(etag),
         size: conflict.remote_size,
     };
-    match transfer::download(dav, local_root, &conflict.path, &remote, chunk_size).await? {
+    match transfer::download(dav, local_root, &conflict.path, &remote, chunk_size, None).await? {
         TransferResult::Done(meta) => {
             record_resolved(
                 db,
@@ -162,6 +162,7 @@ async fn resolve_local<P: TokenProvider>(
         &conflict.path,
         conflict.remote_etag.clone(),
         create,
+        None,
     )
     .await?
     {

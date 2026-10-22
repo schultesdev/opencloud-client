@@ -189,6 +189,12 @@ pub fn danger(ui: &mut Ui, label: impl Into<egui::WidgetText>) -> Response {
     )
 }
 
+/// A single-line label that ellipsizes when it does not fit the row
+/// (paths, URLs), so right-aligned buttons never overlap the text.
+pub fn ellipsis(ui: &mut Ui, text: impl Into<egui::WidgetText>) -> Response {
+    ui.add(egui::Label::new(text).truncate())
+}
+
 /// A colored status dot followed by a label.
 pub fn status(ui: &mut Ui, color: Color32, label: impl Into<RichText>) {
     ui.horizontal(|ui| {

@@ -36,6 +36,7 @@ use oc_config::{Account, Config, ConflictPolicy, Jobs, LogLevel, Settings, SyncJ
 use oc_db::{Conflict, ConflictResolution, Stats, StatusDb, db_path};
 use oc_sync::EngineEvent;
 use oc_sync::JobCommand;
+use oc_sync::RunProgress;
 use oc_sync::RunSummary;
 
 use crate::gui::backend::BackendEvent;
@@ -88,6 +89,13 @@ struct JobUi {
     conflicts: Vec<Conflict>,
     /// Entries currently transferring (from the last stats refresh).
     transfers: Vec<String>,
+    /// Live progress of the running pass (progress events).
+    progress: Option<RunProgress>,
+    /// Bytes and arrival time of the last progress event — the basis
+    /// of the speed estimate.
+    progress_at: Option<(u64, Instant)>,
+    /// Smoothed transfer speed in bytes/s (exponential average).
+    speed_bps: f64,
 }
 
 /// Form state for a new account.
@@ -284,11 +292,40 @@ impl SyncApp {
     fn apply_engine_event(&mut self, event: EngineEvent) {
         match event {
             EngineEvent::RunStarted { job_id } => {
-                self.job_states.entry(job_id).or_default().running = true;
+                let state = self.job_states.entry(job_id).or_default();
+                state.running = true;
+                state.progress = None;
+                state.progress_at = None;
+                state.speed_bps = 0.0;
+            }
+            EngineEvent::Progress { job_id, progress } => {
+                let state = self.job_states.entry(job_id).or_default();
+                let now = Instant::now();
+                if let Some((previous, at)) = state.progress_at {
+                    // Bytes can briefly regress on a retried transfer;
+                    // only rising samples feed the speed estimate.
+                    let gain = progress.bytes_done.saturating_sub(previous);
+                    let elapsed = now.duration_since(at).as_secs_f64();
+                    if gain > 0 && elapsed > 0.05 {
+                        let rate = gain as f64 / elapsed;
+                        state.speed_bps = if state.speed_bps == 0.0 {
+                            rate
+                        } else {
+                            // Smoothed average: new samples shift it
+                            // by 40%.
+                            state.speed_bps * 0.6 + rate * 0.4
+                        };
+                    }
+                }
+                state.progress_at = Some((progress.bytes_done, now));
+                state.progress = Some(progress);
             }
             EngineEvent::RunFinished { job_id, summary } => {
                 let state = self.job_states.entry(job_id).or_default();
                 state.running = false;
+                state.progress = None;
+                state.progress_at = None;
+                state.speed_bps = 0.0;
                 state.last_summary = Some(summary);
             }
             EngineEvent::Failed {
@@ -537,6 +574,11 @@ impl SyncApp {
                         ui.add_space(6.0);
                     }
                     self.tab = tab;
+                    // The button block is the last element: a
+                    // right-to-left layout claims the remaining width,
+                    // so anything after it would land outside the
+                    // panel. Placed last, its buttons pin to the right
+                    // edge.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if theme::primary(ui, "+ Neuen Job anlegen").clicked()
                             && self.wizard.is_none()
@@ -573,75 +615,73 @@ impl SyncApp {
                 let state = self.accounts.entry(account.id.clone()).or_default();
                 let logged_in = state.logged_in == Some(true);
                 theme::card().show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    // One right-to-left row: the right edge is filled
+                    // first (status, buttons), the text block last — it
+                    // gets the remaining width and ellipsizes instead
+                    // of running under the buttons.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if logged_in {
+                            theme::status(ui, theme.success, "Angemeldet");
+                        } else {
+                            theme::status(ui, theme.text_dim, "Nicht angemeldet");
+                        }
+                        ui.add_space(6.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if state.spaces_pending {
+                                ui.label(
+                                    egui::RichText::new("Lade Spaces…")
+                                        .small()
+                                        .color(theme.text_dim),
+                                );
+                            } else if theme::quiet(ui, "Spaces & Quota").clicked() {
+                                state.spaces_pending = true;
+                                state.spaces = None;
+                                self.backend.send(UiCommand::ListSpaces {
+                                    account_id: account.id.clone(),
+                                });
+                            }
+                            if state.logout_pending {
+                                ui.label(
+                                    egui::RichText::new("Abmeldung…")
+                                        .small()
+                                        .color(theme.text_dim),
+                                );
+                            } else if logged_in && theme::danger(ui, "Abmelden").clicked() {
+                                state.logout_pending = true;
+                                self.backend.send(UiCommand::Logout {
+                                    account_id: account.id.clone(),
+                                });
+                            }
+                            if state.login_pending {
+                                ui.label(
+                                    egui::RichText::new("Login läuft — im Browser anmelden…")
+                                        .small()
+                                        .color(theme.accent),
+                                );
+                            } else if !logged_in && theme::primary(ui, "Anmelden").clicked() {
+                                state.login_pending = true;
+                                self.backend.send(UiCommand::Login {
+                                    account_id: account.id.clone(),
+                                });
+                            }
+                        });
                         theme::avatar(ui, &initial_of(&account.username), theme.accent);
                         ui.vertical(|ui| {
-                            ui.label(
+                            theme::ellipsis(
+                                ui,
                                 egui::RichText::new(&account.id)
                                     .strong()
                                     .size(15.0)
                                     .color(theme.text),
                             );
-                            ui.label(
+                            theme::ellipsis(
+                                ui,
                                 egui::RichText::new(format!(
                                     "{} · {}",
                                     account.server_url, account.username
                                 ))
                                 .small()
                                 .color(theme.text_dim),
-                            );
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if logged_in {
-                                theme::status(ui, theme.success, "Angemeldet");
-                            } else {
-                                theme::status(ui, theme.text_dim, "Nicht angemeldet");
-                            }
-                            ui.add_space(6.0);
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if state.spaces_pending {
-                                        ui.label(
-                                            egui::RichText::new("Lade Spaces…")
-                                                .small()
-                                                .color(theme.text_dim),
-                                        );
-                                    } else if theme::quiet(ui, "Spaces & Quota").clicked() {
-                                        state.spaces_pending = true;
-                                        state.spaces = None;
-                                        self.backend.send(UiCommand::ListSpaces {
-                                            account_id: account.id.clone(),
-                                        });
-                                    }
-                                    if state.logout_pending {
-                                        ui.label(
-                                            egui::RichText::new("Abmeldung…")
-                                                .small()
-                                                .color(theme.text_dim),
-                                        );
-                                    } else if logged_in && theme::danger(ui, "Abmelden").clicked() {
-                                        state.logout_pending = true;
-                                        self.backend.send(UiCommand::Logout {
-                                            account_id: account.id.clone(),
-                                        });
-                                    }
-                                    if state.login_pending {
-                                        ui.label(
-                                            egui::RichText::new(
-                                                "Login läuft — im Browser anmelden…",
-                                            )
-                                            .small()
-                                            .color(theme.accent),
-                                        );
-                                    } else if !logged_in && theme::primary(ui, "Anmelden").clicked()
-                                    {
-                                        state.login_pending = true;
-                                        self.backend.send(UiCommand::Login {
-                                            account_id: account.id.clone(),
-                                        });
-                                    }
-                                },
                             );
                         });
                     });
@@ -1016,35 +1056,113 @@ impl SyncApp {
             .unwrap_or_else(|| "—".into());
 
         theme::card().show(ui, |ui| {
-            ui.horizontal(|ui| {
+            // One right-to-left row: the right edge is filled first
+            // (status, buttons), the text block last — it gets the
+            // remaining width and ellipsizes instead of running under
+            // the buttons.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                theme::status(ui, status_color, status_label);
+                ui.add_space(8.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::danger(ui, "Entfernen…").clicked() {
+                        self.confirm_remove = Some(job.id.clone());
+                    }
+                    if theme::quiet(ui, "Ordner…").clicked() {
+                        self.wizard = Some(Wizard::edit_folders(job));
+                    }
+                    if theme::quiet(ui, "Öffnen").clicked() {
+                        open_in_file_manager(&job.local_path);
+                    }
+                    if state.paused {
+                        if theme::quiet(ui, "Fortsetzen").clicked() {
+                            state.paused = false;
+                            self.backend.send(UiCommand::JobCmd {
+                                job_id: job.id.clone(),
+                                command: JobCommand::Resume,
+                            });
+                        }
+                    } else if theme::quiet(ui, "Pausieren").clicked() {
+                        state.paused = true;
+                        self.backend.send(UiCommand::JobCmd {
+                            job_id: job.id.clone(),
+                            command: JobCommand::Pause,
+                        });
+                    }
+                    if theme::primary(ui, "Jetzt synchronisieren").clicked() {
+                        state.paused = false;
+                        self.backend.send(UiCommand::JobCmd {
+                            job_id: job.id.clone(),
+                            command: JobCommand::SyncNow,
+                        });
+                    }
+                });
                 theme::avatar(ui, &initial_of(&space), theme.accent);
                 ui.vertical(|ui| {
-                    ui.label(
+                    theme::ellipsis(
+                        ui,
                         egui::RichText::new(&space)
                             .strong()
                             .size(15.0)
                             .color(theme.text),
                     );
-                    ui.label(
+                    theme::ellipsis(
+                        ui,
                         egui::RichText::new(job.local_path.display().to_string())
                             .small()
                             .color(theme.text_dim),
                     );
                     ui.add_space(2.0);
-                    ui.label(
+                    theme::ellipsis(
+                        ui,
                         egui::RichText::new(format!("Letzter Sync: {last_sync}  ·  {files}"))
                             .small()
                             .color(theme.text_dim),
                     );
+                    if state.running {
+                        if let Some(progress) = state.progress.filter(|p| p.transfers_total > 0) {
+                            let remaining =
+                                progress.bytes_total.saturating_sub(progress.bytes_done);
+                            let speed = state.speed_bps;
+                            let eta = (speed >= 1.0)
+                                .then(|| Duration::from_secs((remaining as f64 / speed) as u64));
+                            let label = format!(
+                                "{} von {} Dateien · {} / {}",
+                                progress.transfers_done,
+                                progress.transfers_total,
+                                format_bytes(progress.bytes_done),
+                                format_bytes(progress.bytes_total),
+                            );
+                            let label = if speed >= 1.0 {
+                                match eta {
+                                    Some(eta) => format!(
+                                        "{label} · {}/s · noch {}",
+                                        format_bytes(speed as u64),
+                                        format_eta(eta)
+                                    ),
+                                    None => format!("{label} · {}/s", format_bytes(speed as u64)),
+                                }
+                            } else {
+                                label
+                            };
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::ProgressBar::new(progress.fraction())
+                                    .desired_width(f32::INFINITY)
+                                    .text(egui::RichText::new(label).small().color(theme.text)),
+                            );
+                        }
+                    }
                     if !state.transfers.is_empty() {
-                        ui.label(
+                        theme::ellipsis(
+                            ui,
                             egui::RichText::new(format!("Aktuell: {}", state.transfers.join(", ")))
                                 .small()
                                 .color(theme.accent),
                         );
                     }
                     if let Some(summary) = &state.last_summary {
-                        ui.label(
+                        theme::ellipsis(
+                            ui,
                             egui::RichText::new(format!(
                                 "Letzter Lauf: {summary}{}",
                                 if summary.remote_scan_skipped {
@@ -1057,43 +1175,6 @@ impl SyncApp {
                             .color(theme.text_dim),
                         );
                     }
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                    theme::status(ui, status_color, status_label);
-                    ui.add_space(8.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::danger(ui, "Entfernen…").clicked() {
-                            self.confirm_remove = Some(job.id.clone());
-                        }
-                        if theme::quiet(ui, "Ordner…").clicked() {
-                            self.wizard = Some(Wizard::edit_folders(job));
-                        }
-                        if theme::quiet(ui, "Öffnen").clicked() {
-                            open_in_file_manager(&job.local_path);
-                        }
-                        if state.paused {
-                            if theme::quiet(ui, "Fortsetzen").clicked() {
-                                state.paused = false;
-                                self.backend.send(UiCommand::JobCmd {
-                                    job_id: job.id.clone(),
-                                    command: JobCommand::Resume,
-                                });
-                            }
-                        } else if theme::quiet(ui, "Pausieren").clicked() {
-                            state.paused = true;
-                            self.backend.send(UiCommand::JobCmd {
-                                job_id: job.id.clone(),
-                                command: JobCommand::Pause,
-                            });
-                        }
-                        if theme::primary(ui, "Jetzt synchronisieren").clicked() {
-                            state.paused = false;
-                            self.backend.send(UiCommand::JobCmd {
-                                job_id: job.id.clone(),
-                                command: JobCommand::SyncNow,
-                            });
-                        }
-                    });
                 });
             });
         });
@@ -1161,9 +1242,27 @@ impl SyncApp {
                 for conflict in list {
                     ui.add_space(6.0);
                     theme::card().show(ui, |ui| {
-                        ui.horizontal(|ui| {
+                        // One right-to-left row: the resolution buttons
+                        // come first (right edge), the path block last —
+                        // it gets the remaining width and ellipsizes.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::primary(ui, "Client behalten").clicked() {
+                                self.backend.send(UiCommand::ResolveConflict {
+                                    job_id: job_id.clone(),
+                                    conflict_id: conflict.id,
+                                    resolution: ConflictResolution::Local,
+                                });
+                            }
+                            if theme::quiet(ui, "Server übernehmen").clicked() {
+                                self.backend.send(UiCommand::ResolveConflict {
+                                    job_id: job_id.clone(),
+                                    conflict_id: conflict.id,
+                                    resolution: ConflictResolution::Server,
+                                });
+                            }
                             ui.vertical(|ui| {
-                                ui.label(
+                                theme::ellipsis(
+                                    ui,
                                     egui::RichText::new(&conflict.path)
                                         .strong()
                                         .size(15.0)
@@ -1212,25 +1311,6 @@ impl SyncApp {
                                     );
                                 });
                             });
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if theme::primary(ui, "Client behalten").clicked() {
-                                        self.backend.send(UiCommand::ResolveConflict {
-                                            job_id: job_id.clone(),
-                                            conflict_id: conflict.id,
-                                            resolution: ConflictResolution::Local,
-                                        });
-                                    }
-                                    if theme::quiet(ui, "Server übernehmen").clicked() {
-                                        self.backend.send(UiCommand::ResolveConflict {
-                                            job_id: job_id.clone(),
-                                            conflict_id: conflict.id,
-                                            resolution: ConflictResolution::Server,
-                                        });
-                                    }
-                                },
-                            );
                         });
                     });
                 }
@@ -1452,12 +1532,18 @@ impl SyncApp {
     fn show_wizard_local(&mut self, ui: &mut egui::Ui, wizard: &mut Wizard) {
         let theme = theme::palette();
         ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut wizard.local_path);
-            if theme::quiet(ui, "Durchsuchen…").clicked() {
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    wizard.local_path = path.display().to_string();
+            // The browse button is allocated first (rightmost edge), so a
+            // long path in the edit field clips instead of running under it.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::quiet(ui, "Durchsuchen…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        wizard.local_path = path.display().to_string();
+                    }
                 }
-            }
+                ui.add(
+                    egui::TextEdit::singleline(&mut wizard.local_path).desired_width(f32::INFINITY),
+                );
+            });
         });
         if !wizard.local_path.trim().is_empty() {
             let path = PathBuf::from(wizard.local_path.trim());
@@ -1536,30 +1622,9 @@ impl SyncApp {
         let backend = self.backend.clone();
         let path = resource.path.clone();
         let name = resource.name.clone();
-        ui.horizontal(|ui| {
-            ui.add_space(depth as f32 * 16.0);
-            let mut checked = wizard.tree.selected.contains(&path);
-            if ui.checkbox(&mut checked, &name).changed() {
-                let prefix = format!("{path}/");
-                let descendants: Vec<String> = wizard
-                    .tree
-                    .selected
-                    .iter()
-                    .filter(|selected| selected.starts_with(&prefix))
-                    .cloned()
-                    .collect();
-                for descendant in descendants {
-                    wizard.tree.selected.remove(&descendant);
-                }
-                if checked {
-                    wizard.tree.selected.insert(path.clone());
-                } else {
-                    wizard.tree.selected.remove(&path);
-                }
-            }
-            if wizard.tree.descendant_selected(&path) {
-                ui.weak("(teilweise)");
-            }
+        // Right-to-left: the expand toggle is allocated first (rightmost
+        // edge), so long folder names clip instead of running under it.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let expanded = wizard.tree.expanded.contains(&path);
             let loaded = wizard.tree.children.contains_key(&path);
             let toggle = if wizard.tree.loading.contains_key(&path) {
@@ -1580,6 +1645,29 @@ impl SyncApp {
                     wizard.tree.expanded.insert(path.clone());
                 }
             }
+            if wizard.tree.descendant_selected(&path) {
+                ui.weak("(teilweise)");
+            }
+            let mut checked = wizard.tree.selected.contains(&path);
+            if ui.checkbox(&mut checked, &name).changed() {
+                let prefix = format!("{path}/");
+                let descendants: Vec<String> = wizard
+                    .tree
+                    .selected
+                    .iter()
+                    .filter(|selected| selected.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                for descendant in descendants {
+                    wizard.tree.selected.remove(&descendant);
+                }
+                if checked {
+                    wizard.tree.selected.insert(path.clone());
+                } else {
+                    wizard.tree.selected.remove(&path);
+                }
+            }
+            ui.add_space(depth as f32 * 16.0);
         });
         if wizard.tree.expanded.contains(&path) {
             let children = wizard.tree.children.get(&path).cloned().unwrap_or_default();
@@ -1805,6 +1893,18 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Formats a remaining time for humans (`45 s`, `2 min 05 s`, `1 h 12 min`).
+fn format_eta(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        format!("{secs} s")
+    } else if secs < 3600 {
+        format!("{} min {:02} s", secs / 60, secs % 60)
+    } else {
+        format!("{} h {:02} min", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 /// Formats a unix timestamp as `TT.MM.JJJJ SS:MM:SS` (UTC).
 fn format_unix(unix: i64) -> String {
     let days = unix.div_euclid(86_400);
@@ -1917,6 +2017,13 @@ mod tests {
     fn format_bytes_scales() {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(2048), "2.0 KB");
+    }
+
+    #[test]
+    fn format_eta_scales() {
+        assert_eq!(format_eta(Duration::from_secs(45)), "45 s");
+        assert_eq!(format_eta(Duration::from_secs(125)), "2 min 05 s");
+        assert_eq!(format_eta(Duration::from_secs(4320)), "1 h 12 min");
     }
 
     #[test]

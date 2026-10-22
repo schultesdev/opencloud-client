@@ -1,6 +1,7 @@
 //! WebDAV client for one space: PROPFIND (structure + metadata), GET, PUT
 //! (with `If-Match`/`If-None-Match`), MKCOL, MOVE, COPY, DELETE.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::{CONTENT_TYPE, ETAG};
@@ -212,22 +213,33 @@ impl<P: TokenProvider> WebDavClient<P> {
         content: impl AsRef<[u8]>,
         condition: Option<WriteCondition>,
     ) -> Result<Option<String>, ApiError> {
+        self.put_with_progress(path, content, condition, |_| {})
+            .await
+    }
+
+    /// Uploads a file like [`WebDavClient::put_with`], but streams the
+    /// body to the server in chunks and reports live progress: as the
+    /// request body is read for sending, `progress` receives the
+    /// cumulative byte count of the current attempt. A retried attempt
+    /// restarts the count at 0.
+    pub async fn put_with_progress(
+        &self,
+        path: &str,
+        content: impl AsRef<[u8]>,
+        condition: Option<WriteCondition>,
+        progress: impl Fn(u64) + Send + Sync + 'static,
+    ) -> Result<Option<String>, ApiError> {
         let url = build_url(&self.base, path)?;
         let timeout = self.http.transfer_timeout();
+        let content = content.as_ref().to_vec();
+        let progress = Arc::new(progress);
         let response = self
             .http
-            .send(timeout, |token| {
+            .send(timeout, move |token| {
                 let mut request = self.http.http().put(url.clone()).bearer_auth(token);
-                match &condition {
-                    Some(WriteCondition::IfMatch { etag }) => {
-                        request = request.header("If-Match", etag);
-                    }
-                    Some(WriteCondition::CreateNew) => {
-                        request = request.header("If-None-Match", "*");
-                    }
-                    None => {}
-                }
-                request.body(content.as_ref().to_vec())
+                request = apply_condition(request, &condition);
+                let body = progress_body(content.clone(), progress.clone());
+                request.body(body)
             })
             .await?;
         Ok(response
@@ -334,4 +346,43 @@ fn webdav_method(name: &[u8]) -> Result<Method, ApiError> {
             String::from_utf8_lossy(name)
         ))
     })
+}
+
+/// Adds an optimistic-write condition's header to a PUT request.
+fn apply_condition(
+    mut request: reqwest::RequestBuilder,
+    condition: &Option<WriteCondition>,
+) -> reqwest::RequestBuilder {
+    match condition {
+        Some(WriteCondition::IfMatch { etag }) => request = request.header("If-Match", etag),
+        Some(WriteCondition::CreateNew) => request = request.header("If-None-Match", "*"),
+        None => {}
+    }
+    request
+}
+
+/// A request body that serves `content` in chunks and reports the
+/// cumulative byte count to `progress` per chunk — the basis of live
+/// upload progress ([`WebDavClient::put_with_progress`]). Hyper pulls the
+/// stream with network backpressure, so the reports follow the actual
+/// sending rate. One instance serves exactly one attempt; retries build
+/// a fresh one.
+fn progress_body(content: Vec<u8>, progress: Arc<dyn Fn(u64) + Send + Sync>) -> reqwest::Body {
+    const CHUNK: usize = 64 * 1024;
+    reqwest::Body::wrap_stream(futures_util::stream::unfold(
+        (content, 0usize, progress),
+        |(content, offset, progress)| async move {
+            if offset >= content.len() {
+                None
+            } else {
+                let end = (offset + CHUNK).min(content.len());
+                let chunk = content[offset..end].to_vec();
+                progress(end as u64);
+                Some((
+                    Ok::<Vec<u8>, std::convert::Infallible>(chunk),
+                    (content, end, progress),
+                ))
+            }
+        },
+    ))
 }

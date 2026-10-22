@@ -281,6 +281,59 @@ async fn new_local_file_is_uploaded_with_create_condition() {
 }
 
 #[tokio::test]
+async fn run_reports_live_transfer_progress() {
+    let f = fixture(&[], &[]).await;
+
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    mount_propfind(&f.server, "", "1", &[("", true, Some("\"root-1\""), None)]).await;
+    for (name, body) in [("a.txt", "aaaa"), ("b.txt", "bb")] {
+        Mock::given(method("PUT"))
+            .and(path(format!("/dav/spaces/sid/{name}")))
+            .and(header("If-None-Match", "*"))
+            .respond_with(ResponseTemplate::new(201).append_header("ETag", "\"x\""))
+            .expect(1)
+            .mount(&f.server)
+            .await;
+        std::fs::write(f.root.join(name), body).expect("write");
+    }
+
+    let mut engine = f.engine(test_options());
+    let (summary, events) = next_run(&mut engine).await;
+    assert_eq!(summary.uploads, 2);
+    assert_eq!(summary.errors, 0);
+
+    // The run published its plan (2 files, 6 bytes) and, throttled, its
+    // progress up to the completed state.
+    let progress: Vec<oc_sync::RunProgress> = events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::Progress { progress, .. } => Some(*progress),
+            _ => None,
+        })
+        .collect();
+    assert!(!progress.is_empty(), "expected progress events");
+    assert_eq!(
+        progress.first(),
+        Some(&oc_sync::RunProgress {
+            transfers_total: 2,
+            transfers_done: 0,
+            bytes_total: 6,
+            bytes_done: 0,
+        })
+    );
+    assert_eq!(
+        progress.last(),
+        Some(&oc_sync::RunProgress {
+            transfers_total: 2,
+            transfers_done: 2,
+            bytes_total: 6,
+            bytes_done: 6,
+        })
+    );
+    engine.stop().await;
+}
+
+#[tokio::test]
 async fn local_change_uploads_with_if_match() {
     let mut options = test_options();
     // Keep the chunked path out of this test; the change is about PUT.

@@ -32,6 +32,9 @@ use crate::conflict::{self, ResolveOutcome};
 use crate::diff::{self, SyncAction};
 use crate::error::SyncError;
 use crate::filter::Filter;
+use crate::progress::RunProgress;
+use crate::progress::RunTracker;
+use crate::progress::TransferHandle;
 use crate::scan::{self, LocalNode, RemoteNode};
 use crate::transfer::{self, TransferResult};
 use crate::watch::LocalWatcher;
@@ -161,6 +164,14 @@ pub enum EngineEvent {
         /// The job's identifier.
         job_id: String,
     },
+    /// Live progress of the running pass's transfers — sent when the
+    /// plan is known, then throttled while transfers stream.
+    Progress {
+        /// The job's identifier.
+        job_id: String,
+        /// The aggregated transfer progress.
+        progress: RunProgress,
+    },
     /// A sync pass finished.
     RunFinished {
         /// The job's identifier.
@@ -206,6 +217,20 @@ impl fmt::Display for EngineEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RunStarted { job_id } => write!(f, "[{job_id}] sync run started"),
+            Self::Progress {
+                job_id,
+                progress:
+                    RunProgress {
+                        transfers_done,
+                        transfers_total,
+                        bytes_done,
+                        bytes_total,
+                    },
+            } => write!(
+                f,
+                "[{job_id}] {transfers_done}/{transfers_total} transfers, \
+                 {bytes_done}/{bytes_total} bytes"
+            ),
             Self::RunFinished { job_id, summary } => {
                 write!(f, "[{job_id}] sync run finished: {summary}")
             }
@@ -446,10 +471,13 @@ async fn job_loop<P: TokenProvider + 'static>(
     });
 }
 
-/// A queued transfer: its kind, path, and the running task.
+/// A queued transfer: its kind, path, planned bytes, progress handle,
+/// and the running task.
 type QueuedTransfer = (
     PendingTransfer,
     String,
+    u64,
+    TransferHandle,
     JoinHandle<Result<TransferResult, SyncError>>,
 );
 
@@ -589,6 +617,29 @@ async fn run_once<P: TokenProvider + 'static>(
 
     let plan = diff::build(&local, &remote, &db_entries, &frozen);
 
+    // What the run plans to move — the denominator of the live
+    // progress events (uploads weigh their local size, downloads their
+    // reported remote size; unknown sizes count as 0).
+    let mut transfers_total = 0usize;
+    let mut bytes_total = 0u64;
+    for action in &plan {
+        match action {
+            SyncAction::Upload { path, .. } => {
+                transfers_total += 1;
+                bytes_total += planned_bytes(local.get(path).and_then(|node| node.size));
+            }
+            SyncAction::Download { remote, .. } => {
+                transfers_total += 1;
+                bytes_total += planned_bytes(remote.size);
+            }
+            _ => {}
+        }
+    }
+    let tracker = RunTracker::new(&job.id, events.clone(), transfers_total, bytes_total);
+    if transfers_total > 0 {
+        tracker.announce();
+    }
+
     let semaphore = Arc::new(Semaphore::new(options.max_parallel_transfers.max(1)));
     let mut transfers: Vec<QueuedTransfer> = Vec::new();
 
@@ -699,34 +750,32 @@ async fn run_once<P: TokenProvider + 'static>(
             } => {
                 let _ = mark_state(&job.db, &path, EntryState::Uploading);
                 let kind = PendingTransfer::Upload { base_etag, create };
-                transfers.push((
+                let planned = planned_bytes(local.get(&path).and_then(|node| node.size));
+                let (handle, task) = spawn_transfer(
+                    job.dav.clone(),
+                    job.local_root.clone(),
+                    options.download_chunk_size,
+                    semaphore.clone(),
+                    tracker.clone(),
                     kind.clone(),
                     path.clone(),
-                    spawn_transfer(
-                        job.dav.clone(),
-                        job.local_root.clone(),
-                        options.download_chunk_size,
-                        semaphore.clone(),
-                        kind,
-                        path,
-                    ),
-                ));
+                );
+                transfers.push((kind, path, planned, handle, task));
             }
             SyncAction::Download { path, remote } => {
                 let _ = mark_state(&job.db, &path, EntryState::Downloading);
+                let planned = planned_bytes(remote.size);
                 let kind = PendingTransfer::Download { remote };
-                transfers.push((
+                let (handle, task) = spawn_transfer(
+                    job.dav.clone(),
+                    job.local_root.clone(),
+                    options.download_chunk_size,
+                    semaphore.clone(),
+                    tracker.clone(),
                     kind.clone(),
                     path.clone(),
-                    spawn_transfer(
-                        job.dav.clone(),
-                        job.local_root.clone(),
-                        options.download_chunk_size,
-                        semaphore.clone(),
-                        kind,
-                        path,
-                    ),
-                ));
+                );
+                transfers.push((kind, path, planned, handle, task));
             }
             SyncAction::Conflict {
                 path,
@@ -769,8 +818,8 @@ async fn run_once<P: TokenProvider + 'static>(
     }
 
     // Transfers ran concurrently; apply their results to the database.
-    for (kind, path, handle) in transfers {
-        let result = match handle.await {
+    for (kind, path, planned, handle, task) in transfers {
+        let result = match task.await {
             Ok(result) => result,
             Err(source) => Err(SyncError::Api(ApiError::protocol(format!(
                 "transfer task for '{path}' failed: {source}"
@@ -778,6 +827,7 @@ async fn run_once<P: TokenProvider + 'static>(
         };
         match result {
             Ok(TransferResult::Done(meta)) => {
+                handle.finish(planned);
                 match upsert_synced(
                     &job.db,
                     &path,
@@ -799,6 +849,7 @@ async fn run_once<P: TokenProvider + 'static>(
             }
             Ok(TransferResult::PreconditionFailed) => {
                 // The remote side changed while we uploaded: conflict.
+                handle.abandon();
                 let current_remote = job
                     .dav
                     .propfind(&path, Depth::Zero)
@@ -815,6 +866,7 @@ async fn run_once<P: TokenProvider + 'static>(
                 handle_conflict(job, options, events, &mut summary, &sighting).await;
             }
             Err(error) => {
+                handle.abandon();
                 let _ = mark_state(&job.db, &path, EntryState::Error);
                 fail(&mut summary, &path, &error);
             }
@@ -833,29 +885,53 @@ async fn run_once<P: TokenProvider + 'static>(
 }
 
 /// Spawns one transfer task; the semaphore caps the number of concurrent
-/// transfers (`max_parallel_transfers`).
+/// transfers (`max_parallel_transfers`). Returns the transfer's progress
+/// handle (for finishing/abandoning it) alongside the task.
 fn spawn_transfer<P: TokenProvider + 'static>(
     dav: Arc<WebDavClient<P>>,
     root: PathBuf,
     chunk_size: u64,
     semaphore: Arc<Semaphore>,
+    tracker: Arc<RunTracker>,
     kind: PendingTransfer,
     path: String,
-) -> JoinHandle<Result<TransferResult, SyncError>> {
-    tokio::spawn(async move {
+) -> (
+    TransferHandle,
+    JoinHandle<Result<TransferResult, SyncError>>,
+) {
+    let handle = tracker.handle();
+    let reporting = handle.clone();
+    let task = tokio::spawn(async move {
         let _permit = semaphore
             .acquire_owned()
             .await
             .map_err(|_| SyncError::Api(ApiError::protocol("transfer semaphore closed")))?;
         match kind {
             PendingTransfer::Upload { base_etag, create } => {
-                transfer::upload(dav.as_ref(), &root, &path, base_etag, create).await
+                transfer::upload(
+                    dav.as_ref(),
+                    &root,
+                    &path,
+                    base_etag,
+                    create,
+                    Some(&reporting),
+                )
+                .await
             }
             PendingTransfer::Download { remote } => {
-                transfer::download(dav.as_ref(), &root, &path, &remote, chunk_size).await
+                transfer::download(
+                    dav.as_ref(),
+                    &root,
+                    &path,
+                    &remote,
+                    chunk_size,
+                    Some(&reporting),
+                )
+                .await
             }
         }
-    })
+    });
+    (handle, task)
 }
 
 /// Resets entries stuck in a transfer state after a crash: the recorded
@@ -1156,4 +1232,9 @@ pub(crate) fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// A transfer's planned byte count; unknown sizes count as 0.
+fn planned_bytes(size: Option<i64>) -> u64 {
+    size.map(|size| size.max(0) as u64).unwrap_or(0)
 }

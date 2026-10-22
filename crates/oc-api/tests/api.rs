@@ -340,6 +340,40 @@ async fn put_without_condition_overwrites() {
     client.put("Datei.txt", b"data").await.expect("put");
 }
 
+#[tokio::test]
+async fn put_with_progress_reports_streamed_bytes() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/dav/spaces/sid/Gross.bin"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = dav_client(&server.uri());
+    let reported = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = reported.clone();
+    let highest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let peak = highest.clone();
+    client
+        .put_with_progress("Gross.bin", vec![7u8; 150_000], None, move |bytes| {
+            counter.store(bytes, std::sync::atomic::Ordering::Relaxed);
+            peak.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
+        })
+        .await
+        .expect("put");
+    assert_eq!(
+        reported.load(std::sync::atomic::Ordering::Relaxed),
+        150_000,
+        "the last chunk must report the full size"
+    );
+    assert_eq!(
+        highest.load(std::sync::atomic::Ordering::Relaxed),
+        150_000,
+        "progress counts grow monotonically"
+    );
+}
+
 // --- MKCOL / DELETE / MOVE / COPY ---------------------------------------------
 
 #[tokio::test]

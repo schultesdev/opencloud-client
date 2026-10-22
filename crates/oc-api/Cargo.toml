@@ -13,6 +13,7 @@ thiserror.workspace = true
 url.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+futures-util.workspace = true
 rand.workspace = true
 quick-xml.workspace = true
 percent-encoding.workspace = true

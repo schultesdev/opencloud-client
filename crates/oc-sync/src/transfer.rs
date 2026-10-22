@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use oc_api::{ApiError, Depth, TokenProvider, WebDavClient, WriteCondition};
 
 use crate::error::SyncError;
+use crate::progress::TransferHandle;
 use crate::scan::LocalNode;
 use crate::scan::RemoteNode;
 use crate::scan::abs_local_path;
@@ -40,13 +41,15 @@ pub enum TransferResult {
 /// `<name>.part` file; smaller ones (or without a reported size) arrive
 /// as a single GET. In both cases the data lands under the `.part` name
 /// first and is atomically renamed once complete, so a crash never leaves
-/// a half-written file under the real name.
+/// a half-written file under the real name. `progress` receives
+/// chunk-granular byte counts.
 pub async fn download<P: TokenProvider>(
     dav: &WebDavClient<P>,
     root: &Path,
     path: &str,
     remote: &RemoteNode,
     chunk_size: u64,
+    progress: Option<&TransferHandle>,
 ) -> Result<TransferResult, SyncError> {
     let target = abs_local_path(root, path)?;
     let size = remote
@@ -55,11 +58,12 @@ pub async fn download<P: TokenProvider>(
         .map(|size| size as u64);
     let (etag, local, remote_size) = match size {
         Some(size) if chunk_size > 0 && size > chunk_size => {
-            let (etag, local) = chunked_download(dav, path, &target, size, chunk_size).await?;
+            let (etag, local) =
+                chunked_download(dav, path, &target, size, chunk_size, progress).await?;
             (etag, local, Some(size as i64))
         }
         _ => {
-            let (etag, local) = whole_download(dav, root, path, remote, &target).await?;
+            let (etag, local) = whole_download(dav, root, path, remote, &target, progress).await?;
             let remote_size = local.size;
             (etag, local, remote_size)
         }
@@ -78,10 +82,14 @@ async fn whole_download<P: TokenProvider>(
     path: &str,
     remote: &RemoteNode,
     target: &Path,
+    progress: Option<&TransferHandle>,
 ) -> Result<(Option<String>, LocalNode), SyncError> {
     let response = dav.get(path).await?;
     let etag = etag_of(&response).or_else(|| remote.etag.clone());
     let bytes = response.bytes().await.map_err(ApiError::from)?;
+    if let Some(progress) = progress {
+        progress.report(bytes.len() as u64);
+    }
     let target = target.to_path_buf();
     let local = tokio::task::spawn_blocking(move || write_atomic(&target, &bytes))
         .await
@@ -92,12 +100,14 @@ async fn whole_download<P: TokenProvider>(
 /// Chunked download: repeated `Range` GETs, each appended to the `.part`
 /// file, until the reported size is reached. A server that ignores the
 /// `Range` header (HTTP 200 with the whole body) is handled gracefully.
+/// Each appended chunk is reported to `progress`.
 async fn chunked_download<P: TokenProvider>(
     dav: &WebDavClient<P>,
     path: &str,
     target: &Path,
     size: u64,
     chunk_size: u64,
+    progress: Option<&TransferHandle>,
 ) -> Result<(Option<String>, LocalNode), SyncError> {
     let part = part_file(target);
     // A fresh part file per attempt; stale ones are cleaned at run start.
@@ -118,6 +128,9 @@ async fn chunked_download<P: TokenProvider>(
         let bytes = response.bytes().await.map_err(ApiError::from)?;
         if status == reqwest::StatusCode::OK {
             // The server ignored the range and sent the whole body.
+            if let Some(progress) = progress {
+                progress.report(bytes.len() as u64);
+            }
             let whole_target = target.to_path_buf();
             let local = tokio::task::spawn_blocking(move || write_atomic(&whole_target, &bytes))
                 .await
@@ -144,6 +157,9 @@ async fn chunked_download<P: TokenProvider>(
             ))));
         }
         offset = written;
+        if let Some(progress) = progress {
+            progress.report(written);
+        }
     }
 
     let actual = std::fs::metadata(&part)
@@ -164,13 +180,15 @@ async fn chunked_download<P: TokenProvider>(
 /// Uploads `path` to the server. `base_etag` guards against concurrent
 /// remote changes (`If-Match`); `create` marks a new file
 /// (`If-None-Match: *`). Without an ETag in the PUT response the file is
-/// PROPFINDed once to learn its new ETag.
+/// PROPFINDed once to learn its new ETag. While the body streams,
+/// `progress` receives byte-granular counts of the current attempt.
 pub async fn upload<P: TokenProvider>(
     dav: &WebDavClient<P>,
     root: &Path,
     path: &str,
     base_etag: Option<String>,
     create: bool,
+    progress: Option<&TransferHandle>,
 ) -> Result<TransferResult, SyncError> {
     let source = abs_local_path(root, path)?;
     let read = tokio::task::spawn_blocking(move || read_with_meta(&source))
@@ -183,7 +201,15 @@ pub async fn upload<P: TokenProvider>(
     } else {
         base_etag.map(|etag| WriteCondition::IfMatch { etag })
     };
-    match dav.put_with(path, content, condition).await {
+    let reporting = progress.cloned();
+    let response = dav
+        .put_with_progress(path, content, condition, move |bytes| {
+            if let Some(handle) = &reporting {
+                handle.report(bytes);
+            }
+        })
+        .await;
+    match response {
         Err(ApiError::PreconditionFailed) => Ok(TransferResult::PreconditionFailed),
         Err(source) => Err(SyncError::Api(source)),
         Ok(etag) => {

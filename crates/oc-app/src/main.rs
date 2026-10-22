@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use oc_auth::{AuthClient, KeyringStore, TokenManager};
+use oc_auth::{AuthClient, KeyringStore, TokenManager, DEFAULT_LOGIN_TIMEOUT};
 use oc_config::Account;
 use oc_db::{StatusDb, db_path};
 
@@ -26,6 +26,18 @@ struct Args {
     #[arg(long)]
     headless: bool,
 
+    /// Interactive login for an account from config.json: opens the
+    /// browser (OIDC code flow + PKCE) and stores the refresh token in
+    /// the OS keyring. Exits afterwards; combine with --headless to log
+    /// in and start the engine in one call.
+    #[arg(long, value_name = "ACCOUNT_ID")]
+    login: Option<String>,
+
+    /// Lists the spaces of the account via the Graph API and prints id,
+    /// type, and name of each space. Requires a prior `--login`.
+    #[arg(long, value_name = "ACCOUNT_ID")]
+    list_spaces: Option<String>,
+
     /// Configuration directory (default: the OS-specific config path).
     #[arg(long, value_name = "DIR")]
     config_dir: Option<PathBuf>,
@@ -34,15 +46,85 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    if !args.headless {
+    if !args.headless && args.login.is_none() && args.list_spaces.is_none() {
         // The GUI lands in Phase 7; until then point users at headless mode.
         println!("GUI not implemented yet (Phase 7); use --headless for engine-only mode");
         return;
     }
-    if let Err(error) = run_headless(args.config_dir.as_deref()).await {
+    let result = match (args.login.as_deref(), args.list_spaces.as_deref()) {
+        (Some(account_id), _) => run_login(account_id, args.config_dir.as_deref()).await,
+        (None, Some(account_id)) => run_list_spaces(account_id, args.config_dir.as_deref()).await,
+        (None, None) => run_headless(args.config_dir.as_deref()).await,
+    };
+    if let Err(error) = result {
         eprintln!("error: {error}");
         std::process::exit(1);
     }
+}
+
+/// Loads the config and returns the account with the given id.
+fn find_account(
+    config_dir: Option<&std::path::Path>,
+    account_id: &str,
+) -> Result<Account, Box<dyn Error>> {
+    let config_dir = match config_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => oc_config::default_config_dir()?,
+    };
+    let config = oc_config::load_config(&config_dir)?;
+    Ok(config
+        .accounts
+        .into_iter()
+        .find(|account| account.id == account_id)
+        .ok_or_else(|| format!("unknown account '{account_id}'"))?)
+}
+
+/// Interactive login for one account: opens the browser for the OIDC
+/// flow and stores the refresh token in the OS keyring, so `--headless`
+/// can pick the account up on later runs.
+async fn run_login(
+    account_id: &str,
+    config_dir: Option<&std::path::Path>,
+) -> Result<(), Box<dyn Error>> {
+    let account = find_account(config_dir, account_id)?;
+
+    let auth = AuthClient::new(&account.server_url)?;
+    let manager = TokenManager::new(auth, KeyringStore::new(), &account.id);
+    println!(
+        "opening browser for login at {} (account '{}')",
+        account.server_url, account.id
+    );
+    manager.login(true, DEFAULT_LOGIN_TIMEOUT).await?;
+    println!("login complete; refresh token stored for account '{}'", account.id);
+    Ok(())
+}
+
+/// Lists the spaces of the logged-in account via the Graph API
+/// (`GET /graph/v1.0/me/drives`).
+async fn run_list_spaces(
+    account_id: &str,
+    config_dir: Option<&std::path::Path>,
+) -> Result<(), Box<dyn Error>> {
+    let account = find_account(config_dir, account_id)?;
+
+    let auth = AuthClient::new(&account.server_url)?;
+    let manager = TokenManager::new(auth, KeyringStore::new(), &account.id);
+    if !manager.has_stored_login() {
+        return Err(format!(
+            "account '{account_id}' has no stored login (run --login first)"
+        )
+        .into());
+    }
+    let graph = oc_api::GraphClient::new(&account.server_url, manager)?;
+    let spaces = graph.list_spaces().await?;
+    if spaces.is_empty() {
+        println!("no spaces found for account '{}'", account.id);
+        return Ok(());
+    }
+    for space in &spaces {
+        println!("{:<40} {:<10} {}", space.id, space.drive_type, space.name);
+    }
+    Ok(())
 }
 
 /// Loads config and jobs, starts the engine for every enabled job, and

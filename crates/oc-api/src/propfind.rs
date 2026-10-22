@@ -247,7 +247,7 @@ fn handle_close(
         }
         Pending::QuotaAvailable => {
             if let Some(stage) = propstat {
-                stage.quota_available_bytes = parse_u64(&value)?;
+                stage.quota_available_bytes = parse_quota_bytes(&value)?;
             }
         }
     }
@@ -264,6 +264,19 @@ fn parse_u64(value: &str) -> Result<Option<u64>, ApiError> {
         .parse::<u64>()
         .map(Some)
         .map_err(|_| ApiError::protocol(format!("invalid number '{value}' in WebDAV response")))
+}
+
+/// Like [`parse_u64`], but for `quota-available-bytes`: RFC 4331 allows
+/// negative sentinel values (e.g. -1 unlimited, -2 not computed, -3
+/// infinite). Servers like OpenCloud/reva send them for spaces without
+/// quota; they map to "unknown" instead of failing the whole response.
+fn parse_quota_bytes(value: &str) -> Result<Option<u64>, ApiError> {
+    if let Ok(signed) = value.parse::<i64>() {
+        if signed < 0 {
+            return Ok(None);
+        }
+    }
+    parse_u64(value)
 }
 
 /// The local name of a tag (namespace prefix stripped).
@@ -392,6 +405,27 @@ mod tests {
  </D:response>
 </D:multistatus>"#;
         assert!(matches!(parse_multistatus(bad), Err(ApiError::Protocol(_))));
+    }
+
+    #[test]
+    fn quota_sentinels_mean_unknown() {
+        // RFC 4331: negative quota-available-bytes are sentinels, not
+        // numbers — e.g. OpenCloud/reva sends -2 for spaces without quota.
+        let sentinel = r#"<D:multistatus xmlns:D="DAV:">
+ <D:response>
+  <D:href>/dav/spaces/sid/</D:href>
+  <D:propstat>
+   <D:prop>
+    <D:resourcetype><D:collection/></D:resourcetype>
+    <D:quota-available-bytes>-2</D:quota-available-bytes>
+   </D:prop>
+   <D:status>HTTP/1.1 200 OK</D:status>
+  </D:propstat>
+ </D:response>
+</D:multistatus>"#;
+        let resources = parse_multistatus(sentinel).expect("sentinel quota parses");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].quota_available_bytes, None);
     }
 
     #[test]

@@ -1213,6 +1213,7 @@ version = "0.1.0"
 dependencies = [
  "notify",
  "oc-api",
+ "oc-config",
  "oc-db",
  "reqwest",
  "tempfile",

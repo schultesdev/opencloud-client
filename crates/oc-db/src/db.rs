@@ -264,6 +264,43 @@ impl StatusDb {
         self.conflicts_with_status(ConflictStatus::Pending)
     }
 
+    /// Returns one conflict by row id, regardless of status; `None`
+    /// when the id is unknown. Resolution flows use it to load the
+    /// conflict before applying its side of the bargain.
+    pub fn get_conflict(&self, conflict_id: i64) -> Result<Option<Conflict>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, detected_at, local_mtime, local_size,
+                    remote_etag, remote_size, remote_mtime, status, resolved_at
+             FROM conflicts WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query([conflict_id])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row_to_conflict(row)?),
+            None => None,
+        })
+    }
+
+    /// Re-records the remote state of a still-pending conflict: the
+    /// server changed again while a resolution was on its way (e.g. the
+    /// `If-Match` upload of `resolve_local` failed with 412). Returns
+    /// `false` when the id is unknown or the conflict is already
+    /// resolved — then the conflict stays exactly as it was.
+    pub fn update_conflict_remote(
+        &self,
+        conflict_id: i64,
+        remote_etag: Option<&str>,
+        remote_size: Option<i64>,
+        remote_mtime: Option<i64>,
+    ) -> Result<bool, DbError> {
+        let changed = self.conn.execute(
+            "UPDATE conflicts
+             SET remote_etag = ?1, remote_size = ?2, remote_mtime = ?3
+             WHERE id = ?4 AND status = 'pending'",
+            params![remote_etag, remote_size, remote_mtime, conflict_id],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Aggregated numbers for the UI (file/dir counts, open conflicts,
     /// errors, active transfers, last sync).
     pub fn stats(&self) -> Result<Stats, DbError> {

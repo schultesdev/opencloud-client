@@ -43,6 +43,21 @@ pub enum SyncError {
     /// The filesystem watcher could not be started or failed.
     #[error("fs watcher error: {0}")]
     Watch(String),
+    /// A conflict to resolve does not exist or is no longer pending.
+    #[error("no pending conflict with id {id}")]
+    UnknownConflict {
+        /// The requested conflict row id.
+        id: i64,
+    },
+    /// The conflict has no automatic resolution (e.g. a folder/file
+    /// mismatch); one side must be removed manually.
+    #[error("conflict at '{path}' cannot be resolved automatically: {reason}")]
+    UnresolvableConflict {
+        /// The conflicting path.
+        path: String,
+        /// Why no automatic resolution exists.
+        reason: &'static str,
+    },
 }
 
 impl SyncError {

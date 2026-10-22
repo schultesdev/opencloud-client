@@ -19,14 +19,16 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use oc_api::{ApiError, Depth, TokenProvider, WebDavClient};
+use oc_config::ConflictPolicy;
 use oc_db::StatusDb;
-use oc_db::{EntryState, NewConflict, NewEntry};
+use oc_db::{ConflictResolution, EntryState, NewConflict, NewEntry};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
+use crate::conflict::{self, ResolveOutcome};
 use crate::diff::{self, SyncAction};
 use crate::error::SyncError;
 use crate::filter::Filter;
@@ -88,6 +90,9 @@ pub struct EngineOptions {
     /// Whether a matching space-root ETag skips the remote scan (the
     /// recorded database state then serves as the remote snapshot).
     pub root_etag_shortcut: bool,
+    /// How detected conflicts are treated: `ask` records them pending;
+    /// the other policies resolve them right away (Phase 6).
+    pub conflict_policy: ConflictPolicy,
 }
 
 impl Default for EngineOptions {
@@ -99,6 +104,7 @@ impl Default for EngineOptions {
             debounce: Duration::from_millis(800),
             download_chunk_size: 8 * 1024 * 1024,
             root_etag_shortcut: true,
+            conflict_policy: ConflictPolicy::default(),
         }
     }
 }
@@ -130,7 +136,7 @@ impl<P: TokenProvider> From<Job<P>> for JobTask<P> {
 /// Locks the job's database. Poisoning (a panic while locked) is
 /// recovered: SQLite survives it, at worst the aborted statement is
 /// retried on the next run.
-fn db_lock(db: &std::sync::Mutex<StatusDb>) -> std::sync::MutexGuard<'_, StatusDb> {
+pub(crate) fn db_lock(db: &std::sync::Mutex<StatusDb>) -> std::sync::MutexGuard<'_, StatusDb> {
     db.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
@@ -179,6 +185,16 @@ pub enum EngineEvent {
         /// The conflicting path.
         path: String,
     },
+    /// A conflict was resolved — by the conflict policy or a resolve
+    /// command (Phase 6).
+    ConflictResolved {
+        /// The job's identifier.
+        job_id: String,
+        /// The resolved path.
+        path: String,
+        /// Which side won.
+        resolution: ConflictResolution,
+    },
     /// The job task stopped (Stop command or channel closed).
     Stopped {
         /// The job's identifier.
@@ -205,6 +221,18 @@ impl fmt::Display for EngineEvent {
                 }
             }
             Self::Conflict { job_id, path } => write!(f, "[{job_id}] conflict at '{path}'"),
+            Self::ConflictResolved {
+                job_id,
+                path,
+                resolution,
+            } => write!(
+                f,
+                "[{job_id}] conflict at '{path}' resolved ({})",
+                match resolution {
+                    ConflictResolution::Server => "server wins",
+                    ConflictResolution::Local => "local wins",
+                }
+            ),
             Self::Stopped { job_id } => write!(f, "[{job_id}] stopped"),
         }
     }
@@ -223,6 +251,8 @@ pub struct RunSummary {
     pub folders_created: usize,
     /// New conflicts recorded.
     pub conflicts: usize,
+    /// Conflicts the policy resolved right away (not left pending).
+    pub auto_resolved: usize,
     /// Paths that failed.
     pub errors: usize,
     /// Whether the remote scan was skipped (unchanged root ETag).
@@ -240,7 +270,11 @@ impl fmt::Display for RunSummary {
             self.folders_created,
             self.conflicts,
             self.errors
-        )
+        )?;
+        if self.auto_resolved > 0 {
+            write!(f, ", {} auto-resolved", self.auto_resolved)?;
+        }
+        Ok(())
     }
 }
 
@@ -689,16 +723,15 @@ async fn run_once<P: TokenProvider + 'static>(
                 path,
                 local,
                 remote,
-            } => match record_conflict(&job.db, &path, local, remote, now) {
-                Ok(()) => {
-                    summary.conflicts += 1;
-                    let _ = events.send(EngineEvent::Conflict {
-                        job_id: job.id.clone(),
-                        path: path.clone(),
-                    });
-                }
-                Err(error) => fail(&mut summary, &path, &error),
-            },
+            } => {
+                let sighting = ConflictSighting {
+                    path,
+                    local,
+                    remote,
+                    at: now,
+                };
+                handle_conflict(job, options, events, &mut summary, &sighting).await;
+            }
             SyncAction::RecordSynced {
                 path,
                 is_dir,
@@ -763,22 +796,14 @@ async fn run_once<P: TokenProvider + 'static>(
                     .await
                     .ok()
                     .and_then(|resources| resources.first().map(RemoteNode::from_resource));
-                match record_conflict(
-                    &job.db,
-                    &path,
-                    local.get(&path).copied(),
-                    current_remote,
-                    now,
-                ) {
-                    Ok(()) => {
-                        summary.conflicts += 1;
-                        let _ = events.send(EngineEvent::Conflict {
-                            job_id: job.id.clone(),
-                            path,
-                        });
-                    }
-                    Err(error) => fail(&mut summary, &path, &error),
-                }
+                let local_node = local.get(&path).copied();
+                let sighting = ConflictSighting {
+                    path,
+                    local: local_node,
+                    remote: current_remote,
+                    at: now,
+                };
+                handle_conflict(job, options, events, &mut summary, &sighting).await;
             }
             Err(error) => {
                 let _ = mark_state(&job.db, &path, EntryState::Error);
@@ -878,7 +903,10 @@ fn remote_from_db(db_entries: &HashMap<String, NewEntry>) -> HashMap<String, Rem
 /// The local state of a path, read from the filesystem after an
 /// operation (scan maps are pre-operation snapshots); `None` when the
 /// path does not exist.
-fn local_node_at(root: &std::path::Path, rel: &str) -> Result<Option<LocalNode>, SyncError> {
+pub(crate) fn local_node_at(
+    root: &std::path::Path,
+    rel: &str,
+) -> Result<Option<LocalNode>, SyncError> {
     let target = scan::abs_local_path(root, rel)?;
     match std::fs::metadata(&target) {
         Ok(metadata) => Ok(Some(LocalNode {
@@ -936,18 +964,38 @@ fn upsert_synced(
     Ok(())
 }
 
-/// Records a conflict in the database and freezes the path.
+/// What a scan saw when it detected a conflict: the path, both sides'
+/// states, and the time — the input of [`record_conflict`].
+struct ConflictSighting {
+    /// The conflicting path.
+    path: String,
+    /// Local state at detection (`None` = deleted locally).
+    local: Option<LocalNode>,
+    /// Remote state at detection (`None` = deleted remotely).
+    remote: Option<RemoteNode>,
+    /// Detection time (unix seconds).
+    at: i64,
+}
+
+/// Records a conflict in the database, freezes the path, and returns
+/// the conflict row id (Phase 6 resolutions address it).
 fn record_conflict(
     db: &std::sync::Mutex<StatusDb>,
-    path: &str,
-    local: Option<LocalNode>,
-    remote: Option<RemoteNode>,
-    now: i64,
-) -> Result<(), SyncError> {
+    sighting: &ConflictSighting,
+) -> Result<i64, SyncError> {
+    let ConflictSighting {
+        path,
+        local,
+        remote,
+        at,
+    } = sighting;
+    // Both node types are cheap copies/clones; work with values below.
+    let local = *local;
+    let remote = remote.clone();
     let db = db_lock(db);
-    db.record_conflict(&NewConflict {
+    let conflict_id = db.record_conflict(&NewConflict {
         path: path.to_owned(),
-        detected_at: now,
+        detected_at: *at,
         local_mtime: local.and_then(|node| node.mtime),
         local_size: local.and_then(|node| node.size),
         remote_etag: remote.as_ref().and_then(|node| node.etag.clone()),
@@ -972,11 +1020,129 @@ fn record_conflict(
         entry.remote_size = remote.size;
     }
     db.upsert_entry(&entry)?;
-    Ok(())
+    Ok(conflict_id)
+}
+
+/// Records a conflict and applies the job's conflict policy (Phase 6):
+/// `ask` leaves it pending for the user; `keep_server`, `keep_local`,
+/// and `conflict_copy` resolve it right away. Whatever needs the user
+/// after all (remote changed again mid-resolution, unresolvable kind,
+/// failed transfer) surfaces as a conflict event.
+async fn handle_conflict<P: TokenProvider>(
+    job: &JobTask<P>,
+    options: &EngineOptions,
+    events: &UnboundedSender<EngineEvent>,
+    summary: &mut RunSummary,
+    sighting: &ConflictSighting,
+) {
+    let conflict_id = match record_conflict(&job.db, sighting) {
+        Ok(conflict_id) => conflict_id,
+        Err(error) => {
+            summary.errors += 1;
+            let _ = events.send(EngineEvent::Failed {
+                job_id: job.id.clone(),
+                path: sighting.path.clone(),
+                error: error.to_string(),
+            });
+            return;
+        }
+    };
+    match apply_policy(job, options, conflict_id, &sighting.path, sighting.local).await {
+        PolicyOutcome::Resolved { resolution } => {
+            summary.auto_resolved += 1;
+            let _ = events.send(EngineEvent::ConflictResolved {
+                job_id: job.id.clone(),
+                path: sighting.path.clone(),
+                resolution,
+            });
+        }
+        PolicyOutcome::Recorded => {
+            summary.conflicts += 1;
+            let _ = events.send(EngineEvent::Conflict {
+                job_id: job.id.clone(),
+                path: sighting.path.clone(),
+            });
+        }
+        PolicyOutcome::NeedsReview { error } => {
+            summary.conflicts += 1;
+            let _ = events.send(EngineEvent::Conflict {
+                job_id: job.id.clone(),
+                path: sighting.path.clone(),
+            });
+            if let Some(error) = error {
+                summary.errors += 1;
+                let _ = events.send(EngineEvent::Failed {
+                    job_id: job.id.clone(),
+                    path: sighting.path.clone(),
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// What the conflict policy decided for one conflict.
+enum PolicyOutcome {
+    /// Policy `ask`: recorded pending, waiting for the user.
+    Recorded,
+    /// The policy resolved the conflict immediately.
+    Resolved {
+        /// Which side won.
+        resolution: ConflictResolution,
+    },
+    /// The policy tried to resolve but the conflict needs the user.
+    NeedsReview {
+        /// Why the automatic resolution failed, if it failed.
+        error: Option<SyncError>,
+    },
+}
+
+/// Applies the configured conflict policy to a freshly recorded
+/// conflict. Keeps the engine's bookkeeping in one place; the actual
+/// resolution logic lives in [`crate::conflict`].
+async fn apply_policy<P: TokenProvider>(
+    job: &JobTask<P>,
+    options: &EngineOptions,
+    conflict_id: i64,
+    path: &str,
+    local: Option<LocalNode>,
+) -> PolicyOutcome {
+    let resolution = match options.conflict_policy {
+        ConflictPolicy::Ask => return PolicyOutcome::Recorded,
+        ConflictPolicy::KeepServer => ConflictResolution::Server,
+        ConflictPolicy::KeepLocal => ConflictResolution::Local,
+        ConflictPolicy::ConflictCopy => {
+            // Keep the local version as a dated copy, then let the
+            // server version win. The copy syncs as a new file.
+            if local.is_some_and(|node| !node.is_dir) {
+                if let Err(error) = conflict::keep_conflict_copy(&job.local_root, path) {
+                    return PolicyOutcome::NeedsReview { error: Some(error) };
+                }
+            }
+            ConflictResolution::Server
+        }
+    };
+    match conflict::resolve(
+        job.dav.as_ref(),
+        &job.db,
+        &job.local_root,
+        conflict_id,
+        resolution,
+        options.download_chunk_size,
+    )
+    .await
+    {
+        Ok(ResolveOutcome::Resolved) => PolicyOutcome::Resolved { resolution },
+        // The remote changed again; the pending row carries the new
+        // remote state and the user decides with fresh information.
+        Ok(ResolveOutcome::RemoteChanged) => PolicyOutcome::NeedsReview { error: None },
+        Err(SyncError::UnresolvableConflict { .. }) => PolicyOutcome::NeedsReview { error: None },
+        Err(error) => PolicyOutcome::NeedsReview { error: Some(error) },
+    }
 }
 
 /// Unix seconds of "now".
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)

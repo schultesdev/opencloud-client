@@ -2,7 +2,8 @@
 //! (`wiremock`): initial full sync, new/changed/deleted files on either
 //! side, folder renames, selective-sync filters, chunked range downloads,
 //! parallel transfers, conflicts, the root-ETag shortcut, crash recovery,
-//! pause/resume/stop, and the filesystem watcher (see `PLAN.md`, Phase 5).
+//! pause/resume/stop, and the filesystem watcher (see `PLAN.md`, Phase 5) —
+//! plus conflict resolution and the conflict policies (Phase 6).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -11,8 +12,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use oc_api::{StaticToken, WebDavClient};
-use oc_db::{EntryState, NewEntry, StatusDb};
-use oc_sync::{Engine, EngineEvent, EngineOptions, Job, JobCommand, RunSummary};
+use oc_config::ConflictPolicy;
+use oc_db::{ConflictResolution, ConflictStatus, EntryState, NewConflict, NewEntry, StatusDb};
+use oc_sync::{
+    Engine, EngineEvent, EngineOptions, Job, JobCommand, ResolveOutcome, RunSummary, resolve,
+};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -94,6 +98,7 @@ fn test_options() -> EngineOptions {
         debounce: Duration::from_millis(300),
         download_chunk_size: 4,
         root_etag_shortcut: false,
+        conflict_policy: ConflictPolicy::Ask,
     }
 }
 
@@ -1101,4 +1106,481 @@ fn events_render_readably() {
     assert!(text.contains("[job-1]"), "{text}");
     assert!(text.contains("2 up"), "{text}");
     assert!(text.contains("1 down"), "{text}");
+}
+
+// --- Conflict resolution (Phase 6) -----------------------------------------
+
+/// A WebDAV client plus the seeded job database of a fixture.
+struct DirectJob {
+    dav: WebDavClient<StaticToken>,
+    db: std::sync::Mutex<StatusDb>,
+}
+
+/// Opens the fixture's database, seeds a conflicted file entry and its
+/// conflict row, and returns both with a client. The local file is
+/// written by the test beforehand.
+fn seeded_conflict(f: &Setup, remote_etag: Option<&str>) -> (DirectJob, i64) {
+    let dav = WebDavClient::new(&f.server.uri(), "sid", StaticToken::new("tok")).unwrap();
+    let db = StatusDb::open(&f.db_path).unwrap();
+    let mut entry = seeded_file_entry("a.txt", "\"e1\"", 100, 10);
+    entry.state = EntryState::Conflict;
+    entry.remote_etag = remote_etag.map(str::to_owned);
+    db.upsert_entry(&entry).unwrap();
+    let conflict_id = db
+        .record_conflict(&NewConflict {
+            path: "a.txt".to_owned(),
+            detected_at: 200,
+            local_mtime: Some(200),
+            local_size: Some(10),
+            remote_etag: remote_etag.map(str::to_owned),
+            remote_size: Some(10),
+            remote_mtime: None,
+        })
+        .unwrap();
+    (
+        DirectJob {
+            dav,
+            db: std::sync::Mutex::new(db),
+        },
+        conflict_id,
+    )
+}
+
+#[tokio::test]
+async fn resolve_server_downloads_and_resolves() {
+    let f = fixture(&[], &[]).await;
+    std::fs::write(f.root.join("a.txt"), "local edit").unwrap();
+    let (job, conflict_id) = seeded_conflict(&f, Some("\"e2\""));
+
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("server edit")
+                .append_header("ETag", "\"e2\""),
+        )
+        .expect(1)
+        .mount(&f.server)
+        .await;
+
+    let outcome = resolve(
+        &job.dav,
+        &job.db,
+        &f.root,
+        conflict_id,
+        ConflictResolution::Server,
+        1024,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, ResolveOutcome::Resolved);
+    f.server.verify().await;
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("a.txt")).unwrap(),
+        "server edit"
+    );
+
+    let db = open_db(&f.db_path);
+    let entry = db.get_entry("a.txt").unwrap().unwrap();
+    assert_eq!(entry.entry.state, EntryState::Synced);
+    assert_eq!(entry.entry.remote_etag.as_deref(), Some("\"e2\""));
+    assert_eq!(
+        db.get_conflict(conflict_id).unwrap().unwrap().status,
+        ConflictStatus::ResolvedServer
+    );
+    assert!(db.pending_conflicts().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn resolve_server_accepts_a_remote_deletion() {
+    let f = fixture(&[], &[]).await;
+    std::fs::write(f.root.join("a.txt"), "local edit").unwrap();
+    // The conflict says the server side is gone (no ETag).
+    let (job, conflict_id) = seeded_conflict(&f, None);
+
+    let outcome = resolve(
+        &job.dav,
+        &job.db,
+        &f.root,
+        conflict_id,
+        ConflictResolution::Server,
+        1024,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, ResolveOutcome::Resolved);
+    assert!(!f.root.join("a.txt").exists());
+
+    let db = open_db(&f.db_path);
+    assert!(db.get_entry("a.txt").unwrap().is_none());
+    assert_eq!(
+        db.get_conflict(conflict_id).unwrap().unwrap().status,
+        ConflictStatus::ResolvedServer
+    );
+}
+
+#[tokio::test]
+async fn resolve_local_uploads_with_the_conflict_etag() {
+    let f = fixture(&[], &[]).await;
+    std::fs::write(f.root.join("a.txt"), "local edit").unwrap();
+    let (job, conflict_id) = seeded_conflict(&f, Some("\"e2\""));
+
+    Mock::given(method("PUT"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .and(header("If-Match", "\"e2\""))
+        .respond_with(ResponseTemplate::new(204).append_header("ETag", "\"e3\""))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+
+    let outcome = resolve(
+        &job.dav,
+        &job.db,
+        &f.root,
+        conflict_id,
+        ConflictResolution::Local,
+        1024,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, ResolveOutcome::Resolved);
+    f.server.verify().await;
+
+    let db = open_db(&f.db_path);
+    let entry = db.get_entry("a.txt").unwrap().unwrap();
+    assert_eq!(entry.entry.state, EntryState::Synced);
+    assert_eq!(entry.entry.remote_etag.as_deref(), Some("\"e3\""));
+    assert_eq!(
+        db.get_conflict(conflict_id).unwrap().unwrap().status,
+        ConflictStatus::ResolvedLocal
+    );
+}
+
+#[tokio::test]
+async fn resolve_local_recreates_a_deleted_remote() {
+    let f = fixture(&[], &[]).await;
+    std::fs::write(f.root.join("a.txt"), "local edit").unwrap();
+    // The conflict says the server side is gone: the upload recreates it.
+    let (job, conflict_id) = seeded_conflict(&f, None);
+
+    Mock::given(method("PUT"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .and(header("If-None-Match", "*"))
+        .respond_with(ResponseTemplate::new(201).append_header("ETag", "\"e1\""))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+
+    let outcome = resolve(
+        &job.dav,
+        &job.db,
+        &f.root,
+        conflict_id,
+        ConflictResolution::Local,
+        1024,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, ResolveOutcome::Resolved);
+    f.server.verify().await;
+
+    let db = open_db(&f.db_path);
+    let entry = db.get_entry("a.txt").unwrap().unwrap();
+    assert_eq!(entry.entry.state, EntryState::Synced);
+    assert_eq!(entry.entry.remote_etag.as_deref(), Some("\"e1\""));
+    assert_eq!(
+        db.get_conflict(conflict_id).unwrap().unwrap().status,
+        ConflictStatus::ResolvedLocal
+    );
+}
+
+#[tokio::test]
+async fn resolve_local_with_remote_changed_again_stays_pending() {
+    let f = fixture(&[], &[]).await;
+    std::fs::write(f.root.join("a.txt"), "local edit").unwrap();
+    let (job, conflict_id) = seeded_conflict(&f, Some("\"e2\""));
+
+    // The server changed again since detection: the guarded upload fails.
+    Mock::given(method("PUT"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .and(header("If-Match", "\"e2\""))
+        .respond_with(ResponseTemplate::new(412))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+    // The conflict row learns the current remote state.
+    mount_propfind(
+        &f.server,
+        "a.txt",
+        "0",
+        &[("a.txt", false, Some("\"e3\""), Some(12))],
+    )
+    .await;
+
+    let outcome = resolve(
+        &job.dav,
+        &job.db,
+        &f.root,
+        conflict_id,
+        ConflictResolution::Local,
+        1024,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, ResolveOutcome::RemoteChanged);
+    f.server.verify().await;
+    // The local file was not touched.
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("a.txt")).unwrap(),
+        "local edit"
+    );
+
+    let db = open_db(&f.db_path);
+    let conflict = db.get_conflict(conflict_id).unwrap().unwrap();
+    assert_eq!(conflict.status, ConflictStatus::Pending);
+    assert_eq!(conflict.remote_etag.as_deref(), Some("\"e3\""));
+    assert_eq!(conflict.remote_size, Some(12));
+    let entry = db.get_entry("a.txt").unwrap().unwrap();
+    assert_eq!(entry.entry.state, EntryState::Conflict);
+}
+
+#[tokio::test]
+async fn resolve_local_with_local_deleted_deletes_remote() {
+    let f = fixture(&[], &[]).await;
+    // No local file: keeping the local side propagates the deletion.
+    let (job, conflict_id) = seeded_conflict(&f, Some("\"e2\""));
+
+    Mock::given(method("DELETE"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+
+    let outcome = resolve(
+        &job.dav,
+        &job.db,
+        &f.root,
+        conflict_id,
+        ConflictResolution::Local,
+        1024,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, ResolveOutcome::Resolved);
+    f.server.verify().await;
+
+    let db = open_db(&f.db_path);
+    assert!(db.get_entry("a.txt").unwrap().is_none());
+    assert_eq!(
+        db.get_conflict(conflict_id).unwrap().unwrap().status,
+        ConflictStatus::ResolvedLocal
+    );
+}
+
+#[tokio::test]
+async fn unresolvable_and_unknown_conflicts_are_rejected() {
+    let f = fixture(&[], &[]).await;
+    let dav = WebDavClient::new(&f.server.uri(), "sid", StaticToken::new("tok")).unwrap();
+    let db = StatusDb::open(&f.db_path).unwrap();
+    // Folder/file mismatch: entry says folder, no automatic resolution.
+    db.upsert_entry(&NewEntry::new("d", true, EntryState::Conflict))
+        .unwrap();
+    let folder_conflict = db
+        .record_conflict(&NewConflict {
+            path: "d".to_owned(),
+            detected_at: 1,
+            local_mtime: None,
+            local_size: None,
+            remote_etag: None,
+            remote_size: None,
+            remote_mtime: None,
+        })
+        .unwrap();
+    let db = std::sync::Mutex::new(db);
+
+    assert!(matches!(
+        resolve(
+            &dav,
+            &db,
+            &f.root,
+            folder_conflict,
+            ConflictResolution::Server,
+            1024,
+        )
+        .await
+        .unwrap_err(),
+        oc_sync::SyncError::UnresolvableConflict { .. }
+    ));
+    assert!(matches!(
+        resolve(&dav, &db, &f.root, 999, ConflictResolution::Server, 1024)
+            .await
+            .unwrap_err(),
+        oc_sync::SyncError::UnknownConflict { id: 999, .. }
+    ));
+}
+
+// --- Conflict policies (Phase 6) --------------------------------------------
+
+/// Seeds a modify/modify conflict: the entry is synced against `e1`,
+/// the local file has been edited since.
+fn seed_both_changed(f: &Setup) {
+    std::fs::write(f.root.join("a.txt"), "local edit").unwrap();
+    let mtime = std::fs::metadata(f.root.join("a.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let mtime = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let db = open_db(&f.db_path);
+    db.upsert_entry(&seeded_file_entry("a.txt", "\"e1\"", mtime - 100, 3))
+        .unwrap();
+}
+
+/// Mounts the remote listing with a changed `a.txt` (ETag `e2`).
+async fn mount_remote_changed(f: &Setup) {
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    mount_propfind(
+        &f.server,
+        "",
+        "1",
+        &[
+            ("", true, Some("\"root-1\""), None),
+            ("a.txt", false, Some("\"e2\""), Some(10)),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn keep_server_policy_resolves_conflicts_inline() {
+    let mut options = test_options();
+    options.conflict_policy = ConflictPolicy::KeepServer;
+    let f = fixture(&[], &[]).await;
+    seed_both_changed(&f);
+    mount_remote_changed(&f).await;
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("server edit")
+                .append_header("ETag", "\"e2\""),
+        )
+        .expect(1)
+        .mount(&f.server)
+        .await;
+
+    let mut engine = f.engine(options);
+    let (summary, events) = next_run(&mut engine).await;
+    assert_eq!(summary.conflicts, 0);
+    assert_eq!(summary.auto_resolved, 1);
+    assert_eq!(summary.errors, 0);
+    f.server.verify().await;
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("a.txt")).unwrap(),
+        "server edit"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::ConflictResolved { path, resolution, .. }
+        if path == "a.txt" && *resolution == ConflictResolution::Server
+    )));
+
+    let db = open_db(&f.db_path);
+    let entry = db.get_entry("a.txt").unwrap().unwrap();
+    assert_eq!(entry.entry.state, EntryState::Synced);
+    assert_eq!(entry.entry.remote_etag.as_deref(), Some("\"e2\""));
+    assert!(db.pending_conflicts().unwrap().is_empty());
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn keep_local_policy_resolves_conflicts_inline() {
+    let mut options = test_options();
+    options.conflict_policy = ConflictPolicy::KeepLocal;
+    let f = fixture(&[], &[]).await;
+    seed_both_changed(&f);
+    mount_remote_changed(&f).await;
+    Mock::given(method("PUT"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .and(header("If-Match", "\"e2\""))
+        .respond_with(ResponseTemplate::new(204).append_header("ETag", "\"e3\""))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+
+    let mut engine = f.engine(options);
+    let (summary, events) = next_run(&mut engine).await;
+    assert_eq!(summary.conflicts, 0);
+    assert_eq!(summary.auto_resolved, 1);
+    assert_eq!(summary.errors, 0);
+    f.server.verify().await;
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("a.txt")).unwrap(),
+        "local edit"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::ConflictResolved { path, resolution, .. }
+        if path == "a.txt" && *resolution == ConflictResolution::Local
+    )));
+
+    let db = open_db(&f.db_path);
+    let entry = db.get_entry("a.txt").unwrap().unwrap();
+    assert_eq!(entry.entry.state, EntryState::Synced);
+    assert_eq!(entry.entry.remote_etag.as_deref(), Some("\"e3\""));
+    assert!(db.pending_conflicts().unwrap().is_empty());
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn conflict_copy_policy_keeps_a_dated_local_copy() {
+    let mut options = test_options();
+    options.conflict_policy = ConflictPolicy::ConflictCopy;
+    let f = fixture(&[], &[]).await;
+    seed_both_changed(&f);
+    mount_remote_changed(&f).await;
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("server edit")
+                .append_header("ETag", "\"e2\""),
+        )
+        .expect(1)
+        .mount(&f.server)
+        .await;
+
+    let mut engine = f.engine(options);
+    let (summary, _) = next_run(&mut engine).await;
+    assert_eq!(summary.conflicts, 0);
+    assert_eq!(summary.auto_resolved, 1);
+    assert_eq!(summary.errors, 0);
+    f.server.verify().await;
+
+    // The server version won; the local version survives as a copy.
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("a.txt")).unwrap(),
+        "server edit"
+    );
+    let copies: Vec<_> = std::fs::read_dir(&f.root)
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            name.contains("(conflicted copy").then_some(name)
+        })
+        .collect();
+    assert_eq!(copies.len(), 1, "exactly one conflicted copy");
+    assert_eq!(
+        std::fs::read_to_string(f.root.join(&copies[0])).unwrap(),
+        "local edit"
+    );
+
+    let db = open_db(&f.db_path);
+    let entry = db.get_entry("a.txt").unwrap().unwrap();
+    assert_eq!(entry.entry.state, EntryState::Synced);
+    assert!(db.pending_conflicts().unwrap().is_empty());
+    engine.stop().await;
 }

@@ -198,6 +198,46 @@ fn conflict_lifecycle_from_detection_to_resolution() {
 }
 
 #[test]
+fn get_conflict_and_remote_state_update() {
+    let db = StatusDb::open_in_memory().unwrap();
+    let id = db
+        .record_conflict(&NewConflict {
+            path: "a.txt".into(),
+            detected_at: unix(500),
+            local_mtime: Some(unix(400)),
+            local_size: Some(10),
+            remote_etag: Some("\"e1\"".into()),
+            remote_size: Some(10),
+            remote_mtime: None,
+        })
+        .unwrap();
+    assert!(db.get_conflict(999).unwrap().is_none());
+
+    // The server changed again during an attempted resolution: the
+    // pending row learns the new remote state.
+    assert!(
+        db.update_conflict_remote(id, Some("\"e2\""), Some(12), Some(unix(550)))
+            .unwrap()
+    );
+    let conflict = db.get_conflict(id).unwrap().unwrap();
+    assert_eq!(conflict.remote_etag.as_deref(), Some("\"e2\""));
+    assert_eq!(conflict.remote_size, Some(12));
+    assert_eq!(conflict.remote_mtime, Some(unix(550)));
+
+    // Once resolved, the remote state is frozen.
+    db.resolve_conflict(id, ConflictResolution::Server, unix(600))
+        .unwrap();
+    assert!(
+        !db.update_conflict_remote(id, Some("\"e3\""), None, None)
+            .unwrap()
+    );
+    assert_eq!(
+        db.get_conflict(id).unwrap().unwrap().remote_etag.as_deref(),
+        Some("\"e2\"")
+    );
+}
+
+#[test]
 fn stats_aggregates_entries_conflicts_and_last_sync() {
     let db = StatusDb::open_in_memory().unwrap();
     db.upsert_entry(&NewEntry::new("ordner", true, EntryState::Synced))

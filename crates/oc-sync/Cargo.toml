@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 oc-api.workspace = true
+oc-config.workspace = true
 oc-db.workspace = true
 tokio.workspace = true
 thiserror.workspace = true

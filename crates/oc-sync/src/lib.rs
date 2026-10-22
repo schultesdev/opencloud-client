@@ -14,10 +14,16 @@
 //!   via `.part` temp files (range-chunked for large files) with atomic
 //!   renames and cross-platform read-only handling.
 //! - [`watch`]: the debouncing filesystem watcher per job.
+//! - [`conflict`]: conflict resolution (Phase 6) — `resolve_server`
+//!   downloads over the local file, `resolve_local` uploads guarded by
+//!   the conflict's ETag (a remote change in between keeps the conflict
+//!   pending with fresh remote state), plus dated conflicted copies for
+//!   the `conflict_copy` policy.
 //! - [`engine`]: the job tasks — periodic and watcher-triggered sync
-//!   passes, crash recovery, pause/resume/stop commands, and the event
-//!   stream for the UI (Phase 7).
+//!   passes, crash recovery, pause/resume/stop commands, the conflict
+//!   policy, and the event stream for the UI (Phase 7).
 
+pub mod conflict;
 pub mod diff;
 pub mod engine;
 pub mod error;
@@ -26,6 +32,7 @@ pub mod scan;
 pub mod transfer;
 pub mod watch;
 
+pub use conflict::{ResolveOutcome, resolve};
 pub use diff::SyncAction;
 pub use engine::{Engine, EngineEvent, EngineOptions, Job, JobCommand, RunSummary};
 pub use error::SyncError;

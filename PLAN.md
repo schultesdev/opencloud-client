@@ -273,19 +273,19 @@ Remote geändert? = ETag != DB-Werte
 
 ### Phase 6 — Konflikthandhabung (in `oc-sync`, ca. 3–5 Tage)
 
-- [ ] Erkennung: beidseitig geändert (siehe Phase 5) → statt blind zu
+- [x] Erkennung: beidseitig geändert (siehe Phase 5) → statt blind zu
       überschreiben Eintrag in `conflicts`-Tabelle, Status `conflict` in
       `entries`, betroffene Datei wird **nicht** mehr angetastet, bis gelöst.
-- [ ] Optional (Einstellung `conflict_policy`): statt Anfrage automatisch
+- [x] Optional (Einstellung `conflict_policy`): statt Anfrage automatisch
       `keep_server` / `keep_local`, oder Konfliktkopie
       `name (conflicted copy <user> <date>).ext` lokal anlegen und Remote
       übernehmen.
-- [ ] **Lösungsaktionen** (Commands von der GUI):
+- [x] **Lösungsaktionen** (Commands von der GUI):
   - `resolve_server`: Download überschreibt lokal, DB aktualisieren, Konflikt `resolved_server`
   - `resolve_local`: Upload mit `If-Match=<Konflikt-ETag>` überschreibt Remote;
     scheitert das (ETag inzwischen wieder geändert) → Konflikt bleibt/neuer Konflikt
-- [ ] GUI-freier Pfad: dieselben Aktionen per CLI (`oc-app --resolve <id> server|local`) → testbar.
-- [ ] Tests: Konflikt entsteht, Aktionen, Remote-ändert-sich-währenddessen.
+- [x] GUI-freier Pfad: dieselben Aktionen per CLI (`oc-app --resolve <id> server|local`) → testbar.
+- [x] Tests: Konflikt entsteht, Aktionen, Remote-ändert-sich-währenddessen.
 
 ### Phase 7 — GUI (`oc-app`, ca. 1–2 Wochen)
 

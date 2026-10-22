@@ -119,6 +119,45 @@ versioning follows [Semantic Versioning](https://semver.org/).
   Pause/Resume/Stop, Watcher; dazu Unit-Tests für Diff, Scan, Filter,
   Transfers und zwei `oc-api`-Tests für `get_range`.
 
+### Added (Phase 6 — Konflikthandhabung, `oc-sync`/`oc-db`/`oc-app`)
+
+- **Konflikterkennung vervollständigt**: beidseitig geänderte Dateien
+  (auch Löschung-vs.-Änderung und 412 beim Upload) landen in
+  `conflicts` (Status `pending`) und `entries.state = conflict`; die
+  betroffene Datei wird nicht mehr angetastet, bis der Konflikt
+  gelöst ist (eingefrorene Pfade, inkl. schützender Ordner).
+- **`conflict_policy`** (`config.json`, `settings`): `ask` (Standard)
+  hält Konflikte pending für GUI/CLI; `keep_server`, `keep_local` und
+  `conflict_copy` lösen Konflikte sofort im Sync-Lauf auf.
+  `conflict_copy` legt die lokale Version als
+  `name (conflicted copy YYYY-MM-DD HH-MM-SS).ext` ab (Kollisionen
+  bekommen einen Zähler) und übernimmt dann die Serverversion; die
+  Kopie synchronisiert sich beim nächsten Lauf als neue Datei.
+- **Lösungsaktionen** (`oc-sync::conflict::resolve`): `resolve_server`
+  lädt die Serverversion herunter und überschreibt lokal (bei
+  serverseitiger Löschung wird die lokale Datei entfernt);
+  `resolve_local` lädt mit `If-Match=<Konflikt-ETag>` hoch — ändert
+  sich der Server in der Zwischenzeit (412), bleibt der Konflikt
+  pending und der aktuelle Remote-Zustand wird nachgetragen
+  (`oc-db`: `update_conflict_remote`, `get_conflict`); lokal
+  gelöschte Dateien propagieren die Löschung zum Server.
+  Ordner-/Datei-Mismatches werden abgelehnt
+  (`SyncError::UnresolvableConflict`) und müssen manuell bereinigt
+  werden.
+- **CLI (GUI-freier Pfad, `oc-app`)**: `--conflicts` listet offene
+  Konflikte aller Jobs (Id, Pfad, lokale/remote-Größe und ETag);
+  `--resolve <id> server|local` löst einen Konflikt (bei mehrdeutigen
+  Ids über mehrere Jobs hinweg: `--resolve <job-id>:<id> ...`).
+  Der Headless-Modus wendet die konfigurierte Policy an.
+- **Events/Summary**: `EngineEvent::ConflictResolved` (Policy wie auch
+  CLI), `RunSummary.auto_resolved` (Anzeige „N auto-resolved“).
+- Tests (12 neue): Resolve-Aktionen gegen Mock-WebDAV — Server gewinnt
+  (Download + Remote-Löschung), Lokal gewinnt (`If-Match`,
+  `If-None-Match`-Neuanlage, lokale Löschung → DELETE), 412 mit
+  nachgetragenem Remote-Zustand, unbekannte/Ordner-Konflikte,
+  Policies `keep_server`/`keep_local`/`conflict_copy` im Engine-Lauf;
+  `oc-db`-DAO-Tests für `get_conflict`/`update_conflict_remote`.
+
 ### Added (Phase 2 — Authentifizierung, `oc-auth`)
 
 - OIDC Discovery über `<server>/.well-known/openid-configuration` mit den

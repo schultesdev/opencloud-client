@@ -790,3 +790,22 @@ async fn put_file_streams_the_file_with_its_length() {
     assert_eq!(reported.load(Ordering::SeqCst), 200_000);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn webdav_urls_must_be_http() {
+    assert!(
+        WebDavClient::from_webdav_url(
+            "ftp://cloud.example.com/dav/spaces/x",
+            StaticToken::new("t")
+        )
+        .is_err()
+    );
+    assert!(WebDavClient::from_webdav_url("not a url", StaticToken::new("t")).is_err());
+    assert!(
+        WebDavClient::from_webdav_url(
+            "https://cloud.example.com/dav/spaces/x",
+            StaticToken::new("t")
+        )
+        .is_ok()
+    );
+}

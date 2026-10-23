@@ -123,15 +123,10 @@ impl<P: TokenProvider> WebDavClient<P> {
     /// server URL may differ from the API host.
     pub fn from_webdav_url(webdav_url: &str, token: P) -> Result<Self, ApiError> {
         let mut normalized = webdav_url.trim_end_matches('/').to_string();
-        if !normalized.contains("://") {
-            return Err(ApiError::invalid_url(
-                webdav_url,
-                "must be an http(s) URL with a host",
-            ));
-        }
         normalized.push('/');
-        let base = Url::parse(&normalized)
-            .map_err(|err| ApiError::invalid_url(webdav_url, err.to_string()))?;
+        // Same rules as for server URLs: http(s) with a host.
+        let base = parse_server_url(&normalized)
+            .map_err(|_| ApiError::invalid_url(webdav_url, "must be an http(s) URL with a host"))?;
         Ok(Self {
             http: AuthedHttp::new(token)?,
             base,

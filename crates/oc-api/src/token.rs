@@ -17,9 +17,12 @@ pub trait TokenProvider: Send + Sync {
     /// Returns a valid access token, refreshing first when necessary.
     fn access_token(&self) -> impl Future<Output = Result<String, ApiError>> + Send;
 
-    /// Returns a freshly refreshed access token — used after a request was
-    /// answered with 401. Defaults to [`TokenProvider::access_token`].
-    fn refresh(&self) -> impl Future<Output = Result<String, ApiError>> + Send {
+    /// Returns a replacement for the access token `rejected`, which the
+    /// server answered with 401. Providers that share tokens between
+    /// requests refresh only if `rejected` is still current. Defaults to
+    /// [`TokenProvider::access_token`].
+    fn refresh(&self, rejected: &str) -> impl Future<Output = Result<String, ApiError>> + Send {
+        let _ = rejected;
         self.access_token()
     }
 }
@@ -49,8 +52,8 @@ impl<P: TokenProvider> TokenProvider for std::sync::Arc<P> {
         P::access_token(self)
     }
 
-    fn refresh(&self) -> impl Future<Output = Result<String, ApiError>> + Send {
-        P::refresh(self)
+    fn refresh(&self, rejected: &str) -> impl Future<Output = Result<String, ApiError>> + Send {
+        P::refresh(self, rejected)
     }
 }
 
@@ -61,8 +64,8 @@ impl<S: TokenStore> TokenProvider for TokenManager<S> {
             .map_err(ApiError::Auth)
     }
 
-    async fn refresh(&self) -> Result<String, ApiError> {
-        TokenManager::force_refresh(self)
+    async fn refresh(&self, rejected: &str) -> Result<String, ApiError> {
+        TokenManager::refresh_rejected(self, rejected)
             .await
             .map_err(ApiError::Auth)
     }
@@ -78,7 +81,7 @@ mod tests {
         let provider = StaticToken::new("tok");
         let token = provider.access_token().await.expect("token");
         assert_eq!(token, "tok");
-        assert_eq!(provider.refresh().await.expect("refresh"), "tok");
+        assert_eq!(provider.refresh("tok").await.expect("refresh"), "tok");
     }
 
     #[tokio::test]

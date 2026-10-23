@@ -1800,9 +1800,9 @@ impl SyncApp {
         let theme = theme::palette();
         let backend = self.backend.clone();
         // Root children load automatically once the space is chosen.
-        wizard
-            .tree
-            .fetch(account_id, space_id, "", |command| backend.send(command));
+        wizard.tree.fetch(account_id, space_id, "", "", |command| {
+            backend.send(command)
+        });
         if wizard.tree.loading.contains_key("") {
             ui.label(
                 egui::RichText::new("Lade Struktur…")
@@ -1847,6 +1847,7 @@ impl SyncApp {
     ) {
         let backend = self.backend.clone();
         let path = resource.path.clone();
+        let server_path = resource.server_path.clone();
         let name = resource.name.clone();
         // Right-to-left: the expand toggle is allocated first (rightmost
         // edge), so long folder names clip instead of running under it.
@@ -1864,7 +1865,9 @@ impl SyncApp {
                 if !loaded {
                     wizard
                         .tree
-                        .fetch(account_id, space_id, &path, |command| backend.send(command));
+                        .fetch(account_id, space_id, &path, &server_path, |command| {
+                            backend.send(command)
+                        });
                 } else if expanded {
                     wizard.tree.expanded.remove(&path);
                 } else {

@@ -52,11 +52,14 @@ pub struct FolderTree {
 
 impl FolderTree {
     /// Sends a child request for `path` unless it is loaded or pending.
+    /// `server_path` addresses the folder on the server (its spelling may
+    /// differ from the normalized `path`, see `DavResource::server_path`).
     pub fn fetch(
         &mut self,
         account_id: &str,
         space_id: &str,
         path: &str,
+        server_path: &str,
         send: impl FnOnce(UiCommand),
     ) {
         if self.children.contains_key(path) || self.loading.contains_key(path) {
@@ -68,7 +71,7 @@ impl FolderTree {
         send(UiCommand::FetchChildren {
             account_id: account_id.to_owned(),
             space_id: space_id.to_owned(),
-            path: path.to_owned(),
+            path: server_path.to_owned(),
             token,
         });
     }

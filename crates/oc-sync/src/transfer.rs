@@ -14,6 +14,19 @@ use crate::scan::RemoteNode;
 use crate::scan::abs_local_path;
 use crate::scan::unix_mtime;
 
+/// Where a transfer reads or writes: the job's local root and the
+/// normalized key of the file (its local location), plus the path that
+/// addresses it on the server (see [`crate::scan::ServerNames`]).
+#[derive(Debug, Clone, Copy)]
+pub struct TransferPaths<'a> {
+    /// The job's local root directory.
+    pub root: &'a Path,
+    /// The space-relative, normalized path (diff/database key).
+    pub path: &'a str,
+    /// The server spelling of `path`.
+    pub remote_path: &'a str,
+}
+
 /// Metadata of a completed transfer, as recorded in the status database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferMeta {
@@ -93,13 +106,17 @@ impl LocalGuard {
 /// `progress` receives chunk-granular byte counts.
 pub async fn download<P: TokenProvider>(
     dav: &WebDavClient<P>,
-    root: &Path,
-    path: &str,
+    paths: TransferPaths<'_>,
     remote: &RemoteNode,
     chunk_size: u64,
     guard: LocalGuard,
     progress: Option<&TransferHandle>,
 ) -> Result<TransferResult, SyncError> {
+    let TransferPaths {
+        root,
+        path,
+        remote_path,
+    } = paths;
     let target = abs_local_path(root, path)?;
     let size = remote
         .size
@@ -107,11 +124,11 @@ pub async fn download<P: TokenProvider>(
         .map(|size| size as u64);
     let landed = match size {
         Some(size) if chunk_size > 0 && size > chunk_size => {
-            chunked_download(dav, path, &target, size, chunk_size, guard, progress)
+            chunked_download(dav, remote_path, &target, size, chunk_size, guard, progress)
                 .await?
                 .map(|(etag, local)| (etag, local, Some(size as i64)))
         }
-        _ => whole_download(dav, root, path, remote, &target, guard, progress)
+        _ => whole_download(dav, root, remote_path, remote, &target, guard, progress)
             .await?
             .map(|(etag, local)| {
                 let remote_size = local.size;
@@ -175,13 +192,23 @@ async fn chunked_download<P: TokenProvider>(
         return Err(SyncError::io(target, join_error(source)));
     }
 
-    let mut etag = None;
+    // Every chunk must come from the same version of the file: the
+    // ranges are requested with `If-Match` on the first chunk's ETag, and
+    // each response's ETag is compared as well (for servers that ignore
+    // `If-Match` on GET).
+    let mut etag: Option<String> = None;
     let mut offset = 0u64;
     while offset < size {
         let end = (offset + chunk_size - 1).min(size - 1);
-        let response = dav.get_range(path, offset, end).await?;
-        if etag.is_none() {
-            etag = etag_of(&response);
+        let response = dav.get_range(path, offset, end, etag.as_deref()).await?;
+        match (&etag, etag_of(&response)) {
+            (None, first) => etag = first,
+            (Some(expected), Some(current)) if *expected != current => {
+                return Err(SyncError::Api(ApiError::protocol(format!(
+                    "'{path}' changed on the server during the download; retrying next pass"
+                ))));
+            }
+            _ => {}
         }
         let status = response.status();
         let bytes = response.bytes().await.map_err(ApiError::from)?;
@@ -244,12 +271,16 @@ async fn chunked_download<P: TokenProvider>(
 /// `progress` receives byte-granular counts of the current attempt.
 pub async fn upload<P: TokenProvider>(
     dav: &WebDavClient<P>,
-    root: &Path,
-    path: &str,
+    paths: TransferPaths<'_>,
     base_etag: Option<String>,
     create: bool,
     progress: Option<&TransferHandle>,
 ) -> Result<TransferResult, SyncError> {
+    let TransferPaths {
+        root,
+        path,
+        remote_path,
+    } = paths;
     let source = abs_local_path(root, path)?;
     let read = tokio::task::spawn_blocking(move || read_with_meta(&source))
         .await
@@ -263,7 +294,7 @@ pub async fn upload<P: TokenProvider>(
     };
     let reporting = progress.cloned();
     let response = dav
-        .put_with_progress(path, content, condition, move |bytes| {
+        .put_with_progress(remote_path, content, condition, move |bytes| {
             if let Some(handle) = &reporting {
                 handle.report(bytes);
             }
@@ -276,7 +307,7 @@ pub async fn upload<P: TokenProvider>(
             let etag = match etag {
                 Some(etag) => Some(etag),
                 None => dav
-                    .propfind(path, Depth::Zero)
+                    .propfind(remote_path, Depth::Zero)
                     .await
                     .ok()
                     .and_then(|resources| {

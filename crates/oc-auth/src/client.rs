@@ -20,6 +20,10 @@ pub const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// OIDC client for one OpenCloud server (public desktop client, no secret).
+///
+/// Token and revocation requests use the discovered endpoints: discovery
+/// runs lazily before the first such request (and is shared by clones);
+/// until it succeeds, the OpenCloud defaults are used.
 #[derive(Debug, Clone)]
 pub struct AuthClient {
     http: reqwest::Client,
@@ -27,6 +31,8 @@ pub struct AuthClient {
     client_id: String,
     scopes: String,
     endpoints: ProviderEndpoints,
+    /// Endpoints after a successful discovery (merged over `endpoints`).
+    discovered: std::sync::Arc<tokio::sync::OnceCell<ProviderEndpoints>>,
 }
 
 impl AuthClient {
@@ -55,6 +61,7 @@ impl AuthClient {
             server,
             client_id: client_id.to_string(),
             scopes: crate::DEFAULT_SCOPES.to_string(),
+            discovered: Default::default(),
         })
     }
 
@@ -88,8 +95,29 @@ impl AuthClient {
     pub async fn discover_endpoints(&mut self) -> ProviderEndpoints {
         if let Ok(discovered) = discovery::discover(&self.http, &self.server).await {
             self.endpoints = self.endpoints.clone().merge(discovered);
+            let cell = tokio::sync::OnceCell::new();
+            let _ = cell.set(self.endpoints.clone());
+            self.discovered = std::sync::Arc::new(cell);
         }
         self.endpoints.clone()
+    }
+
+    /// The endpoints for token and revocation requests: discovered ones
+    /// once a discovery succeeded (run here on first use), the configured
+    /// defaults otherwise. A failed discovery is retried on the next call.
+    async fn active_endpoints(&self) -> ProviderEndpoints {
+        let discovered = self
+            .discovered
+            .get_or_try_init(|| async {
+                discovery::discover(&self.http, &self.server)
+                    .await
+                    .map(|found| self.endpoints.clone().merge(found))
+            })
+            .await;
+        match discovered {
+            Ok(endpoints) => endpoints.clone(),
+            Err(_) => self.endpoints.clone(),
+        }
     }
 
     /// Builds the authorization URL (authorization-code flow with PKCE S256).
@@ -148,7 +176,8 @@ impl AuthClient {
     /// Revokes the refresh token (RFC 7009). A no-op when no revocation
     /// endpoint is known (only discovery provides one).
     pub async fn revoke(&self, refresh_token: &str) -> Result<(), AuthError> {
-        let Some(endpoint) = self.endpoints.revocation_endpoint.as_deref() else {
+        let endpoints = self.active_endpoints().await;
+        let Some(endpoint) = endpoints.revocation_endpoint.as_deref() else {
             return Ok(());
         };
         let form = [
@@ -215,8 +244,8 @@ impl AuthClient {
 
     /// Posts a form to the token endpoint and parses the response.
     async fn token_request(&self, form: &[(String, String)]) -> Result<TokenSet, AuthError> {
-        let endpoint = self
-            .endpoints
+        let endpoints = self.active_endpoints().await;
+        let endpoint = endpoints
             .token_endpoint
             .as_deref()
             .ok_or_else(|| AuthError::missing_endpoint("token_endpoint"))?;

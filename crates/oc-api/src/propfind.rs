@@ -37,6 +37,17 @@ pub(crate) struct RawResource {
     pub last_modified: Option<String>,
     /// `quota-available-bytes` for collections.
     pub quota_available_bytes: Option<u64>,
+    /// A `<status>` directly inside `<response>` (RFC 4918 allows one in
+    /// place of propstats, e.g. `404` for a resource that is gone).
+    pub status: Option<String>,
+}
+
+/// Whether a `HTTP/1.1 200 OK`-style status line carries a 2xx code.
+fn is_success_status(line: &str) -> bool {
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .is_some_and(|code| (200..300).contains(&code))
 }
 
 /// Properties of one `<propstat>`, committed on its 200 status.
@@ -51,7 +62,7 @@ struct PropStat {
 
 impl PropStat {
     fn is_ok(&self) -> bool {
-        self.status.contains("200")
+        is_success_status(&self.status)
     }
 }
 
@@ -116,8 +127,13 @@ pub(crate) fn parse_multistatus(xml: &str) -> Result<Vec<RawResource>, ApiError>
                     &mut text,
                 )?;
                 if name == "response" {
-                    if let Some(resource) = current.take() {
-                        if !resource.href.is_empty() {
+                    if let Some(mut resource) = current.take() {
+                        let gone = resource
+                            .status
+                            .as_deref()
+                            .is_some_and(|status| !is_success_status(status));
+                        if !resource.href.is_empty() && !gone {
+                            resource.is_dir |= resource.href.ends_with('/');
                             resources.push(resource);
                         }
                     }
@@ -225,11 +241,11 @@ fn handle_close(
                 resource.href = value;
             }
         }
-        Pending::Status => {
-            if let Some(stage) = propstat {
-                stage.status = value;
-            }
-        }
+        Pending::Status => match (propstat, current) {
+            (Some(stage), _) => stage.status = value,
+            (None, Some(resource)) => resource.status = Some(value),
+            (None, None) => {}
+        },
         Pending::Etag => {
             if let Some(stage) = propstat {
                 stage.etag = (!value.is_empty()).then_some(value);
@@ -287,6 +303,31 @@ fn local_name(name: quick_xml::name::QName<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responses_with_an_error_status_are_dropped() {
+        let xml = r#"<?xml version="1.0"?>
+<D:multistatus xmlns:D="DAV:">
+ <D:response>
+  <D:href>/dav/spaces/sid/gone.txt</D:href>
+  <D:status>HTTP/1.1 404 Not Found</D:status>
+ </D:response>
+ <D:response>
+  <D:href>/dav/spaces/sid/folder/</D:href>
+  <D:propstat>
+   <D:prop><D:getetag>"f"</D:getetag></D:prop>
+   <D:status>HTTP/1.1 200 OK</D:status>
+  </D:propstat>
+ </D:response>
+</D:multistatus>"#;
+        let resources = parse_multistatus(xml).expect("parse");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].href, "/dav/spaces/sid/folder/");
+        // A trailing slash marks a collection even without resourcetype.
+        assert!(resources[0].is_dir);
+        assert!(is_success_status("HTTP/1.1 207 Multi-Status"));
+        assert!(!is_success_status("HTTP/1.1 404 Not Found 200"));
+    }
 
     const FIXTURE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <D:multistatus xmlns:D="DAV:" xmlns:s="http://sabredav.org/ns">

@@ -267,3 +267,34 @@ versioning follows [Semantic Versioning](https://semver.org/).
   wegen gleichzeitiger Rotation abgelehnter Refresh-Token meldet das
   Konto nicht mehr ab.
 - `oc-app`: `--login` mit `--headless` startet nach dem Login die Engine.
+
+### Fixed (Review, Block 2 — Netzwerk- und Engine-Robustheit)
+
+- `oc-api`: Netzwerkfehler werden jetzt wie dokumentiert wiederholt.
+  Bedingte PUTs und MOVE/COPY werden nur wiederholt, wenn der Server den
+  ersten Versuch sicher nicht verarbeitet hat (keine Verbindung, 429,
+  503); sonst entstünden falsche Konflikte. `Retry-After` gilt auch bei
+  503 und wird auf 60 s gedeckelt.
+- `oc-api`/`oc-sync`: Offline schlägt oft zuerst der Token-Refresh fehl;
+  das zählt jetzt als Verbindungsfehler und löst den Offline-Backoff aus.
+- `oc-api`/`oc-sync`: Server-Namen in anderer Unicode-Form (NFD, etwa von
+  macOS hochgeladen) bleiben adressierbar. `DavResource::server_path`
+  trägt die Server-Schreibweise, die Engine merkt sie sich in der
+  Status-DB (`server_names`) und nutzt sie für alle Requests.
+- `oc-api`: hrefs müssen auf einer Segmentgrenze unter dem Space liegen;
+  `<response>`-Einträge mit eigenem Fehlerstatus werden verworfen,
+  Statuszeilen werden geparst.
+- `oc-sync`: Range-Downloads senden `If-Match` und prüfen das ETag jedes
+  Stücks, damit keine Datei aus zwei Versionen entsteht.
+- `oc-sync`: Ein unlesbarer lokaler Eintrag bricht den Scan nicht mehr ab.
+  Er wird gemeldet und für den Lauf eingefroren, damit ein unlesbarer
+  Ordner nie als gelöscht gilt.
+- `oc-db`: Schema v2 mit passenden Indizes, höchstens einem offenen
+  Konflikt pro Pfad und der Tabelle `server_names`. Migrationen laufen in
+  einer `IMMEDIATE`-Transaktion nach dem Umschalten auf WAL, so dass
+  parallele Öffnungen nicht doppelt migrieren; kaputte Versionsangaben
+  sind ein Fehler statt einer erneuten Migration.
+- `oc-auth`: Refresh und Widerruf nutzen die per Discovery gefundenen
+  Endpunkte; Server-URLs mit Unterpfad funktionieren; mehrere gleichzeitige
+  401 lösen nur einen Refresh aus; Token-Antworten ohne `expires_in`
+  werden akzeptiert.

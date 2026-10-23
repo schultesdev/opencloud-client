@@ -35,8 +35,8 @@ use crate::filter::Filter;
 use crate::progress::RunProgress;
 use crate::progress::RunTracker;
 use crate::progress::TransferHandle;
-use crate::scan::{self, LocalNode, RemoteNode};
-use crate::transfer::{self, LocalGuard, TransferResult};
+use crate::scan::{self, LocalNode, RemoteNode, ServerNames};
+use crate::transfer::{self, LocalGuard, TransferPaths, TransferResult};
 use crate::watch::LocalWatcher;
 
 /// Configuration of a sync job handed to [`Engine::start`].
@@ -635,8 +635,8 @@ async fn run_once<P: TokenProvider + 'static>(
         return (summary, aborted);
     }
 
-    let local = match scan::scan_local(&job.local_root, &job.filter) {
-        Ok(local) => local,
+    let (local, unreadable) = match scan::scan_local(&job.local_root, &job.filter) {
+        Ok(scan) => (scan.entries, scan.unreadable),
         Err(error) => {
             abort(&mut summary, &mut aborted, error);
             return (summary, aborted);
@@ -670,9 +670,10 @@ async fn run_once<P: TokenProvider + 'static>(
     let skip_remote =
         options.root_etag_shortcut && stored_etag.is_some() && stored_etag == root_etag;
 
-    let remote = if skip_remote {
+    let (remote, names) = if skip_remote {
         summary.remote_scan_skipped = true;
-        remote_from_db(&db_entries)
+        let names = db_lock(&job.db).server_names().unwrap_or_default();
+        (remote_from_db(&db_entries), names)
     } else {
         let listing = match job.dav.propfind("", Depth::One).await {
             Ok(listing) => listing,
@@ -690,13 +691,20 @@ async fn run_once<P: TokenProvider + 'static>(
         )
         .await
         {
-            Ok(snapshot) => snapshot.entries,
+            Ok(snapshot) => {
+                if let Err(error) = db_lock(&job.db).replace_server_names(&snapshot.server_names) {
+                    fail(&mut summary, "", &SyncError::from(error));
+                }
+                (snapshot.entries, snapshot.server_names)
+            }
             Err(error) => {
                 abort(&mut summary, &mut aborted, error);
                 return (summary, aborted);
             }
         }
     };
+    // Requests address paths by their server spelling.
+    let names = ServerNames::new(names);
 
     // Open conflicts freeze their paths; nothing below them is touched.
     let mut frozen = HashSet::new();
@@ -714,6 +722,12 @@ async fn run_once<P: TokenProvider + 'static>(
             .filter(|(_, entry)| entry.state == EntryState::Conflict)
             .map(|(path, _)| path.clone()),
     );
+    // Locally unreadable paths are in an unknown state: freeze them for
+    // this pass (a folder that cannot be listed must not look deleted).
+    for (path, error) in unreadable {
+        fail(&mut summary, &path, &error);
+        frozen.insert(path);
+    }
 
     let plan = diff::build(&local, &remote, &db_entries, &frozen);
 
@@ -740,12 +754,18 @@ async fn run_once<P: TokenProvider + 'static>(
         tracker.announce();
     }
 
-    let semaphore = Arc::new(Semaphore::new(options.max_parallel_transfers.max(1)));
+    let context = TransferContext {
+        dav: job.dav.clone(),
+        root: job.local_root.clone(),
+        chunk_size: options.download_chunk_size,
+        semaphore: Arc::new(Semaphore::new(options.max_parallel_transfers.max(1))),
+        tracker: tracker.clone(),
+    };
     let mut transfers: Vec<QueuedTransfer> = Vec::new();
 
     for action in plan {
         match action {
-            SyncAction::MkcolRemote { path } => match job.dav.mkcol(&path).await {
+            SyncAction::MkcolRemote { path } => match job.dav.mkcol(&names.resolve(&path)).await {
                 // 405: the folder already exists (created concurrently).
                 Ok(()) | Err(ApiError::Status { code: 405 }) => {
                     summary.folders_created += 1;
@@ -791,23 +811,25 @@ async fn run_once<P: TokenProvider + 'static>(
                 }
                 Err(error) => fail(&mut summary, &path, &error),
             },
-            SyncAction::DeleteRemote { path, is_dir } => match job.dav.delete(&path).await {
-                // 404: already gone (e.g. the parent folder was deleted
-                // first) — the outcome is the same.
-                Ok(()) | Err(ApiError::NotFound) => {
-                    let result = if is_dir {
-                        db_lock(&job.db).delete_subtree(&path)
-                    } else {
-                        db_lock(&job.db).delete_entry(&path).map(|_| 0)
-                    };
-                    if let Err(error) = result {
-                        fail(&mut summary, &path, &SyncError::from(error));
-                    } else {
-                        summary.deletes += 1;
+            SyncAction::DeleteRemote { path, is_dir } => {
+                match job.dav.delete(&names.resolve(&path)).await {
+                    // 404: already gone (e.g. the parent folder was deleted
+                    // first) — the outcome is the same.
+                    Ok(()) | Err(ApiError::NotFound) => {
+                        let result = if is_dir {
+                            db_lock(&job.db).delete_subtree(&path)
+                        } else {
+                            db_lock(&job.db).delete_entry(&path).map(|_| 0)
+                        };
+                        if let Err(error) = result {
+                            fail(&mut summary, &path, &SyncError::from(error));
+                        } else {
+                            summary.deletes += 1;
+                        }
                     }
+                    Err(error) => fail(&mut summary, &path, &SyncError::from(error)),
                 }
-                Err(error) => fail(&mut summary, &path, &SyncError::from(error)),
-            },
+            }
             SyncAction::DeleteLocal { path, is_dir } => {
                 match scan::abs_local_path(&job.local_root, &path) {
                     Ok(target) => {
@@ -851,15 +873,8 @@ async fn run_once<P: TokenProvider + 'static>(
                 let _ = mark_state(&job.db, &path, EntryState::Uploading);
                 let kind = PendingTransfer::Upload { base_etag, create };
                 let planned = planned_bytes(local.get(&path).and_then(|node| node.size));
-                let (handle, task) = spawn_transfer(
-                    job.dav.clone(),
-                    job.local_root.clone(),
-                    options.download_chunk_size,
-                    semaphore.clone(),
-                    tracker.clone(),
-                    kind.clone(),
-                    path.clone(),
-                );
+                let (handle, task) =
+                    spawn_transfer(&context, kind.clone(), path.clone(), names.resolve(&path));
                 transfers.push((kind, path, planned, handle, task));
             }
             SyncAction::Download { path, remote } => {
@@ -867,15 +882,8 @@ async fn run_once<P: TokenProvider + 'static>(
                 let planned = planned_bytes(remote.size);
                 let guard = LocalGuard::from_scan(local.get(&path).copied());
                 let kind = PendingTransfer::Download { remote, guard };
-                let (handle, task) = spawn_transfer(
-                    job.dav.clone(),
-                    job.local_root.clone(),
-                    options.download_chunk_size,
-                    semaphore.clone(),
-                    tracker.clone(),
-                    kind.clone(),
-                    path.clone(),
-                );
+                let (handle, task) =
+                    spawn_transfer(&context, kind.clone(), path.clone(), names.resolve(&path));
                 transfers.push((kind, path, planned, handle, task));
             }
             SyncAction::Conflict {
@@ -954,7 +962,7 @@ async fn run_once<P: TokenProvider + 'static>(
                 handle.abandon();
                 let current_remote = job
                     .dav
-                    .propfind(&path, Depth::Zero)
+                    .propfind(&names.resolve(&path), Depth::Zero)
                     .await
                     .ok()
                     .and_then(|resources| resources.first().map(RemoteNode::from_resource));
@@ -1003,45 +1011,56 @@ async fn run_once<P: TokenProvider + 'static>(
     (summary, aborted)
 }
 
+/// What every transfer task of one pass shares.
+struct TransferContext<P: TokenProvider> {
+    /// The job's WebDAV client.
+    dav: Arc<WebDavClient<P>>,
+    /// The job's local root.
+    root: PathBuf,
+    /// Chunk size of range downloads.
+    chunk_size: u64,
+    /// Caps the number of concurrent transfers (`max_parallel_transfers`).
+    semaphore: Arc<Semaphore>,
+    /// The pass's progress tracker.
+    tracker: Arc<RunTracker>,
+}
+
 /// Spawns one transfer task; the semaphore caps the number of concurrent
 /// transfers (`max_parallel_transfers`). Returns the transfer's progress
 /// handle (for finishing/abandoning it) alongside the task.
 fn spawn_transfer<P: TokenProvider + 'static>(
-    dav: Arc<WebDavClient<P>>,
-    root: PathBuf,
-    chunk_size: u64,
-    semaphore: Arc<Semaphore>,
-    tracker: Arc<RunTracker>,
+    context: &TransferContext<P>,
     kind: PendingTransfer,
     path: String,
+    remote_path: String,
 ) -> (
     TransferHandle,
     JoinHandle<Result<TransferResult, SyncError>>,
 ) {
-    let handle = tracker.handle();
+    let handle = context.tracker.handle();
     let reporting = handle.clone();
+    let dav = context.dav.clone();
+    let root = context.root.clone();
+    let chunk_size = context.chunk_size;
+    let semaphore = context.semaphore.clone();
     let task = tokio::spawn(async move {
         let _permit = semaphore
             .acquire_owned()
             .await
             .map_err(|_| SyncError::Api(ApiError::protocol("transfer semaphore closed")))?;
+        let paths = TransferPaths {
+            root: &root,
+            path: &path,
+            remote_path: &remote_path,
+        };
         match kind {
             PendingTransfer::Upload { base_etag, create } => {
-                transfer::upload(
-                    dav.as_ref(),
-                    &root,
-                    &path,
-                    base_etag,
-                    create,
-                    Some(&reporting),
-                )
-                .await
+                transfer::upload(dav.as_ref(), paths, base_etag, create, Some(&reporting)).await
             }
             PendingTransfer::Download { remote, guard } => {
                 transfer::download(
                     dav.as_ref(),
-                    &root,
-                    &path,
+                    paths,
                     &remote,
                     chunk_size,
                     guard,

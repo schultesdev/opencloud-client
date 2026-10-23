@@ -9,8 +9,8 @@ use reqwest::{Method, Response};
 use url::Url;
 
 use crate::error::ApiError;
-use crate::http::{AuthedHttp, parse_server_url};
-use crate::path::{build_url, encode_segment, href_to_path};
+use crate::http::{AuthedHttp, Replay, parse_server_url};
+use crate::path::{build_url, encode_segment, href_to_server_path, normalize_nfc};
 use crate::propfind::{PROPFIND_BODY, RawResource, parse_multistatus};
 use crate::retry::RetryConfig;
 use crate::token::TokenProvider;
@@ -52,8 +52,13 @@ pub enum WriteCondition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DavResource {
     /// Path relative to the space root (`""` is the root), percent-decoded
-    /// and NFC-normalized, without trailing slash.
+    /// and NFC-normalized, without trailing slash — the comparison key.
     pub path: String,
+    /// The same path as the server spells it (percent-decoded, not
+    /// normalized). Use it to address the resource in requests: a name
+    /// stored in NFD (e.g. uploaded from macOS) is a different URL than
+    /// its NFC form. Equal to `path` for NFC names.
+    pub server_path: String,
     /// Last path segment; empty for the space root.
     pub name: String,
     /// Whether the resource is a collection (directory).
@@ -144,7 +149,7 @@ impl<P: TokenProvider> WebDavClient<P> {
         let propfind = self.propfind_method()?;
         let response = self
             .http
-            .send(self.http.request_timeout(), |token| {
+            .send(self.http.request_timeout(), Replay::Safe, |token| {
                 self.http
                     .http()
                     .request(propfind.clone(), url.clone())
@@ -167,7 +172,7 @@ impl<P: TokenProvider> WebDavClient<P> {
         let url = build_url(&self.base, path)?;
         let timeout = self.http.transfer_timeout();
         self.http
-            .send(timeout, |token| {
+            .send(timeout, Replay::Safe, |token| {
                 self.http.http().get(url.clone()).bearer_auth(token)
             })
             .await
@@ -178,16 +183,32 @@ impl<P: TokenProvider> WebDavClient<P> {
     /// ignore the header and answer with the full body (HTTP 200 instead
     /// of 206), so callers must check the response status before
     /// appending the chunk.
-    pub async fn get_range(&self, path: &str, start: u64, end: u64) -> Result<Response, ApiError> {
+    ///
+    /// With `if_match`, the range is only served while the file still has
+    /// that ETag (`If-Match`); a file changed since the first chunk yields
+    /// [`ApiError::PreconditionFailed`] instead of a chunk of another
+    /// version.
+    pub async fn get_range(
+        &self,
+        path: &str,
+        start: u64,
+        end: u64,
+        if_match: Option<&str>,
+    ) -> Result<Response, ApiError> {
         let url = build_url(&self.base, path)?;
         let timeout = self.http.transfer_timeout();
         self.http
-            .send(timeout, |token| {
-                self.http
+            .send(timeout, Replay::Safe, |token| {
+                let request = self
+                    .http
                     .http()
                     .get(url.clone())
                     .bearer_auth(token)
-                    .header("Range", format!("bytes={start}-{end}"))
+                    .header("Range", format!("bytes={start}-{end}"));
+                match if_match {
+                    Some(etag) => request.header("If-Match", etag),
+                    None => request,
+                }
             })
             .await
     }
@@ -233,9 +254,16 @@ impl<P: TokenProvider> WebDavClient<P> {
         let timeout = self.http.transfer_timeout();
         let content = content.as_ref().to_vec();
         let progress = Arc::new(progress);
+        // A repeated conditional PUT that the server already applied
+        // would fail its own precondition and look like a conflict.
+        let replay = if condition.is_some() {
+            Replay::OnlyUnprocessed
+        } else {
+            Replay::Safe
+        };
         let response = self
             .http
-            .send(timeout, move |token| {
+            .send(timeout, replay, move |token| {
                 let mut request = self.http.http().put(url.clone()).bearer_auth(token);
                 request = apply_condition(request, &condition);
                 let body = progress_body(content.clone(), progress.clone());
@@ -254,7 +282,7 @@ impl<P: TokenProvider> WebDavClient<P> {
         let url = build_url(&self.base, path)?;
         let mkcol = webdav_method(b"MKCOL")?;
         self.http
-            .send(self.http.request_timeout(), |token| {
+            .send(self.http.request_timeout(), Replay::Safe, |token| {
                 self.http
                     .http()
                     .request(mkcol.clone(), url.clone())
@@ -268,7 +296,7 @@ impl<P: TokenProvider> WebDavClient<P> {
     pub async fn delete(&self, path: &str) -> Result<(), ApiError> {
         let url = build_url(&self.base, path)?;
         self.http
-            .send(self.http.request_timeout(), |token| {
+            .send(self.http.request_timeout(), Replay::Safe, |token| {
                 self.http.http().delete(url.clone()).bearer_auth(token)
             })
             .await?;
@@ -303,15 +331,20 @@ impl<P: TokenProvider> WebDavClient<P> {
         let source = build_url(&self.base, from)?;
         let destination = build_url(&self.base, to)?;
         let overwrite = if overwrite { "T" } else { "F" };
+        // A repeated MOVE that already happened fails with 404.
         self.http
-            .send(self.http.request_timeout(), |token| {
-                self.http
-                    .http()
-                    .request(method.clone(), source.clone())
-                    .bearer_auth(token)
-                    .header("Destination", destination.as_str())
-                    .header("Overwrite", overwrite)
-            })
+            .send(
+                self.http.request_timeout(),
+                Replay::OnlyUnprocessed,
+                |token| {
+                    self.http
+                        .http()
+                        .request(method.clone(), source.clone())
+                        .bearer_auth(token)
+                        .header("Destination", destination.as_str())
+                        .header("Overwrite", overwrite)
+                },
+            )
             .await?;
         Ok(())
     }
@@ -319,10 +352,12 @@ impl<P: TokenProvider> WebDavClient<P> {
     /// Converts a raw parsed resource into a resolved [`DavResource`]
     /// (href decoded to a space-relative, NFC-normalized path).
     fn resolve(&self, raw: RawResource) -> Result<DavResource, ApiError> {
-        let path = href_to_path(&self.base, &raw.href)?;
+        let server_path = href_to_server_path(&self.base, &raw.href)?;
+        let path = normalize_nfc(&server_path);
         let name = path.rsplit('/').next().unwrap_or_default().to_string();
         Ok(DavResource {
             path,
+            server_path,
             name,
             is_dir: raw.is_dir,
             size: raw.size,

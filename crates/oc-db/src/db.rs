@@ -41,9 +41,11 @@ impl StatusDb {
             })?;
         }
         let conn = Connection::open(path).map_err(|source| DbError::open(path, source))?;
-        let db = Self::from_conn(conn, path.to_path_buf())?;
-        db.enable_wal()?;
-        Ok(db)
+        // WAL first: the migration itself already runs in WAL mode, so
+        // concurrent readers (GUI, CLI) are not blocked by it.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Self::enable_wal(&conn)?;
+        Self::from_conn(conn, path.to_path_buf())
     }
 
     /// Opens a private in-memory database (used by tests and tools that
@@ -55,17 +57,17 @@ impl StatusDb {
     }
 
     /// Common setup for file-backed and in-memory databases.
-    fn from_conn(conn: Connection, path: PathBuf) -> Result<Self, DbError> {
+    fn from_conn(mut conn: Connection, path: PathBuf) -> Result<Self, DbError> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        migrations::migrate(&conn)?;
+        migrations::migrate(&mut conn)?;
         Ok(Self { conn, path })
     }
 
     /// Switches the journal to WAL. Best effort: in-memory databases (and
     /// exotic filesystems) keep their default journal.
-    fn enable_wal(&self) -> Result<(), DbError> {
-        let _ = self.conn.pragma_update(None, "journal_mode", "WAL");
-        self.conn.pragma_update(None, "synchronous", "NORMAL")?;
+    fn enable_wal(conn: &Connection) -> Result<(), DbError> {
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(())
     }
 
@@ -88,7 +90,39 @@ impl StatusDb {
             .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
                 row.get::<_, String>(0)
             })
-            .ok())
+            .optional()?)
+    }
+
+    /// The recorded server spellings of non-NFC paths (normalized path →
+    /// server path); see [`StatusDb::replace_server_names`].
+    pub fn server_names(&self) -> Result<std::collections::HashMap<String, String>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, server_path FROM server_names")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Replaces the recorded server spellings with the ones of a complete
+    /// remote scan, so passes that skip the scan (root-ETag shortcut) and
+    /// conflict resolutions still address such files by their real name.
+    pub fn replace_server_names(
+        &self,
+        names: &std::collections::HashMap<String, String>,
+    ) -> Result<(), DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM server_names", [])?;
+        {
+            let mut insert =
+                tx.prepare("INSERT INTO server_names (path, server_path) VALUES (?1, ?2)")?;
+            for (path, server_path) in names {
+                insert.execute(params![path, server_path])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Writes a `meta` value, overwriting any existing entry.
@@ -130,6 +164,7 @@ impl StatusDb {
                 tx.execute_batch(
                     "DELETE FROM entries;
                      DELETE FROM conflicts;
+                     DELETE FROM server_names;
                      DELETE FROM meta WHERE key IN ('space_etag', 'last_sync');",
                 )?;
                 true
@@ -200,6 +235,8 @@ impl StatusDb {
     /// Deletes the entry for an exact path. Returns whether a row was
     /// removed.
     pub fn delete_entry(&self, path: &str) -> Result<bool, DbError> {
+        self.conn
+            .execute("DELETE FROM server_names WHERE path = ?1", [path])?;
         Ok(self
             .conn
             .execute("DELETE FROM entries WHERE path = ?1", [path])?
@@ -216,9 +253,14 @@ impl StatusDb {
     /// case-sensitive (unlike `LIKE`, where `_`/`%` in names are
     /// wildcards and ASCII case is ignored) and uses the path index.
     pub fn delete_subtree(&self, path: &str) -> Result<usize, DbError> {
+        let bounds = params![path, format!("{path}/"), format!("{path}0")];
+        self.conn.execute(
+            "DELETE FROM server_names WHERE path = ?1 OR (path >= ?2 AND path < ?3)",
+            bounds,
+        )?;
         let removed = self.conn.execute(
             "DELETE FROM entries WHERE path = ?1 OR (path >= ?2 AND path < ?3)",
-            params![path, format!("{path}/"), format!("{path}0")],
+            bounds,
         )?;
         Ok(removed)
     }
@@ -254,12 +296,24 @@ impl StatusDb {
 
     /// Records a newly detected conflict and returns its row id. The
     /// conflict starts as `pending`.
+    ///
+    /// A path has at most one pending conflict: recording one for a path
+    /// that already has a pending row refreshes that row (detection time
+    /// and both sides) and returns its id.
     pub fn record_conflict(&self, conflict: &NewConflict) -> Result<i64, DbError> {
-        self.conn.execute(
+        Ok(self.conn.query_row(
             "INSERT INTO conflicts
                (path, detected_at, local_mtime, local_size,
                 remote_etag, remote_size, remote_mtime, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending')",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending')
+             ON CONFLICT (path) WHERE status = 'pending' DO UPDATE SET
+               detected_at = excluded.detected_at,
+               local_mtime = excluded.local_mtime,
+               local_size = excluded.local_size,
+               remote_etag = excluded.remote_etag,
+               remote_size = excluded.remote_size,
+               remote_mtime = excluded.remote_mtime
+             RETURNING id",
             params![
                 conflict.path,
                 conflict.detected_at,
@@ -269,8 +323,8 @@ impl StatusDb {
                 conflict.remote_size,
                 conflict.remote_mtime,
             ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+            |row| row.get(0),
+        )?)
     }
 
     /// Applies a resolution to a pending conflict: sets `status` and

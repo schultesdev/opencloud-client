@@ -40,8 +40,9 @@ use crate::engine::unix_now;
 use crate::error::SyncError;
 use crate::scan::LocalNode;
 use crate::scan::RemoteNode;
+use crate::scan::ServerNames;
 use crate::scan::abs_local_path;
-use crate::transfer::{self, LocalGuard, TransferResult};
+use crate::transfer::{self, LocalGuard, TransferPaths, TransferResult};
 
 /// Outcome of applying a conflict resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,11 +82,15 @@ pub async fn resolve<P: TokenProvider>(
         }
     }
 
+    // The server spelling of the path (recorded by the last full scan).
+    let remote_path = ServerNames::new(db_lock(db).server_names()?).resolve(&conflict.path);
     let outcome = match resolution {
         ConflictResolution::Server => {
-            resolve_server(dav, db, local_root, &conflict, chunk_size).await
+            resolve_server(dav, db, local_root, &conflict, &remote_path, chunk_size).await
         }
-        ConflictResolution::Local => resolve_local(dav, db, local_root, &conflict).await,
+        ConflictResolution::Local => {
+            resolve_local(dav, db, local_root, &conflict, &remote_path).await
+        }
     }?;
     if outcome == ResolveOutcome::Resolved {
         let resolved = db_lock(db).resolve_conflict(conflict_id, resolution, unix_now())?;
@@ -104,6 +109,7 @@ async fn resolve_server<P: TokenProvider>(
     db: &Mutex<StatusDb>,
     local_root: &Path,
     conflict: &Conflict,
+    remote_path: &str,
     chunk_size: u64,
 ) -> Result<ResolveOutcome, SyncError> {
     let Some(etag) = conflict.remote_etag.clone() else {
@@ -118,17 +124,12 @@ async fn resolve_server<P: TokenProvider>(
         size: conflict.remote_size,
     };
     // The user (or policy) chose the server side: overwrite unconditionally.
-    match transfer::download(
-        dav,
-        local_root,
-        &conflict.path,
-        &remote,
-        chunk_size,
-        LocalGuard::Any,
-        None,
-    )
-    .await?
-    {
+    let paths = TransferPaths {
+        root: local_root,
+        path: &conflict.path,
+        remote_path,
+    };
+    match transfer::download(dav, paths, &remote, chunk_size, LocalGuard::Any, None).await? {
         TransferResult::Done(meta) => {
             record_resolved(
                 db,
@@ -154,10 +155,11 @@ async fn resolve_local<P: TokenProvider>(
     db: &Mutex<StatusDb>,
     local_root: &Path,
     conflict: &Conflict,
+    remote_path: &str,
 ) -> Result<ResolveOutcome, SyncError> {
     if local_node_at(local_root, &conflict.path)?.is_none() {
         // The local side was deleted: keep the deletion, propagate it.
-        match dav.delete(&conflict.path).await {
+        match dav.delete(remote_path).await {
             Ok(()) | Err(ApiError::NotFound) => {}
             Err(error) => return Err(SyncError::Api(error)),
         }
@@ -168,16 +170,12 @@ async fn resolve_local<P: TokenProvider>(
     // upload re-creates the file; a server that got a new file in the
     // meantime rejects `If-None-Match` with 412 — handled below.
     let create = conflict.remote_etag.is_none();
-    match transfer::upload(
-        dav,
-        local_root,
-        &conflict.path,
-        conflict.remote_etag.clone(),
-        create,
-        None,
-    )
-    .await?
-    {
+    let paths = TransferPaths {
+        root: local_root,
+        path: &conflict.path,
+        remote_path,
+    };
+    match transfer::upload(dav, paths, conflict.remote_etag.clone(), create, None).await? {
         TransferResult::Done(meta) => {
             record_resolved(
                 db,
@@ -195,7 +193,7 @@ async fn resolve_local<P: TokenProvider>(
         // The server changed again: record its current state on the
         // pending row; the user resolves anew with fresh information.
         TransferResult::PreconditionFailed => {
-            let remote = current_remote(dav, &conflict.path).await;
+            let remote = current_remote(dav, remote_path).await;
             let updated = db_lock(db).update_conflict_remote(
                 conflict.id,
                 remote.as_ref().and_then(|node| node.etag.as_deref()),

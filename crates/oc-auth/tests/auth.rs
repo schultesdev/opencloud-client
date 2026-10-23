@@ -493,3 +493,75 @@ async fn stale_refresh_token_after_concurrent_rotation_keeps_the_login() {
     );
     server.verify().await;
 }
+
+#[tokio::test]
+async fn token_response_without_expires_in_is_accepted() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/konnect/v1/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "acc",
+            "token_type": "Bearer",
+            "refresh_token": "r2",
+        })))
+        .mount(&server)
+        .await;
+    let client = AuthClient::new(&server.uri()).expect("valid server");
+    let tokens = client.refresh("r1").await.expect("refresh");
+    assert_eq!(tokens.access_token, "acc");
+    assert!(tokens.expires_in > 0);
+}
+
+#[tokio::test]
+async fn refresh_uses_the_discovered_token_endpoint_and_a_server_subpath() {
+    let server = MockServer::start().await;
+    let base = format!("{}/cloud", server.uri());
+    Mock::given(method("GET"))
+        .and(path("/cloud/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": base,
+            "token_endpoint": format!("{}/idp/token", server.uri()),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/idp/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_json("acc", None, LONG_LIVED)))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let client = AuthClient::new(&base).expect("valid server");
+    client.refresh("r1").await.expect("first refresh");
+    // Discovery ran once and is cached for later requests.
+    client.refresh("r1").await.expect("second refresh");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn simultaneous_401s_refresh_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/konnect/v1/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_json(
+            "new",
+            Some("r2"),
+            LONG_LIVED,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = AuthClient::new(&server.uri()).expect("valid server");
+    let manager = TokenManager::new(client, InMemoryTokenStore::default(), "konto-1");
+    manager
+        .apply_login(&tokens("old", LONG_LIVED, Some("r1")))
+        .await
+        .expect("apply login");
+    // Two requests were rejected with the same old token.
+    assert_eq!(manager.refresh_rejected("old").await.expect("first"), "new");
+    assert_eq!(
+        manager.refresh_rejected("old").await.expect("second"),
+        "new"
+    );
+    server.verify().await;
+}

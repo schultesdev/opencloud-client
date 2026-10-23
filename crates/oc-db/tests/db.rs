@@ -15,7 +15,7 @@ fn unix(seconds: i64) -> i64 {
 }
 
 #[test]
-fn fresh_file_database_migrates_from_v0_to_v1() {
+fn fresh_file_database_migrates_to_the_latest_version() {
     let dir = tempfile::tempdir().unwrap();
     let db = StatusDb::open(dir.path().join("job-1.sqlite")).unwrap();
 
@@ -37,7 +37,7 @@ fn reopening_an_existing_database_is_idempotent() {
     let db = StatusDb::open(&path).unwrap();
     assert_eq!(
         db.meta("schema_version").unwrap().as_deref(),
-        Some("1".to_string().as_str())
+        Some(SCHEMA_VERSION.to_string().as_str())
     );
 }
 
@@ -349,4 +349,61 @@ fn db_path_lays_files_under_the_db_directory() {
         db_path(dir.path(), "../escape").unwrap_err(),
         DbError::InvalidJobId { .. }
     ));
+}
+
+#[test]
+fn a_path_has_at_most_one_pending_conflict() {
+    let db = StatusDb::open_in_memory().unwrap();
+    let conflict = |size| NewConflict {
+        path: "a.txt".into(),
+        detected_at: unix(1),
+        local_mtime: None,
+        local_size: Some(size),
+        remote_etag: None,
+        remote_size: None,
+        remote_mtime: None,
+    };
+    let first = db.record_conflict(&conflict(1)).unwrap();
+    let second = db.record_conflict(&conflict(2)).unwrap();
+    assert_eq!(first, second);
+    let pending = db.pending_conflicts().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].local_size, Some(2));
+    // Once resolved, a new conflict on the path gets a new row.
+    db.resolve_conflict(first, ConflictResolution::Local, unix(2))
+        .unwrap();
+    assert_ne!(db.record_conflict(&conflict(3)).unwrap(), first);
+}
+
+#[test]
+fn server_names_are_replaced_and_follow_deletions() {
+    let db = StatusDb::open_in_memory().unwrap();
+    let names = std::collections::HashMap::from([
+        ("Caf\u{e9}".to_owned(), "Cafe\u{301}".to_owned()),
+        ("Caf\u{e9}/x.txt".to_owned(), "Cafe\u{301}/x.txt".to_owned()),
+    ]);
+    db.replace_server_names(&names).unwrap();
+    assert_eq!(db.server_names().unwrap(), names);
+    db.delete_subtree("Caf\u{e9}").unwrap();
+    assert!(db.server_names().unwrap().is_empty());
+}
+
+#[test]
+fn concurrent_opens_migrate_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("job.sqlite");
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let path = path.clone();
+            std::thread::spawn(move || StatusDb::open(&path).map(|_| ()))
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+    let db = StatusDb::open(&path).unwrap();
+    assert_eq!(
+        db.meta("schema_version").unwrap().as_deref(),
+        Some(SCHEMA_VERSION.to_string().as_str())
+    );
 }

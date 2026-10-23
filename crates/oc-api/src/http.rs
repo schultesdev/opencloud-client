@@ -16,6 +16,27 @@ use crate::token::TokenProvider;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default timeout for transfers (GET/PUT request bodies).
 pub const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
+/// Longest `Retry-After` hint the clients wait for inside one call; a
+/// server asking for more gets the error back, and the engine's next
+/// pass (or offline backoff) retries later instead of blocking a task.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// Whether a request may be sent again after a failure that leaves open
+/// whether the server already applied it (5xx, timeout, broken
+/// connection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Replay {
+    /// Reads and writes whose repetition is harmless (GET, PROPFIND,
+    /// DELETE, MKCOL, unconditional PUT): every retryable failure is
+    /// retried.
+    Safe,
+    /// Conditional writes and MOVE/COPY: if the first attempt was applied,
+    /// a repetition fails its precondition (412/404) and would look like
+    /// a conflict. Only failures that prove the request was not processed
+    /// are retried — no connection, 429, 503, or a token failure before
+    /// sending.
+    OnlyUnprocessed,
+}
 
 /// HTTP core shared by [`crate::GraphClient`] and [`crate::WebDavClient`].
 pub(crate) struct AuthedHttp<P> {
@@ -77,37 +98,64 @@ impl<P: TokenProvider> AuthedHttp<P> {
     ///
     /// On 401 the token is force-refreshed and the request repeated once
     /// within the same attempt. Retryable failures (network, 5xx, 429,
-    /// 408) are retried with backoff until the policy is exhausted; a 429
-    /// `Retry-After` hint takes precedence over the computed backoff.
+    /// 408) are retried with backoff until the policy is exhausted, as far
+    /// as `replay` allows. A `Retry-After` hint (429/503) takes precedence
+    /// over the computed backoff; hints above [`MAX_RETRY_AFTER`] end the
+    /// call with the error.
     pub async fn send(
         &self,
         timeout: Duration,
+        replay: Replay,
         build: impl Fn(&str) -> RequestBuilder,
     ) -> Result<Response, ApiError> {
         let max_attempts = self.retry.max_attempts.max(1);
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let token = self.token.access_token().await?;
-            let response = build(&token).timeout(timeout).send().await?;
-            let response = if response.status() == StatusCode::UNAUTHORIZED {
-                let refreshed = self.token.refresh().await?;
-                build(&refreshed).timeout(timeout).send().await?
-            } else {
-                response
+            let (error, hint) = match self.attempt(timeout, &build).await {
+                Ok(response) if response.status().is_success() => return Ok(response),
+                Ok(response) => {
+                    let status = response.status();
+                    let hint = match status {
+                        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
+                            crate::error::retry_after_hint(response.headers())
+                        }
+                        _ => None,
+                    };
+                    (ApiError::from_status(response.headers(), status), hint)
+                }
+                Err(error) => (error, None),
             };
-            if response.status().is_success() {
-                return Ok(response);
-            }
-            let error = ApiError::from_status(response.headers(), response.status());
-            if attempt >= max_attempts || !error.is_retryable() {
+            let may_retry = match replay {
+                Replay::Safe => error.is_retryable(),
+                Replay::OnlyUnprocessed => error.is_unprocessed(),
+            };
+            if attempt >= max_attempts || !may_retry {
                 return Err(error);
             }
-            let delay = error
-                .retry_after()
-                .unwrap_or_else(|| self.retry.backoff(attempt));
+            let delay = match hint {
+                Some(hint) if hint > MAX_RETRY_AFTER => return Err(error),
+                Some(hint) => hint,
+                None => self.retry.backoff(attempt),
+            };
             tokio::time::sleep(delay).await;
         }
+    }
+
+    /// One attempt: send with the current token; on 401 refresh the token
+    /// and send once more.
+    async fn attempt(
+        &self,
+        timeout: Duration,
+        build: &impl Fn(&str) -> RequestBuilder,
+    ) -> Result<Response, ApiError> {
+        let token = self.token.access_token().await?;
+        let response = build(&token).timeout(timeout).send().await?;
+        if response.status() != StatusCode::UNAUTHORIZED {
+            return Ok(response);
+        }
+        let refreshed = self.token.refresh(&token).await?;
+        Ok(build(&refreshed).timeout(timeout).send().await?)
     }
 }
 

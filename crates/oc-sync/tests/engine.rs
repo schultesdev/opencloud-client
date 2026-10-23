@@ -1934,3 +1934,57 @@ async fn failed_download_disables_the_root_etag_shortcut() {
     assert!(!summary.remote_scan_skipped);
     engine.stop().await;
 }
+
+#[tokio::test]
+async fn nfd_named_server_folders_are_addressed_by_their_server_spelling() {
+    let f = fixture(&[], &[]).await;
+
+    // "Café" stored decomposed (e + U+0301), as macOS clients upload it.
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    mount_propfind(
+        &f.server,
+        "",
+        "1",
+        &[
+            ("", true, Some("\"root-1\""), None),
+            ("Cafe\u{301}", true, Some("\"d\""), None),
+        ],
+    )
+    .await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/dav/spaces/sid/Cafe%CC%81"))
+        .and(header("Depth", "1"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(multistatus(&[
+            ("Cafe\u{301}", true, Some("\"d\""), None),
+            ("Cafe\u{301}/menu.txt", false, Some("\"m1\""), Some(4)),
+        ])))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/Cafe%CC%81/menu.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("soup"))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+
+    let mut engine = f.engine(test_options());
+    let (summary, events) = next_run(&mut engine).await;
+    assert_eq!(summary.errors, 0, "events: {events:?}");
+    assert_eq!(summary.downloads, 1);
+    // Locally the name is NFC.
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("Caf\u{e9}/menu.txt")).expect("downloaded"),
+        "soup"
+    );
+    let db = open_db(&f.db_path);
+    assert_eq!(
+        db.server_names()
+            .expect("names")
+            .get("Caf\u{e9}")
+            .map(String::as_str),
+        Some("Cafe\u{301}")
+    );
+    f.server.verify().await;
+    engine.stop().await;
+}

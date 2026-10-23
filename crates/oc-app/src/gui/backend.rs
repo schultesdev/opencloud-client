@@ -72,7 +72,8 @@ pub enum UiCommand {
         account_id: String,
         /// The space to traverse.
         space_id: String,
-        /// The folder path inside the space (`""` = root).
+        /// The folder's server path inside the space (`""` = root), as
+        /// reported by `DavResource::server_path`.
         path: String,
         /// Correlation token; the answer arrives as
         /// [`BackendEvent::Children`] with the same token.
@@ -463,7 +464,7 @@ async fn run_fetch_children(
         .map_err(|error| error.to_string())?;
     let mut folders: Vec<DavResource> = listing
         .into_iter()
-        .filter(|resource| resource.is_dir && resource.path != path)
+        .filter(|resource| resource.is_dir && resource.server_path != path)
         .collect();
     folders.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(folders)

@@ -508,7 +508,8 @@ async fn unauthorized_triggers_forced_refresh_and_retry() {
         async fn access_token(&self) -> Result<String, ApiError> {
             Ok("stale".into())
         }
-        async fn refresh(&self) -> Result<String, ApiError> {
+        async fn refresh(&self, rejected: &str) -> Result<String, ApiError> {
+            assert_eq!(rejected, "stale");
             self.refreshes.fetch_add(1, Ordering::SeqCst);
             Ok("fresh".into())
         }
@@ -626,7 +627,10 @@ async fn get_range_sends_bytes_header_and_accepts_partial_response() {
         .await;
 
     let client = dav_client(&server.uri());
-    let response = client.get_range("big.bin", 0, 3).await.expect("range");
+    let response = client
+        .get_range("big.bin", 0, 3, None)
+        .await
+        .expect("range");
     assert_eq!(response.status().as_u16(), 206);
     assert_eq!(response.bytes().await.expect("body"), "abcd");
     server.verify().await;
@@ -642,7 +646,112 @@ async fn get_range_tolerates_servers_that_ignore_the_header() {
         .await;
 
     let client = dav_client(&server.uri());
-    let response = client.get_range("big.bin", 4, 7).await.expect("range");
+    let response = client
+        .get_range("big.bin", 4, 7, None)
+        .await
+        .expect("range");
     assert_eq!(response.status().as_u16(), 200);
     assert_eq!(response.bytes().await.expect("body"), "whole file");
+}
+
+// --- Retry semantics -------------------------------------------------------
+
+/// A raw HTTP server: the first connection is dropped without an answer
+/// (a broken transport), the second gets `200 ok`.
+async fn flaky_server() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (first, _) = listener.accept().await.expect("accept");
+        drop(first);
+        let (mut second, _) = listener.accept().await.expect("accept");
+        let mut buffer = [0u8; 4096];
+        let _ = second.read(&mut buffer).await;
+        let _ = second
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await;
+    });
+    format!("http://{address}")
+}
+
+#[tokio::test]
+async fn network_errors_are_retried() {
+    let server = flaky_server().await;
+    let client = WebDavClient::new(&server, "sid", StaticToken::new("tok"))
+        .expect("client")
+        .with_retry(oc_api::RetryConfig::immediate());
+    let response = client
+        .get("a.txt")
+        .await
+        .expect("retried after a broken connection");
+    assert_eq!(response.text().await.expect("body"), "ok");
+}
+
+#[tokio::test]
+async fn conditional_put_is_not_repeated_after_an_ambiguous_failure() {
+    let server = MockServer::start().await;
+    // 502: the proxy may have forwarded the first attempt already; a
+    // repetition would fail `If-None-Match` and look like a conflict.
+    Mock::given(method("PUT"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .respond_with(ResponseTemplate::new(502))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = WebDavClient::new(&server.uri(), "sid", StaticToken::new("tok"))
+        .expect("client")
+        .with_retry(oc_api::RetryConfig::immediate());
+    let error = client
+        .put_with("a.txt", b"x", Some(oc_api::WriteCondition::CreateNew))
+        .await
+        .expect_err("must fail");
+    assert!(matches!(error, ApiError::Server { code: 502 }));
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn conditional_put_is_repeated_after_503() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .respond_with(ResponseTemplate::new(503).append_header("Retry-After", "0"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .respond_with(ResponseTemplate::new(201).append_header("ETag", "\"a1\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = WebDavClient::new(&server.uri(), "sid", StaticToken::new("tok"))
+        .expect("client")
+        .with_retry(oc_api::RetryConfig::immediate());
+    let etag = client
+        .put_with("a.txt", b"x", Some(oc_api::WriteCondition::CreateNew))
+        .await
+        .expect("retried");
+    assert_eq!(etag.as_deref(), Some("\"a1\""));
+}
+
+#[tokio::test]
+async fn excessive_retry_after_is_not_waited_for() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/graph/v1.0/me/drives"))
+        .respond_with(ResponseTemplate::new(429).append_header("Retry-After", "86400"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = GraphClient::new(&server.uri(), StaticToken::new("tok"))
+        .expect("client")
+        .with_retry(oc_api::RetryConfig::immediate());
+    let started = std::time::Instant::now();
+    let error = client.list_spaces().await.expect_err("must fail");
+    assert!(matches!(error, ApiError::RateLimited { .. }));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    server.verify().await;
 }

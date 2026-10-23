@@ -111,14 +111,9 @@ impl ApiError {
             StatusCode::NOT_FOUND => Self::NotFound,
             StatusCode::PRECONDITION_FAILED => Self::PreconditionFailed,
             StatusCode::LOCKED => Self::Locked,
-            StatusCode::TOO_MANY_REQUESTS => {
-                let retry_after = headers
-                    .get(RETRY_AFTER)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.trim().parse::<u64>().ok())
-                    .map(Duration::from_secs);
-                Self::RateLimited { retry_after }
-            }
+            StatusCode::TOO_MANY_REQUESTS => Self::RateLimited {
+                retry_after: retry_after_hint(headers),
+            },
             code if code.is_server_error() => Self::Server {
                 code: code.as_u16(),
             },
@@ -135,6 +130,22 @@ impl ApiError {
         match self {
             Self::Network(_) | Self::Server { .. } | Self::RateLimited { .. } => true,
             Self::Status { code } => *code == 408,
+            // The token endpoint could not be reached; nothing was sent.
+            Self::Auth(AuthError::Http(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether the failure proves the request was never processed by the
+    /// server: no connection, rate limited (429), unavailable (503), or a
+    /// token failure before sending. Such requests can be repeated even
+    /// when a repetition of an applied request would fail its
+    /// precondition (conditional PUT, MOVE, COPY).
+    pub fn is_unprocessed(&self) -> bool {
+        match self {
+            Self::Network(source) => source.is_connect(),
+            Self::RateLimited { .. } | Self::Server { code: 503 } => true,
+            Self::Auth(AuthError::Http(_)) => true,
             _ => false,
         }
     }
@@ -146,6 +157,8 @@ impl ApiError {
     pub fn is_connectivity(&self) -> bool {
         match self {
             Self::Network(source) => source.is_connect(),
+            // Offline, the first thing to fail is often the token refresh.
+            Self::Auth(AuthError::Http(source)) => source.is_connect(),
             _ => false,
         }
     }
@@ -157,6 +170,16 @@ impl ApiError {
             _ => None,
         }
     }
+}
+
+/// The `Retry-After` hint of a response in seconds (429/503), if any.
+/// HTTP-date values are not interpreted.
+pub(crate) fn retry_after_hint(headers: &HeaderMap) -> Option<Duration> {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 #[cfg(test)]

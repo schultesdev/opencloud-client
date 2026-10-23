@@ -70,7 +70,16 @@ pub(crate) fn build_url(base: &Url, path: &str) -> Result<Url, ApiError> {
 /// Decodes a server `href` (absolute URL or absolute path, percent-encoded)
 /// into a path relative to the space root. Returns `""` for the root,
 /// otherwise NFC-normalized without trailing slash.
+#[cfg(test)]
 pub(crate) fn href_to_path(base: &Url, href: &str) -> Result<String, ApiError> {
+    href_to_server_path(base, href).map(|path| normalize_nfc(&path))
+}
+
+/// Like [`href_to_path`], but keeps the server's spelling (no Unicode
+/// normalization) — the form that addresses the resource in requests.
+/// The href must lie below the space root on a segment boundary
+/// (`/dav/spaces/sid2/...` is not below `/dav/spaces/sid`).
+pub(crate) fn href_to_server_path(base: &Url, href: &str) -> Result<String, ApiError> {
     let url = if href.contains("://") {
         Url::parse(href).map_err(|err| ApiError::invalid_url(href, err.to_string()))?
     } else {
@@ -84,11 +93,17 @@ pub(crate) fn href_to_path(base: &Url, href: &str) -> Result<String, ApiError> {
             base.as_str()
         ))
     })?;
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return Err(ApiError::protocol(format!(
+            "href '{href}' does not lie below '{}'",
+            base.as_str()
+        )));
+    }
     let rest = rest.trim_matches('/');
     let decoded = percent_encoding::percent_decode_str(rest)
         .decode_utf8()
         .map_err(|_| ApiError::protocol(format!("href '{href}' is not valid UTF-8")))?;
-    Ok(normalize_nfc(&decoded))
+    Ok(decoded.into_owned())
 }
 
 #[cfg(test)]
@@ -158,6 +173,17 @@ mod tests {
     fn href_outside_the_space_is_rejected() {
         let err = href_to_path(&base(), "/dav/spaces/other/file.txt").unwrap_err();
         assert!(matches!(err, ApiError::Protocol(_)));
+        // A sibling space sharing the id as prefix is outside as well.
+        let err = href_to_path(&base(), "/dav/spaces/sid2/file.txt").unwrap_err();
+        assert!(matches!(err, ApiError::Protocol(_)));
+    }
+
+    #[test]
+    fn server_path_keeps_the_servers_spelling() {
+        assert_eq!(
+            href_to_server_path(&base(), "/dav/spaces/sid/Cafe%CC%81/a.txt").expect("nfd"),
+            "Cafe\u{301}/a.txt"
+        );
     }
 
     #[test]

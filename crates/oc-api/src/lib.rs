@@ -33,7 +33,7 @@ mod token;
 pub use dav::{DavResource, Depth, WebDavClient, WriteCondition};
 pub use error::ApiError;
 pub use graph::{GRAPH_API_PREFIX, GraphClient, Quota, Space, SpaceRoot};
-pub use http::{DEFAULT_TIMEOUT, DEFAULT_TRANSFER_TIMEOUT};
+pub use http::{DEFAULT_TIMEOUT, DEFAULT_TRANSFER_TIMEOUT, MAX_RETRY_AFTER};
 pub use path::normalize_nfc;
 pub use retry::{RetryConfig, with_retry};
 pub use token::{StaticToken, TokenProvider};

@@ -130,10 +130,23 @@ impl<S: TokenStore> TokenManager<S> {
         self.refresh_locked(&mut guard).await
     }
 
-    /// Forces a refresh, even if the current access token looks valid —
-    /// e.g. after an API call answered 401.
+    /// Forces a refresh, even if the current access token looks valid.
     pub async fn force_refresh(&self) -> Result<String, AuthError> {
         let mut guard = self.state.lock().await;
+        self.refresh_locked(&mut guard).await
+    }
+
+    /// Replaces an access token the server rejected (401). When several
+    /// requests are rejected at once, only the first refreshes; the
+    /// others find a newer token already in place and use it, instead of
+    /// each rotating the refresh token again.
+    pub async fn refresh_rejected(&self, rejected: &str) -> Result<String, AuthError> {
+        let mut guard = self.state.lock().await;
+        if let Some(active) = guard.as_ref() {
+            if active.access_token != rejected && !active.is_expired(self.refresh_skew) {
+                return Ok(active.access_token.clone());
+            }
+        }
         self.refresh_locked(&mut guard).await
     }
 

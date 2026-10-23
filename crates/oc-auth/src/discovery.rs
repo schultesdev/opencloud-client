@@ -32,8 +32,8 @@ impl ProviderEndpoints {
     pub fn fallback(server: &Url) -> Self {
         Self {
             issuer: None,
-            authorization_endpoint: Some(format!("{server}signin/v1/identifier/_/authorize")),
-            token_endpoint: Some(format!("{server}konnect/v1/token")),
+            authorization_endpoint: Some(below(server, "signin/v1/identifier/_/authorize")),
+            token_endpoint: Some(below(server, "konnect/v1/token")),
             revocation_endpoint: None,
         }
     }
@@ -99,7 +99,7 @@ pub async fn discover(
     http: &reqwest::Client,
     server: &Url,
 ) -> Result<ProviderEndpoints, AuthError> {
-    let url = format!("{server}.well-known/openid-configuration");
+    let url = below(server, ".well-known/openid-configuration");
     let response = http
         .get(&url)
         .send()
@@ -120,6 +120,20 @@ pub async fn discover(
             message: format!("invalid document: {err}"),
         })?;
     Ok(document.endpoints())
+}
+
+/// `relative` below the server base URL. A base path without trailing
+/// slash (`https://host/cloud`) counts as a folder, so the result is
+/// `https://host/cloud/<relative>` and not `https://host/<relative>`.
+fn below(server: &Url, relative: &str) -> String {
+    let mut base = server.clone();
+    if !base.path().ends_with('/') {
+        let path = format!("{}/", base.path());
+        base.set_path(&path);
+    }
+    base.join(relative)
+        .map(String::from)
+        .unwrap_or_else(|_| format!("{base}{relative}"))
 }
 
 #[cfg(test)]

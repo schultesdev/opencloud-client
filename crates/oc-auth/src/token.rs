@@ -13,7 +13,9 @@ pub struct TokenSet {
     /// Token type, usually `Bearer`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_type: Option<String>,
-    /// Lifetime of the access token in seconds.
+    /// Lifetime of the access token in seconds. RFC 6749 only recommends
+    /// the field; without it a conservative default is assumed.
+    #[serde(default = "default_expires_in")]
     pub expires_in: u64,
     /// Refresh token (present with the `offline_access` scope).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -24,6 +26,11 @@ pub struct TokenSet {
     /// OpenID Connect ID token, if issued.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token: Option<String>,
+}
+
+/// Assumed access-token lifetime when the server omits `expires_in`.
+fn default_expires_in() -> u64 {
+    300
 }
 
 #[cfg(test)]

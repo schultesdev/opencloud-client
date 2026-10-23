@@ -6,7 +6,7 @@ use std::time::Duration;
 use url::Url;
 
 use crate::error::ApiError;
-use crate::http::{AuthedHttp, parse_server_url};
+use crate::http::{AuthedHttp, Replay, parse_server_url};
 use crate::retry::RetryConfig;
 use crate::token::TokenProvider;
 
@@ -57,7 +57,7 @@ impl<P: TokenProvider> GraphClient<P> {
             .map_err(|err| ApiError::invalid_url(self.base.as_str(), err.to_string()))?;
         let response = self
             .http
-            .send(self.http.request_timeout(), |token| {
+            .send(self.http.request_timeout(), Replay::Safe, |token| {
                 self.http.http().get(url.clone()).bearer_auth(token)
             })
             .await?;

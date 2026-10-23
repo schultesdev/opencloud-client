@@ -5,7 +5,7 @@ use rusqlite::OptionalExtension;
 use rusqlite::TransactionBehavior;
 
 /// Highest schema version this build understands.
-pub const SCHEMA_VERSION: u64 = 2;
+pub const SCHEMA_VERSION: u64 = 3;
 
 /// All known migrations, ordered by target version. Each entry upgrades a
 /// database from `version - 1` to `version`.
@@ -66,6 +66,18 @@ const MIGRATIONS: &[(u64, &str)] = &[
           path TEXT PRIMARY KEY,
           server_path TEXT NOT NULL
         );
+        "#,
+    ),
+    (
+        3,
+        r#"
+        -- Local modification times are stored in milliseconds from now
+        -- on (they were whole seconds); the diff treats a whole-second
+        -- value as "recorded at second precision".
+        UPDATE entries SET local_mtime = local_mtime * 1000
+          WHERE local_mtime IS NOT NULL;
+        UPDATE conflicts SET local_mtime = local_mtime * 1000
+          WHERE local_mtime IS NOT NULL;
         "#,
     ),
 ];

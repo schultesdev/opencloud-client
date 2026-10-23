@@ -22,7 +22,7 @@ pub const PART_SUFFIX: &str = ".part";
 pub struct LocalNode {
     /// Whether this is a folder.
     pub is_dir: bool,
-    /// Modification time (unix seconds), if determinable.
+    /// Modification time (unix milliseconds), if determinable.
     pub mtime: Option<i64>,
     /// Size in bytes (files only).
     pub size: Option<i64>,
@@ -296,13 +296,15 @@ fn add_remote_child(
     entries.insert(resource.path.clone(), node);
 }
 
-/// Modification time of a file as unix seconds.
+/// Modification time of a file as unix milliseconds. Second precision
+/// would miss two same-size edits within one second (e.g. an editor
+/// saving right after an upload recorded the first one).
 pub(crate) fn unix_mtime(metadata: &std::fs::Metadata) -> Option<i64> {
     metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64)
+        .map(|duration| duration.as_millis() as i64)
 }
 
 #[cfg(test)]

@@ -161,15 +161,53 @@ async fn whole_download<P: TokenProvider>(
 ) -> Result<Landed, SyncError> {
     let response = dav.get(path).await?;
     let etag = etag_of(&response).or_else(|| remote.etag.clone());
-    let bytes = response.bytes().await.map_err(ApiError::from)?;
-    if let Some(progress) = progress {
-        progress.report(bytes.len() as u64);
-    }
-    let target = target.to_path_buf();
-    let local = tokio::task::spawn_blocking(move || write_atomic(&target, &bytes, guard))
+    let part = part_file(target);
+    stream_to_part(response, &part, progress).await?;
+    let (part, final_target) = (part, target.to_path_buf());
+    let local = tokio::task::spawn_blocking(move || finish_atomic(&part, &final_target, guard))
         .await
         .map_err(|source| SyncError::io(root, join_error(source)))??;
     Ok(local.map(|local| (etag, local)))
+}
+
+/// Streams a response body into a fresh `.part` file (parent folders are
+/// created) without holding it in memory; reports the received bytes to
+/// `progress`. A failed transfer removes the incomplete part file.
+async fn stream_to_part(
+    mut response: reqwest::Response,
+    part: &Path,
+    progress: Option<&TransferHandle>,
+) -> Result<u64, SyncError> {
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = part.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|source| SyncError::io(parent, source))?;
+    }
+    let result = async {
+        let mut file = tokio::fs::File::create(part)
+            .await
+            .map_err(|source| SyncError::io(part, source))?;
+        let mut received = 0u64;
+        while let Some(chunk) = response.chunk().await.map_err(ApiError::from)? {
+            file.write_all(&chunk)
+                .await
+                .map_err(|source| SyncError::io(part, source))?;
+            received += chunk.len() as u64;
+            if let Some(progress) = progress {
+                progress.report(received);
+            }
+        }
+        file.flush()
+            .await
+            .map_err(|source| SyncError::io(part, source))?;
+        Ok(received)
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(part).await;
+    }
+    result
 }
 
 /// Chunked download: repeated `Range` GETs, each appended to the `.part`
@@ -210,20 +248,18 @@ async fn chunked_download<P: TokenProvider>(
             }
             _ => {}
         }
-        let status = response.status();
-        let bytes = response.bytes().await.map_err(ApiError::from)?;
-        if status == reqwest::StatusCode::OK {
-            // The server ignored the range and sent the whole body.
-            if let Some(progress) = progress {
-                progress.report(bytes.len() as u64);
-            }
-            let whole_target = target.to_path_buf();
+        if response.status() == reqwest::StatusCode::OK {
+            // The server ignored the range and sends the whole body:
+            // stream it into a fresh part file.
+            stream_to_part(response, &part, progress).await?;
+            let (part, whole_target) = (part.clone(), target.to_path_buf());
             let local =
-                tokio::task::spawn_blocking(move || write_atomic(&whole_target, &bytes, guard))
+                tokio::task::spawn_blocking(move || finish_atomic(&part, &whole_target, guard))
                     .await
                     .map_err(|source| SyncError::io(target, join_error(source)))??;
             return Ok(local.map(|local| (etag, local)));
         }
+        let bytes = response.bytes().await.map_err(ApiError::from)?;
         if bytes.is_empty() {
             return Err(SyncError::Api(ApiError::protocol(format!(
                 "empty range response for '{path}' at offset {offset}"
@@ -282,10 +318,11 @@ pub async fn upload<P: TokenProvider>(
         remote_path,
     } = paths;
     let source = abs_local_path(root, path)?;
-    let read = tokio::task::spawn_blocking(move || read_with_meta(&source))
-        .await
-        .map_err(|source| SyncError::io(root, join_error(source)))??;
-    let (content, local) = read;
+    // The state recorded for the upload is the one before sending. If the
+    // file changes while it streams, the next pass sees a local change
+    // against this record and uploads again (with the new ETag).
+    let local = file_node(&source)?;
+    let length = local.size.unwrap_or(0).max(0) as u64;
 
     let condition = if create {
         Some(WriteCondition::CreateNew)
@@ -294,7 +331,7 @@ pub async fn upload<P: TokenProvider>(
     };
     let reporting = progress.cloned();
     let response = dav
-        .put_with_progress(remote_path, content, condition, move |bytes| {
+        .put_file(remote_path, &source, length, condition, move |bytes| {
             if let Some(handle) = &reporting {
                 handle.report(bytes);
             }
@@ -325,6 +362,7 @@ pub async fn upload<P: TokenProvider>(
 
 /// Writes `bytes` to `<target>.part`, then renames it atomically onto
 /// `target` ([`finish_atomic`]).
+#[cfg(test)]
 fn write_atomic(
     target: &Path,
     bytes: &[u8],
@@ -368,23 +406,6 @@ fn append_chunk(part: &Path, bytes: &[u8]) -> Result<(), SyncError> {
         .map_err(|source| SyncError::io(part, source))?;
     file.write_all(bytes)
         .map_err(|source| SyncError::io(part, source))
-}
-
-/// Reads a file together with its metadata. The metadata is taken before
-/// and after reading; if they differ, the file was written to while being
-/// read and the content may not match the recorded state — the upload is
-/// refused (the next pass picks the file up again).
-fn read_with_meta(path: &Path) -> Result<(Vec<u8>, LocalNode), SyncError> {
-    let before = file_node(path)?;
-    let content = std::fs::read(path).map_err(|source| SyncError::io(path, source))?;
-    let after = file_node(path)?;
-    if before != after || after.size != Some(content.len() as i64) {
-        return Err(SyncError::io(
-            path,
-            std::io::Error::other("file changed while it was being read; retrying next pass"),
-        ));
-    }
-    Ok((content, after))
 }
 
 /// Local metadata of a file as [`LocalNode`].

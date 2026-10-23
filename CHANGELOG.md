@@ -325,3 +325,29 @@ versioning follows [Semantic Versioning](https://semver.org/).
   Job einmal und hebt die Pause nicht mehr auf.
 - `oc-sync`: Ein nicht installierbarer Dateiwächter verhindert den Start
   der Engine nicht mehr; der Job nutzt dann den periodischen Scan.
+
+### Changed (Review, Block 4 — Performance)
+
+- `oc-db`/`oc-sync`: `StatusDb::transaction`; reine DB-Schritte eines
+  Laufs (`RecordSynced`, `DropEntry`) und die Filter-Bereinigung laufen in
+  einer Transaktion statt einem Commit pro Pfad; Recovery
+  (`reset_transfer_states`) und Statuswechsel (`set_state`) sind je ein
+  Statement; die Einträge werden einmal pro Lauf gelesen. Konflikt und
+  eingefrorener Eintrag werden atomar geschrieben.
+- `oc-db`/`oc-sync`: Schema v3 speichert lokale Änderungszeiten in
+  Millisekunden; zwei gleich große Änderungen in derselben Sekunde gehen
+  nicht mehr verloren. Alte Sekundenwerte werden migriert und tolerant
+  verglichen.
+- `oc-api`/`oc-sync`: Uploads streamen aus der Datei
+  (`WebDavClient::put_file`), Downloads in die `.part`-Datei; keine Datei
+  liegt mehr komplett im Speicher. Transfers haben einen Leerlauf-Timeout
+  (120 s ohne Daten) statt 10 Minuten Gesamtzeit. Alle API-Clients teilen
+  einen Connection-Pool.
+- `oc-app`: Die GUI liest die Status-DBs nicht mehr im UI-Thread; das
+  Backend liefert Snapshots aus einem Blocking-Thread. Backend-Ereignisse
+  wecken die GUI sofort; im Leerlauf zeichnet sie einmal pro Sekunde.
+- `oc-db`: `stats()` ist eine einzige, konsistente Abfrage.
+- `oc-auth`: Schlüsselbund-Zugriffe beim Refresh laufen in einem
+  Blocking-Thread.
+- `oc-app`: Der Wizard-Ordnerbaum kopiert seine Einträge nicht mehr pro
+  Frame; `derive_include` ist linear in der Tiefe.

@@ -3165,6 +3165,7 @@ dependencies = [
 name = "oc-api"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures-util",
  "oc-auth",
  "percent-encoding",

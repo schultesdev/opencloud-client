@@ -2,6 +2,7 @@
 //! refreshes it (single-flight) when needed. Refresh tokens live in a
 //! [`TokenStore`] (OS keyring).
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
@@ -44,19 +45,19 @@ impl ActiveToken {
 /// token stays intact so a later call can retry.
 pub struct TokenManager<S: TokenStore> {
     client: AuthClient,
-    store: S,
+    store: Arc<S>,
     account_id: String,
     state: Mutex<Option<ActiveToken>>,
     /// Refresh this many seconds before the access token actually expires.
     refresh_skew: Duration,
 }
 
-impl<S: TokenStore> TokenManager<S> {
+impl<S: TokenStore + 'static> TokenManager<S> {
     /// Creates a manager for the given client, store, and account.
     pub fn new(client: AuthClient, store: S, account_id: &str) -> Self {
         Self {
             client,
-            store,
+            store: Arc::new(store),
             account_id: account_id.to_string(),
             state: Mutex::new(None),
             refresh_skew: Duration::from_secs(crate::DEFAULT_REFRESH_SKEW_SECS),
@@ -79,12 +80,27 @@ impl<S: TokenStore> TokenManager<S> {
         &self.store
     }
 
+    /// Runs a store operation on a blocking thread: keyring calls may
+    /// block (macOS unlock dialog, D-Bus round trips) and must not stall
+    /// a runtime worker — least of all while the refresh lock is held.
+    async fn with_store<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&S, &str) -> Result<T, AuthError> + Send + 'static,
+    ) -> Result<T, AuthError> {
+        let store = self.store.clone();
+        let account_id = self.account_id.clone();
+        tokio::task::spawn_blocking(move || operation(&store, &account_id))
+            .await
+            .map_err(|error| AuthError::Store(format!("token store task failed: {error}")))?
+    }
+
     /// The account id used as key in the store.
     pub fn account_id(&self) -> &str {
         &self.account_id
     }
 
     /// Whether a refresh token is stored (i.e. the account can refresh).
+    /// Blocks on the keyring; call it outside of hot async paths.
     pub fn has_stored_login(&self) -> bool {
         self.store
             .load_refresh_token(&self.account_id)
@@ -95,9 +111,11 @@ impl<S: TokenStore> TokenManager<S> {
     /// Applies the tokens of a completed login: persists the refresh token
     /// and keeps the access token (with expiry) in memory.
     pub async fn apply_login(&self, tokens: &TokenSet) -> Result<(), AuthError> {
-        if let Some(refresh_token) = tokens.refresh_token.as_deref() {
-            self.store
-                .save_refresh_token(&self.account_id, refresh_token)?;
+        if let Some(refresh_token) = tokens.refresh_token.clone() {
+            self.with_store(move |store, account| {
+                store.save_refresh_token(account, &refresh_token)
+            })
+            .await?;
         }
         *self.state.lock().await = Some(ActiveToken::new(tokens));
         Ok(())
@@ -112,7 +130,7 @@ impl<S: TokenStore> TokenManager<S> {
     ) -> Result<TokenSet, AuthError> {
         let tokens = self
             .client
-            .login(&self.store, &self.account_id, open_browser, timeout)
+            .login(self.store.as_ref(), &self.account_id, open_browser, timeout)
             .await?;
         *self.state.lock().await = Some(ActiveToken::new(&tokens));
         Ok(tokens)
@@ -159,22 +177,27 @@ impl<S: TokenStore> TokenManager<S> {
     /// is retried once with the current token instead of logging out.
     async fn refresh_locked(&self, guard: &mut Option<ActiveToken>) -> Result<String, AuthError> {
         let mut refresh_token = self
-            .store
-            .load_refresh_token(&self.account_id)?
+            .with_store(|store, account| store.load_refresh_token(account))
+            .await?
             .ok_or(AuthError::NoRefreshToken)?;
         let mut retried = false;
         loop {
             match self.client.refresh(&refresh_token).await {
                 Ok(tokens) => {
-                    if let Some(rotated) = tokens.refresh_token.as_deref() {
-                        self.store.save_refresh_token(&self.account_id, rotated)?;
+                    if let Some(rotated) = tokens.refresh_token.clone() {
+                        self.with_store(move |store, account| {
+                            store.save_refresh_token(account, &rotated)
+                        })
+                        .await?;
                     }
                     let access_token = tokens.access_token.clone();
                     *guard = Some(ActiveToken::new(&tokens));
                     return Ok(access_token);
                 }
                 Err(AuthError::RefreshTokenInvalid { reason }) => {
-                    let current = self.store.load_refresh_token(&self.account_id)?;
+                    let current = self
+                        .with_store(|store, account| store.load_refresh_token(account))
+                        .await?;
                     match current {
                         Some(current) if current != refresh_token && !retried => {
                             // Rotated concurrently: ours was stale.
@@ -191,7 +214,9 @@ impl<S: TokenStore> TokenManager<S> {
                             // good: drop the login; the user must
                             // authenticate again.
                             *guard = None;
-                            let _ = self.store.delete_refresh_token(&self.account_id);
+                            let _ = self
+                                .with_store(|store, account| store.delete_refresh_token(account))
+                                .await;
                             return Err(AuthError::RefreshTokenInvalid { reason });
                         }
                     }
@@ -207,12 +232,16 @@ impl<S: TokenStore> TokenManager<S> {
     pub async fn logout(&self) -> Result<(), AuthError> {
         let mut guard = self.state.lock().await;
         *guard = None;
-        if let Ok(Some(refresh_token)) = self.store.load_refresh_token(&self.account_id) {
+        let stored = self
+            .with_store(|store, account| store.load_refresh_token(account))
+            .await;
+        if let Ok(Some(refresh_token)) = stored {
             // Revocation is best effort (offline server, unknown endpoint):
             // the local state is cleared regardless.
             let _ = self.client.revoke(&refresh_token).await;
         }
-        self.store.delete_refresh_token(&self.account_id)
+        self.with_store(|store, account| store.delete_refresh_token(account))
+            .await
     }
 }
 

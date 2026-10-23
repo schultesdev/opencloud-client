@@ -14,8 +14,31 @@ use crate::token::TokenProvider;
 
 /// Default timeout for metadata requests (Graph, PROPFIND, MKCOL, MOVE, ...).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Default timeout for transfers (GET/PUT request bodies).
-pub const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
+/// Default idle timeout for transfers (GET/PUT bodies): a transfer fails
+/// when no data moves for this long. There is no limit on the total
+/// duration — a large file over a slow line may take hours.
+pub const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
+/// Timeout for establishing a connection.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Builds an HTTP client with the given transfer idle timeout.
+fn build_client(transfer_idle: Duration) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(transfer_idle)
+        .build()
+}
+
+/// The HTTP client shared by all API clients with default timeouts — one
+/// connection pool (and TLS session cache) for every job and request.
+fn shared_client() -> Result<reqwest::Client, ApiError> {
+    static SHARED: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = SHARED.get() {
+        return Ok(client.clone());
+    }
+    let client = build_client(DEFAULT_TRANSFER_TIMEOUT)?;
+    Ok(SHARED.get_or_init(|| client).clone())
+}
 /// Longest `Retry-After` hint the clients wait for inside one call; a
 /// server asking for more gets the error back, and the engine's next
 /// pass (or offline backoff) retries later instead of blocking a task.
@@ -51,11 +74,8 @@ pub(crate) struct AuthedHttp<P> {
 impl<P: TokenProvider> AuthedHttp<P> {
     /// Creates the core with the default timeouts and retry policy.
     pub fn new(token: P) -> Result<Self, ApiError> {
-        let http = reqwest::Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
-            .build()?;
         Ok(Self {
-            http,
+            http: shared_client()?,
             token,
             retry: RetryConfig::default(),
             request_timeout: DEFAULT_TIMEOUT,
@@ -69,11 +89,17 @@ impl<P: TokenProvider> AuthedHttp<P> {
         self
     }
 
-    /// Overrides the metadata-request and transfer timeouts (applied
-    /// per request).
+    /// Overrides the metadata-request timeout (total, per request) and
+    /// the transfer idle timeout. A custom idle timeout needs its own
+    /// HTTP client; if that cannot be built, the shared one is kept.
     pub fn with_timeouts(mut self, request: Duration, transfer: Duration) -> Self {
         self.request_timeout = request;
-        self.transfer_timeout = transfer;
+        if transfer != self.transfer_timeout {
+            if let Ok(http) = build_client(transfer) {
+                self.http = http;
+                self.transfer_timeout = transfer;
+            }
+        }
         self
     }
 
@@ -87,14 +113,10 @@ impl<P: TokenProvider> AuthedHttp<P> {
         self.request_timeout
     }
 
-    /// Timeout for transfers (GET/PUT bodies).
-    pub fn transfer_timeout(&self) -> Duration {
-        self.transfer_timeout
-    }
-
     /// Sends a request built by `build`, which receives the current bearer
-    /// token and is called once per attempt; `timeout` is applied to every
-    /// attempt.
+    /// token and is called once per attempt; `timeout` (a limit on the
+    /// whole request) is applied to every attempt — `None` for transfers,
+    /// which are bounded by the client's idle timeout instead.
     ///
     /// On 401 the token is force-refreshed and the request repeated once
     /// within the same attempt. Retryable failures (network, 5xx, 429,
@@ -104,7 +126,7 @@ impl<P: TokenProvider> AuthedHttp<P> {
     /// call with the error.
     pub async fn send(
         &self,
-        timeout: Duration,
+        timeout: Option<Duration>,
         replay: Replay,
         build: impl Fn(&str) -> RequestBuilder,
     ) -> Result<Response, ApiError> {
@@ -146,16 +168,20 @@ impl<P: TokenProvider> AuthedHttp<P> {
     /// and send once more.
     async fn attempt(
         &self,
-        timeout: Duration,
+        timeout: Option<Duration>,
         build: &impl Fn(&str) -> RequestBuilder,
     ) -> Result<Response, ApiError> {
+        let limited = |request: RequestBuilder| match timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        };
         let token = self.token.access_token().await?;
-        let response = build(&token).timeout(timeout).send().await?;
+        let response = limited(build(&token)).send().await?;
         if response.status() != StatusCode::UNAUTHORIZED {
             return Ok(response);
         }
         let refreshed = self.token.refresh(&token).await?;
-        Ok(build(&refreshed).timeout(timeout).send().await?)
+        Ok(limited(build(&refreshed)).send().await?)
     }
 }
 

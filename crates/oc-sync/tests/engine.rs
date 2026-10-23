@@ -367,10 +367,10 @@ async fn local_change_uploads_with_if_match() {
     let mtime = mtime
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as i64;
+        .as_millis() as i64;
     {
         let db = open_db(&f.db_path);
-        db.upsert_entry(&seeded_file_entry("a.txt", "\"e1\"", mtime - 100, 3))
+        db.upsert_entry(&seeded_file_entry("a.txt", "\"e1\"", mtime - 100_000, 3))
             .expect("seed");
     }
     std::fs::write(f.root.join("a.txt"), "changed").expect("write");
@@ -418,7 +418,7 @@ async fn remote_change_is_downloaded() {
     let mtime = mtime
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as i64;
+        .as_millis() as i64;
     {
         let db = open_db(&f.db_path);
         db.upsert_entry(&seeded_file_entry("a.txt", "\"e1\"", mtime, 5))
@@ -510,7 +510,7 @@ async fn remote_deletion_removes_the_local_file() {
     let mtime = mtime
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as i64;
+        .as_millis() as i64;
     {
         let db = open_db(&f.db_path);
         db.upsert_entry(&seeded_file_entry("a.txt", "\"e1\"", mtime, 5))
@@ -786,10 +786,10 @@ async fn both_sides_changed_records_a_conflict() {
     let mtime = mtime
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as i64;
+        .as_millis() as i64;
     {
         let db = open_db(&f.db_path);
-        db.upsert_entry(&seeded_file_entry("a.txt", "\"e1\"", mtime - 100, 3))
+        db.upsert_entry(&seeded_file_entry("a.txt", "\"e1\"", mtime - 100_000, 3))
             .expect("seed");
     }
 
@@ -842,10 +842,10 @@ async fn upload_precondition_failure_becomes_a_conflict() {
     let mtime = mtime
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as i64;
+        .as_millis() as i64;
     {
         let db = open_db(&f.db_path);
-        db.upsert_entry(&seeded_file_entry("a.txt", "\"e1\"", mtime - 100, 3))
+        db.upsert_entry(&seeded_file_entry("a.txt", "\"e1\"", mtime - 100_000, 3))
             .expect("seed");
     }
 
@@ -946,7 +946,7 @@ async fn interrupted_download_state_is_replanned() {
     let mtime = mtime
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as i64;
+        .as_millis() as i64;
     {
         let db = open_db(&f.db_path);
         let mut entry = seeded_file_entry("a.txt", "\"e1\"", mtime, 5);
@@ -1504,9 +1504,9 @@ fn seed_both_changed(f: &Setup) {
     let mtime = mtime
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as i64;
+        .as_millis() as i64;
     let db = open_db(&f.db_path);
-    db.upsert_entry(&seeded_file_entry("a.txt", "\"e1\"", mtime - 100, 3))
+    db.upsert_entry(&seeded_file_entry("a.txt", "\"e1\"", mtime - 100_000, 3))
         .unwrap();
 }
 

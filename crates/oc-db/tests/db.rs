@@ -407,3 +407,46 @@ fn concurrent_opens_migrate_once() {
         Some(SCHEMA_VERSION.to_string().as_str())
     );
 }
+
+#[test]
+fn transactions_commit_together_or_not_at_all() {
+    let db = StatusDb::open_in_memory().unwrap();
+    db.transaction(|db| {
+        db.upsert_entry(&NewEntry::new("a.txt", false, EntryState::Synced))?;
+        db.upsert_entry(&NewEntry::new("b.txt", false, EntryState::Synced))
+    })
+    .unwrap();
+    assert_eq!(db.all_entries().unwrap().len(), 2);
+
+    let failed: Result<(), DbError> = db.transaction(|db| {
+        db.upsert_entry(&NewEntry::new("c.txt", false, EntryState::Synced))?;
+        Err(DbError::InvalidValue {
+            column: "test",
+            value: "abort".into(),
+        })
+    });
+    assert!(failed.is_err());
+    assert!(db.get_entry("c.txt").unwrap().is_none());
+}
+
+#[test]
+fn transfer_states_reset_in_one_statement() {
+    let db = StatusDb::open_in_memory().unwrap();
+    db.upsert_entry(&NewEntry::new("up", false, EntryState::Uploading))
+        .unwrap();
+    db.upsert_entry(&NewEntry::new("down", false, EntryState::Downloading))
+        .unwrap();
+    db.upsert_entry(&NewEntry::new("err", false, EntryState::Error))
+        .unwrap();
+    assert_eq!(db.reset_transfer_states().unwrap(), 2);
+    assert_eq!(
+        db.get_entry("up").unwrap().unwrap().entry.state,
+        EntryState::Synced
+    );
+    assert_eq!(
+        db.get_entry("err").unwrap().unwrap().entry.state,
+        EntryState::Error
+    );
+    assert!(db.set_state("err", EntryState::Synced).unwrap());
+    assert!(!db.set_state("missing", EntryState::Synced).unwrap());
+}

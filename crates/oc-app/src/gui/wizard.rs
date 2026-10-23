@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use oc_api::{DavResource, Space};
 use oc_config::SyncJob;
@@ -41,8 +42,9 @@ pub struct SpacesState {
 /// The lazily loaded remote folder tree (wizard step 4).
 #[derive(Debug, Default)]
 pub struct FolderTree {
-    /// Loaded subfolders per path (`""` = space root).
-    pub children: HashMap<String, Vec<DavResource>>,
+    /// Loaded subfolders per path (`""` = space root); shared slices, so
+    /// rendering a node does not copy its children every frame.
+    pub children: HashMap<String, Rc<[DavResource]>>,
     /// Pending child requests: path -> correlation token.
     pub loading: HashMap<String, u32>,
     /// Failed child requests: path -> error. Not re-sent automatically;
@@ -101,7 +103,7 @@ impl FolderTree {
         match result {
             Ok(children) => {
                 self.failed.remove(&path);
-                self.children.insert(path.clone(), children);
+                self.children.insert(path.clone(), children.into());
                 self.expanded.insert(path);
                 true
             }
@@ -132,14 +134,20 @@ impl FolderTree {
 /// folder and one of its descendants are selected, the folder alone
 /// covers the descendant (the whitelist matches whole subtrees).
 pub fn derive_include(selected: &HashSet<String>) -> Vec<String> {
+    // A folder is dropped when one of its ancestors is selected too —
+    // the whitelist covers whole subtrees. Checking the ancestors (set
+    // lookups) is linear in the depth, not in the selection size.
     let mut include: Vec<String> = selected
         .iter()
         .filter(|path| {
-            // Drop a folder when one of its ancestors is selected too —
-            // the whitelist covers whole subtrees.
-            !selected
-                .iter()
-                .any(|other| other != *path && path.starts_with(&format!("{other}/")))
+            let mut current = path.as_str();
+            while let Some((parent, _)) = current.rsplit_once('/') {
+                if selected.contains(parent) {
+                    return false;
+                }
+                current = parent;
+            }
+            true
         })
         .cloned()
         .collect();
@@ -282,6 +290,9 @@ mod tests {
     fn derive_include_collapses_descendants() {
         let include = derive_include(&set(&["a", "a/b", "a/b/c", "d", "e/f"]));
         assert_eq!(include, ["a", "d", "e/f"]);
+        // A sibling sorting between a folder and its child stays.
+        let include = derive_include(&set(&["a", "a b", "a/b"]));
+        assert_eq!(include, ["a", "a b"]);
     }
 
     #[test]

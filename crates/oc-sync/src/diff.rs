@@ -232,8 +232,9 @@ fn file_action(
     remote: Option<&RemoteNode>,
     entry: &NewEntry,
 ) -> Option<SyncAction> {
-    let local_changed =
-        local.is_some_and(|node| node.mtime != entry.local_mtime || node.size != entry.local_size);
+    let local_changed = local.is_some_and(|node| {
+        !mtime_matches(node.mtime, entry.local_mtime) || node.size != entry.local_size
+    });
     let remote_changed = remote.is_some_and(|node| remote_changed(node, entry));
 
     match (local, remote) {
@@ -292,6 +293,19 @@ fn file_action(
         (None, None) => Some(SyncAction::DropEntry {
             path: path.to_owned(),
         }),
+    }
+}
+
+/// Whether a scanned mtime (unix milliseconds) matches the recorded one.
+/// Entries recorded before schema v3 stored whole seconds (migrated to
+/// `seconds * 1000`): such a value matches any scan within that second,
+/// so an upgrade does not make every file look changed.
+fn mtime_matches(scanned: Option<i64>, recorded: Option<i64>) -> bool {
+    match (scanned, recorded) {
+        (Some(scanned), Some(recorded)) if scanned != recorded => {
+            recorded % 1000 == 0 && scanned.div_euclid(1000) == recorded.div_euclid(1000)
+        }
+        (scanned, recorded) => scanned == recorded,
     }
 }
 
@@ -765,6 +779,26 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn whole_second_mtimes_from_old_databases_still_match() {
+        // Recorded at second precision (migrated: 1_700_000_000 s → ms).
+        assert!(mtime_matches(
+            Some(1_700_000_000_123),
+            Some(1_700_000_000_000)
+        ));
+        assert!(!mtime_matches(
+            Some(1_700_000_001_123),
+            Some(1_700_000_000_000)
+        ));
+        // Millisecond values compare exactly.
+        assert!(!mtime_matches(
+            Some(1_700_000_000_124),
+            Some(1_700_000_000_123)
+        ));
+        assert!(mtime_matches(None, None));
+        assert!(!mtime_matches(Some(1), None));
     }
 
     #[test]

@@ -57,7 +57,7 @@ impl<P: TokenProvider> TokenProvider for std::sync::Arc<P> {
     }
 }
 
-impl<S: TokenStore> TokenProvider for TokenManager<S> {
+impl<S: TokenStore + 'static> TokenProvider for TokenManager<S> {
     async fn access_token(&self) -> Result<String, ApiError> {
         TokenManager::access_token(self)
             .await

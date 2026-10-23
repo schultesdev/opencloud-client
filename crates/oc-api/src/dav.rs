@@ -149,7 +149,7 @@ impl<P: TokenProvider> WebDavClient<P> {
         let propfind = self.propfind_method()?;
         let response = self
             .http
-            .send(self.http.request_timeout(), Replay::Safe, |token| {
+            .send(Some(self.http.request_timeout()), Replay::Safe, |token| {
                 self.http
                     .http()
                     .request(propfind.clone(), url.clone())
@@ -170,9 +170,8 @@ impl<P: TokenProvider> WebDavClient<P> {
     /// ETag is available in its `ETag` header.
     pub async fn get(&self, path: &str) -> Result<Response, ApiError> {
         let url = build_url(&self.base, path)?;
-        let timeout = self.http.transfer_timeout();
         self.http
-            .send(timeout, Replay::Safe, |token| {
+            .send(None, Replay::Safe, |token| {
                 self.http.http().get(url.clone()).bearer_auth(token)
             })
             .await
@@ -196,9 +195,8 @@ impl<P: TokenProvider> WebDavClient<P> {
         if_match: Option<&str>,
     ) -> Result<Response, ApiError> {
         let url = build_url(&self.base, path)?;
-        let timeout = self.http.transfer_timeout();
         self.http
-            .send(timeout, Replay::Safe, |token| {
+            .send(None, Replay::Safe, |token| {
                 let request = self
                     .http
                     .http()
@@ -251,30 +249,53 @@ impl<P: TokenProvider> WebDavClient<P> {
         progress: impl Fn(u64) + Send + Sync + 'static,
     ) -> Result<Option<String>, ApiError> {
         let url = build_url(&self.base, path)?;
-        let timeout = self.http.transfer_timeout();
-        let content = content.as_ref().to_vec();
-        let progress = Arc::new(progress);
-        // A repeated conditional PUT that the server already applied
-        // would fail its own precondition and look like a conflict.
-        let replay = if condition.is_some() {
-            Replay::OnlyUnprocessed
-        } else {
-            Replay::Safe
-        };
+        // One copy into a shared buffer; attempts and chunks slice it.
+        let content = bytes::Bytes::copy_from_slice(content.as_ref());
+        let progress: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(progress);
         let response = self
             .http
-            .send(timeout, replay, move |token| {
-                let mut request = self.http.http().put(url.clone()).bearer_auth(token);
-                request = apply_condition(request, &condition);
-                let body = progress_body(content.clone(), progress.clone());
-                request.body(body)
+            .send(None, put_replay(&condition), move |token| {
+                let request = self.http.http().put(url.clone()).bearer_auth(token);
+                apply_condition(request, &condition)
+                    .body(progress_body(content.clone(), progress.clone()))
             })
             .await?;
-        Ok(response
-            .headers()
-            .get(ETAG)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string))
+        Ok(etag_header(&response))
+    }
+
+    /// Uploads the local file `source` (exactly `length` bytes) to `path`,
+    /// streaming it from disk in chunks — the file is never held in
+    /// memory as a whole. Each attempt reopens the file; `progress`
+    /// receives the cumulative byte count of the current attempt. A file
+    /// that shrinks below `length` while being sent fails the attempt.
+    /// Returns the new remote ETag, if the server reports one.
+    pub async fn put_file(
+        &self,
+        path: &str,
+        source: &std::path::Path,
+        length: u64,
+        condition: Option<WriteCondition>,
+        progress: impl Fn(u64) + Send + Sync + 'static,
+    ) -> Result<Option<String>, ApiError> {
+        let url = build_url(&self.base, path)?;
+        let progress: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(progress);
+        let response = self
+            .http
+            .send(None, put_replay(&condition), move |token| {
+                let request = self
+                    .http
+                    .http()
+                    .put(url.clone())
+                    .bearer_auth(token)
+                    .header(reqwest::header::CONTENT_LENGTH, length);
+                apply_condition(request, &condition).body(file_body(
+                    source,
+                    length,
+                    progress.clone(),
+                ))
+            })
+            .await?;
+        Ok(etag_header(&response))
     }
 
     /// Creates a collection (directory); parent collections must exist.
@@ -282,7 +303,7 @@ impl<P: TokenProvider> WebDavClient<P> {
         let url = build_url(&self.base, path)?;
         let mkcol = webdav_method(b"MKCOL")?;
         self.http
-            .send(self.http.request_timeout(), Replay::Safe, |token| {
+            .send(Some(self.http.request_timeout()), Replay::Safe, |token| {
                 self.http
                     .http()
                     .request(mkcol.clone(), url.clone())
@@ -296,7 +317,7 @@ impl<P: TokenProvider> WebDavClient<P> {
     pub async fn delete(&self, path: &str) -> Result<(), ApiError> {
         let url = build_url(&self.base, path)?;
         self.http
-            .send(self.http.request_timeout(), Replay::Safe, |token| {
+            .send(Some(self.http.request_timeout()), Replay::Safe, |token| {
                 self.http.http().delete(url.clone()).bearer_auth(token)
             })
             .await?;
@@ -334,7 +355,7 @@ impl<P: TokenProvider> WebDavClient<P> {
         // A repeated MOVE that already happened fails with 404.
         self.http
             .send(
-                self.http.request_timeout(),
+                Some(self.http.request_timeout()),
                 Replay::OnlyUnprocessed,
                 |token| {
                     self.http
@@ -396,28 +417,91 @@ fn apply_condition(
     request
 }
 
-/// A request body that serves `content` in chunks and reports the
-/// cumulative byte count to `progress` per chunk — the basis of live
-/// upload progress ([`WebDavClient::put_with_progress`]). Hyper pulls the
-/// stream with network backpressure, so the reports follow the actual
-/// sending rate. One instance serves exactly one attempt; retries build
-/// a fresh one.
-fn progress_body(content: Vec<u8>, progress: Arc<dyn Fn(u64) + Send + Sync>) -> reqwest::Body {
-    const CHUNK: usize = 64 * 1024;
+/// Chunk size of streamed upload bodies.
+const UPLOAD_CHUNK: usize = 64 * 1024;
+
+/// How a PUT may be repeated: a conditional one that the server already
+/// applied would fail its own precondition and look like a conflict.
+fn put_replay(condition: &Option<WriteCondition>) -> Replay {
+    if condition.is_some() {
+        Replay::OnlyUnprocessed
+    } else {
+        Replay::Safe
+    }
+}
+
+/// The `ETag` header of a response, if present.
+fn etag_header(response: &Response) -> Option<String> {
+    response
+        .headers()
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+/// A request body that serves `content` in chunks (zero-copy slices) and
+/// reports the cumulative byte count to `progress` per chunk — the basis
+/// of live upload progress ([`WebDavClient::put_with_progress`]). Hyper
+/// pulls the stream with network backpressure, so the reports follow the
+/// actual sending rate. One instance serves exactly one attempt; retries
+/// build a fresh one.
+fn progress_body(content: bytes::Bytes, progress: Arc<dyn Fn(u64) + Send + Sync>) -> reqwest::Body {
     reqwest::Body::wrap_stream(futures_util::stream::unfold(
         (content, 0usize, progress),
         |(content, offset, progress)| async move {
             if offset >= content.len() {
                 None
             } else {
-                let end = (offset + CHUNK).min(content.len());
-                let chunk = content[offset..end].to_vec();
+                let end = (offset + UPLOAD_CHUNK).min(content.len());
+                let chunk = content.slice(offset..end);
                 progress(end as u64);
                 Some((
-                    Ok::<Vec<u8>, std::convert::Infallible>(chunk),
+                    Ok::<bytes::Bytes, std::convert::Infallible>(chunk),
                     (content, end, progress),
                 ))
             }
         },
     ))
+}
+
+/// A request body streaming `length` bytes of the file at `source`, in
+/// chunks, with progress like [`progress_body`]. Opening or reading
+/// errors (and a file shorter than `length`) fail the attempt.
+fn file_body(
+    source: &std::path::Path,
+    length: u64,
+    progress: Arc<dyn Fn(u64) + Send + Sync>,
+) -> reqwest::Body {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncReadExt;
+    let file = match std::fs::File::open(source) {
+        Ok(file) => tokio::fs::File::from_std(file),
+        Err(error) => {
+            return reqwest::Body::wrap_stream(futures_util::stream::once(async move {
+                Err::<bytes::Bytes, std::io::Error>(error)
+            }));
+        }
+    };
+    let stream = futures_util::stream::try_unfold(
+        (file, 0u64, progress),
+        move |(mut file, sent, progress)| async move {
+            if sent >= length {
+                return Ok(None);
+            }
+            let want = (length - sent).min(UPLOAD_CHUNK as u64) as usize;
+            let mut buffer = vec![0u8; want];
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "file got shorter while it was uploaded",
+                ));
+            }
+            buffer.truncate(read);
+            let sent = sent + read as u64;
+            progress(sent);
+            Ok(Some((bytes::Bytes::from(buffer), (file, sent, progress))))
+        },
+    );
+    reqwest::Body::wrap_stream(stream.boxed())
 }

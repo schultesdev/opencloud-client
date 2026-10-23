@@ -23,7 +23,7 @@ url = "2"
 dirs = "6"
 tempfile = "3"
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal", "fs"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 sha2 = "0.10"
 base64 = "0.22"
@@ -36,6 +36,7 @@ quick-xml = "0.37"
 percent-encoding = "2"
 unicode-normalization = "0.1"
 futures-util = "0.3"
+bytes = "1"
 notify = "8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

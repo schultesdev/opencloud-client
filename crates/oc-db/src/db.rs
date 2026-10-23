@@ -218,6 +218,41 @@ impl StatusDb {
         Ok(())
     }
 
+    /// Runs `operations` in one transaction: all of their writes commit
+    /// together (one disk sync instead of one per statement), or none do
+    /// when `operations` fails. Not reentrant — `operations` must not call
+    /// `transaction` again.
+    pub fn transaction<T>(
+        &self,
+        operations: impl FnOnce(&Self) -> Result<T, DbError>,
+    ) -> Result<T, DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let value = operations(self)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    /// Sets the lifecycle state of a tracked path; returns whether the
+    /// path was tracked.
+    pub fn set_state(&self, path: &str, state: EntryState) -> Result<bool, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE entries SET state = ?2 WHERE path = ?1",
+            params![path, state.as_str()],
+        )? > 0)
+    }
+
+    /// Resets every entry left in a transfer state (`uploading`,
+    /// `downloading`) by an interrupted run to `synced`: its recorded
+    /// baseline is intact, so the next diff plans the transfer again.
+    /// Returns the number of reset entries.
+    pub fn reset_transfer_states(&self) -> Result<usize, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE entries SET state = 'synced'
+             WHERE state IN ('uploading', 'downloading')",
+            [],
+        )?)
+    }
+
     /// Returns the entry for an exact path, if tracked.
     pub fn get_entry(&self, path: &str) -> Result<Option<Entry>, DbError> {
         let mut stmt = self.conn.prepare(
@@ -407,45 +442,36 @@ impl StatusDb {
     /// Aggregated numbers for the UI (file/dir counts, open conflicts,
     /// errors, active transfers, last sync).
     pub fn stats(&self) -> Result<Stats, DbError> {
-        let (files, dirs) = self.conn.query_row(
+        // One statement: the numbers form a consistent snapshot even
+        // while the engine writes, and `entries` is scanned once.
+        let (files, dirs, transfers, errors, conflicts, last_sync) = self.conn.query_row(
             "SELECT
-               SUM(CASE WHEN is_dir = 0 THEN 1 ELSE 0 END),
-               SUM(CASE WHEN is_dir = 1 THEN 1 ELSE 0 END)
+               COALESCE(SUM(is_dir = 0), 0),
+               COALESCE(SUM(is_dir = 1), 0),
+               COALESCE(SUM(state IN ('uploading', 'downloading')), 0),
+               COALESCE(SUM(state = 'error'), 0),
+               (SELECT COUNT(*) FROM conflicts WHERE status = 'pending'),
+               (SELECT value FROM meta WHERE key = 'last_sync')
              FROM entries",
             [],
             |row| {
                 Ok((
-                    row.get::<_, Option<i64>>(0)?.unwrap_or(0),
-                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             },
         )?;
-        let (transfers, errors) = self.conn.query_row(
-            "SELECT
-               SUM(CASE WHEN state IN ('uploading','downloading') THEN 1 ELSE 0 END),
-               SUM(CASE WHEN state = 'error' THEN 1 ELSE 0 END)
-             FROM entries",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, Option<i64>>(0)?.unwrap_or(0),
-                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                ))
-            },
-        )?;
-        let conflicts = self.conn.query_row(
-            "SELECT COUNT(*) FROM conflicts WHERE status = 'pending'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let last_sync = self.meta("last_sync")?.and_then(|v| v.parse().ok());
         Ok(Stats {
             files: files as u64,
             dirs: dirs as u64,
             transfers: transfers as u64,
             conflicts: conflicts as u64,
             errors: errors as u64,
-            last_sync,
+            last_sync: last_sync.and_then(|value| value.parse().ok()),
         })
     }
 }

@@ -21,7 +21,7 @@ use std::time::Duration;
 use oc_api::{DavResource, Depth, GraphClient, Space, WebDavClient};
 use oc_auth::{AuthClient, DEFAULT_LOGIN_TIMEOUT, KeyringStore, TokenManager};
 use oc_config::{Config, Jobs, SyncJob};
-use oc_db::{ConflictResolution, StatusDb, db_path};
+use oc_db::{Conflict, ConflictResolution, EntryState, Stats, StatusDb, db_path};
 use oc_sync::{Engine, EngineEvent, EngineOptions, Job, JobCommand};
 use tokio::sync::mpsc;
 
@@ -83,6 +83,30 @@ pub enum UiCommand {
     /// Reload `config.json`/`jobs.json` and restart the engine — applied
     /// after the GUI saved changes (new job, filters, settings, login).
     ApplyJobs,
+    /// Read statistics, pending conflicts, and running transfers of these
+    /// jobs from their status databases; the answer arrives as
+    /// [`BackendEvent::Snapshots`]. A request arriving while the previous
+    /// one is still being read is dropped.
+    RefreshSnapshots {
+        /// The jobs to read.
+        job_ids: Vec<String>,
+    },
+}
+
+/// What the GUI shows of one job's status database.
+#[derive(Debug, Default)]
+pub struct JobSnapshot {
+    /// The job.
+    pub job_id: String,
+    /// Aggregated numbers; `None` before the first sync (no database yet)
+    /// or when it could not be read.
+    pub stats: Option<Stats>,
+    /// Pending conflicts.
+    pub conflicts: Vec<Conflict>,
+    /// Paths currently transferring (a few, for display).
+    pub transfers: Vec<String>,
+    /// Why the database could not be read, if it could not.
+    pub error: Option<String>,
 }
 
 /// What the backend reports back to the GUI.
@@ -134,6 +158,27 @@ pub enum BackendEvent {
         /// Human-readable text.
         message: String,
     },
+    /// Database snapshots of the requested jobs.
+    Snapshots(Vec<JobSnapshot>),
+}
+
+/// The GUI end of the event channel: sends an event and wakes the GUI,
+/// which otherwise only polls at its idle frame rate.
+#[derive(Clone)]
+struct GuiSink {
+    events: Sender<BackendEvent>,
+    repaint: Arc<std::sync::OnceLock<eframe::egui::Context>>,
+}
+
+impl GuiSink {
+    /// Delivers an event; `false` once the GUI is gone.
+    fn send(&self, event: BackendEvent) -> bool {
+        let delivered = self.events.send(event).is_ok();
+        if let Some(context) = self.repaint.get() {
+            context.request_repaint();
+        }
+        delivered
+    }
 }
 
 /// Handle for the GUI to talk to the backend; dropped when the GUI exits,
@@ -141,6 +186,7 @@ pub enum BackendEvent {
 #[derive(Debug, Clone)]
 pub struct BackendHandle {
     commands: mpsc::UnboundedSender<UiCommand>,
+    repaint: Arc<std::sync::OnceLock<eframe::egui::Context>>,
 }
 
 impl BackendHandle {
@@ -148,6 +194,12 @@ impl BackendHandle {
     /// is on its way out anyway.
     pub fn send(&self, command: UiCommand) {
         let _ = self.commands.send(command);
+    }
+
+    /// Lets the backend wake the GUI whenever it sends an event (set
+    /// once the egui context exists).
+    pub fn set_repaint_context(&self, context: eframe::egui::Context) {
+        let _ = self.repaint.set(context);
     }
 }
 
@@ -160,24 +212,32 @@ pub fn spawn(config_dir: PathBuf) -> Result<(BackendHandle, Receiver<BackendEven
     let managers = Managers::default();
     let (mut engine, notices) = start_engine(&config_dir, &managers, &config, &jobs)?;
     let (gui_tx, gui_rx) = std_mpsc::channel::<BackendEvent>();
+    let repaint = Arc::new(std::sync::OnceLock::new());
+    let gui = GuiSink {
+        events: gui_tx,
+        repaint: repaint.clone(),
+    };
     for message in notices {
-        let _ = gui_tx.send(BackendEvent::Message { message });
+        gui.send(BackendEvent::Message { message });
     }
-    spawn_forwarder(engine.take_events(), gui_tx.clone());
+    spawn_forwarder(engine.take_events(), gui.clone());
 
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let backend = Backend {
         config_dir,
         managers,
-        gui: gui_tx,
+        gui,
         // Weak: the backend must not keep its own command channel open,
         // or it would never notice the GUI quitting.
         internal: command_tx.downgrade(),
+        snapshot_dbs: Arc::default(),
+        snapshot_busy: Arc::default(),
     };
     tokio::spawn(backend_task(backend, command_rx, engine));
     Ok((
         BackendHandle {
             commands: command_tx,
+            repaint,
         },
         gui_rx,
     ))
@@ -191,16 +251,22 @@ struct Backend {
     /// Token managers per account.
     managers: Managers,
     /// The GUI's event channel.
-    gui: Sender<BackendEvent>,
+    gui: GuiSink,
     /// The backend's own command channel (e.g. to restart the engine after
     /// a login finished in its own task).
     internal: mpsc::WeakUnboundedSender<UiCommand>,
+    /// Read connections to the job databases for GUI snapshots (opened
+    /// once; dropped before an engine restart so removed jobs' files can
+    /// be deleted).
+    snapshot_dbs: Arc<std::sync::Mutex<HashMap<String, StatusDb>>>,
+    /// A snapshot read is in progress.
+    snapshot_busy: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Backend {
     /// Sends an event to the GUI; a closed GUI is ignored.
     fn report(&self, event: BackendEvent) {
-        let _ = self.gui.send(event);
+        self.gui.send(event);
     }
 
     /// Asks the backend task for an engine restart.
@@ -233,9 +299,30 @@ async fn backend_task(
             UiCommand::PauseAll => engine.pause_all().await,
             UiCommand::ResumeAll => engine.resume_all().await,
             UiCommand::ApplyJobs => {
+                backend
+                    .snapshot_dbs
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clear();
                 engine =
                     restart_engine(&backend.config_dir, &backend.managers, &backend.gui, engine)
                         .await;
+            }
+            UiCommand::RefreshSnapshots { job_ids } => {
+                use std::sync::atomic::Ordering;
+                if backend.snapshot_busy.swap(true, Ordering::AcqRel) {
+                    continue;
+                }
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    let reader = backend.clone();
+                    let snapshots =
+                        tokio::task::spawn_blocking(move || read_snapshots(&reader, &job_ids))
+                            .await
+                            .unwrap_or_default();
+                    backend.snapshot_busy.store(false, Ordering::Release);
+                    backend.report(BackendEvent::Snapshots(snapshots));
+                });
             }
             UiCommand::Login { account_id } => {
                 let backend = backend.clone();
@@ -318,13 +405,13 @@ async fn backend_task(
 async fn restart_engine(
     config_dir: &std::path::Path,
     managers: &Managers,
-    gui: &Sender<BackendEvent>,
+    gui: &GuiSink,
     mut engine: Engine,
 ) -> Engine {
     let (config, jobs) = match load_workspace(config_dir) {
         Ok(pair) => pair,
         Err(error) => {
-            let _ = gui.send(BackendEvent::Message {
+            gui.send(BackendEvent::Message {
                 message: format!(
                     "Konfiguration unlesbar, die Engine läuft mit dem bisherigen Stand weiter: \
                      {error}"
@@ -338,13 +425,13 @@ async fn restart_engine(
     match start_engine(config_dir, managers, &config, &jobs) {
         Ok((mut new_engine, notices)) => {
             for message in notices {
-                let _ = gui.send(BackendEvent::Message { message });
+                gui.send(BackendEvent::Message { message });
             }
             spawn_forwarder(new_engine.take_events(), gui.clone());
             new_engine
         }
         Err(error) => {
-            let _ = gui.send(BackendEvent::Message {
+            gui.send(BackendEvent::Message {
                 message: format!(
                     "Sync-Engine konnte nicht gestartet werden, alle Jobs stehen: {error}"
                 ),
@@ -356,15 +443,79 @@ async fn restart_engine(
 
 /// Forwards engine events into the GUI's event channel until the engine
 /// stops (channel closed). Every event also goes to the process log.
-fn spawn_forwarder(mut events: mpsc::UnboundedReceiver<EngineEvent>, gui: Sender<BackendEvent>) {
+fn spawn_forwarder(mut events: mpsc::UnboundedReceiver<EngineEvent>, gui: GuiSink) {
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             tracing::info!("{event}");
-            if gui.send(BackendEvent::Engine(event)).is_err() {
+            if !gui.send(BackendEvent::Engine(event)) {
                 break;
             }
         }
     });
+}
+
+/// Reads the GUI snapshots of `job_ids` (blocking; runs on a blocking
+/// thread). Connections are opened once and kept; those of jobs no longer
+/// asked for are closed.
+fn read_snapshots(backend: &Backend, job_ids: &[String]) -> Vec<JobSnapshot> {
+    let mut dbs = backend
+        .snapshot_dbs
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    dbs.retain(|job_id, _| job_ids.contains(job_id));
+    let mut snapshots = Vec::with_capacity(job_ids.len());
+    for job_id in job_ids {
+        let mut snapshot = JobSnapshot {
+            job_id: job_id.clone(),
+            ..JobSnapshot::default()
+        };
+        if !dbs.contains_key(job_id) {
+            let path = match db_path(&backend.config_dir, job_id) {
+                Ok(path) => path,
+                Err(error) => {
+                    snapshot.error = Some(error.to_string());
+                    snapshots.push(snapshot);
+                    continue;
+                }
+            };
+            // No database yet: the job has not synced.
+            if !path.exists() {
+                snapshots.push(snapshot);
+                continue;
+            }
+            match StatusDb::open(&path) {
+                Ok(db) => {
+                    dbs.insert(job_id.clone(), db);
+                }
+                Err(error) => {
+                    snapshot.error = Some(error.to_string());
+                    snapshots.push(snapshot);
+                    continue;
+                }
+            }
+        }
+        let Some(db) = dbs.get(job_id) else {
+            snapshots.push(snapshot);
+            continue;
+        };
+        let read = (|| -> Result<(), oc_db::DbError> {
+            snapshot.stats = Some(db.stats()?);
+            snapshot.conflicts = db.pending_conflicts()?;
+            for state in [EntryState::Uploading, EntryState::Downloading] {
+                snapshot.transfers.extend(
+                    db.entries_with_state(state, 8)?
+                        .into_iter()
+                        .map(|entry| entry.entry.path),
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = read {
+            snapshot.error = Some(error.to_string());
+        }
+        snapshots.push(snapshot);
+    }
+    snapshots
 }
 
 /// Loads config and jobs, validating cross-references.

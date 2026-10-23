@@ -51,7 +51,8 @@ pub struct NewEntry {
     pub path: String,
     /// Whether this row describes a folder (`true`) or a file.
     pub is_dir: bool,
-    /// Local modification time (unix seconds) as seen at the last sync.
+    /// Local modification time (unix milliseconds; whole seconds × 1000
+    /// for entries recorded before schema v3) as seen at the last sync.
     pub local_mtime: Option<i64>,
     /// Local size in bytes as seen at the last sync.
     pub local_size: Option<i64>,
@@ -155,7 +156,7 @@ pub struct NewConflict {
     pub path: String,
     /// When the conflict was detected (unix seconds).
     pub detected_at: i64,
-    /// Local modification time (unix seconds) at detection time.
+    /// Local modification time (unix milliseconds) at detection time.
     pub local_mtime: Option<i64>,
     /// Local size in bytes at detection time.
     pub local_size: Option<i64>,
@@ -176,7 +177,7 @@ pub struct Conflict {
     pub path: String,
     /// When the conflict was detected (unix seconds).
     pub detected_at: i64,
-    /// Local modification time (unix seconds) at detection time.
+    /// Local modification time (unix milliseconds) at detection time.
     pub local_mtime: Option<i64>,
     /// Local size in bytes at detection time.
     pub local_size: Option<i64>,

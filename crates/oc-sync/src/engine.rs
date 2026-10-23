@@ -637,16 +637,8 @@ async fn run_once<P: TokenProvider + 'static>(
 
     // Crash recovery: interrupted transfers keep their recorded baseline,
     // so the diff re-plans them; the stale state must not linger.
-    if let Err(error) = recover_interrupted(&job.db) {
-        abort(&mut summary, &mut aborted, error);
-        return (summary, aborted);
-    }
-
-    // A changed filter (include/exclude) removes paths from the database
-    // that no longer belong to the synced set; local files stay (the GUI
-    // asks before cleaning them up, see PLAN.md Phase 5/7).
-    if let Err(error) = drop_uncovered(&job.db, &job.filter) {
-        abort(&mut summary, &mut aborted, error);
+    if let Err(error) = db_lock(&job.db).reset_transfer_states() {
+        abort(&mut summary, &mut aborted, SyncError::from(error));
         return (summary, aborted);
     }
 
@@ -664,13 +656,13 @@ async fn run_once<P: TokenProvider + 'static>(
         }
     };
 
-    let db_entries = match db_lock(&job.db).all_entries() {
-        Ok(entries) => entries
-            .into_iter()
-            .map(|entry| (entry.entry.path.clone(), entry.entry))
-            .collect::<HashMap<_, _>>(),
+    // The recorded state, read once per pass. A changed filter
+    // (include/exclude) first removes paths that no longer belong to the
+    // synced set; local files stay (the GUI asks before cleaning them up,
+    // see PLAN.md Phase 5/7).
+    let db_entries = match load_covered_entries(&job.db, &job.filter) {
+        Ok(entries) => entries,
         Err(error) => {
-            let error = SyncError::from(error);
             abort(&mut summary, &mut aborted, error);
             return (summary, aborted);
         }
@@ -783,6 +775,9 @@ async fn run_once<P: TokenProvider + 'static>(
         tracker: tracker.clone(),
     };
     let mut transfers: Vec<QueuedTransfer> = Vec::new();
+    // Plan steps that only touch the database are applied together in
+    // one transaction after the loop (initial syncs record thousands).
+    let mut db_writes: Vec<DbWrite> = Vec::new();
 
     for action in plan {
         match action {
@@ -935,15 +930,27 @@ async fn run_once<P: TokenProvider + 'static>(
                     mtime: None,
                     size: None,
                 });
-                if let Err(error) = upsert_synced(&job.db, &path, is_dir, node, etag, size, now) {
-                    fail(&mut summary, &path, &error);
+                db_writes.push(DbWrite::Record(synced_entry(
+                    &path, is_dir, node, etag, size, now,
+                )));
+            }
+            SyncAction::DropEntry { path } => db_writes.push(DbWrite::Drop(path)),
+        }
+    }
+    if !db_writes.is_empty() {
+        let result = db_lock(&job.db).transaction(|db| {
+            for write in &db_writes {
+                match write {
+                    DbWrite::Record(entry) => db.upsert_entry(entry)?,
+                    DbWrite::Drop(path) => {
+                        db.delete_entry(path)?;
+                    }
                 }
             }
-            SyncAction::DropEntry { path } => {
-                if let Err(error) = db_lock(&job.db).delete_entry(&path) {
-                    fail(&mut summary, &path, &SyncError::from(error));
-                }
-            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            fail(&mut summary, "", &SyncError::from(error));
         }
     }
 
@@ -1094,37 +1101,44 @@ fn spawn_transfer<P: TokenProvider + 'static>(
     (handle, task)
 }
 
-/// Resets entries stuck in a transfer state after a crash: the recorded
-/// baseline is intact, so the diff re-plans the transfer.
-fn recover_interrupted(db: &std::sync::Mutex<StatusDb>) -> Result<(), SyncError> {
-    let db = db_lock(db);
-    for entry in db.all_entries()? {
-        if matches!(
-            entry.entry.state,
-            EntryState::Uploading | EntryState::Downloading
-        ) {
-            let mut updated = entry.entry;
-            updated.state = EntryState::Synced;
-            db.upsert_entry(&updated)?;
-        }
-    }
-    Ok(())
+/// A plan step that only writes the database (batched per pass).
+enum DbWrite {
+    /// Record a synced entry.
+    Record(NewEntry),
+    /// Drop the entry of a path that vanished on both sides.
+    Drop(String),
 }
 
-/// Removes database entries that the job's filter no longer covers
-/// (selective-sync changes); local files are left in place.
-fn drop_uncovered(db: &std::sync::Mutex<StatusDb>, filter: &Filter) -> Result<(), SyncError> {
+/// Reads all recorded entries and removes the ones the job's filter no
+/// longer covers (selective-sync changes) in one transaction; local files
+/// are left in place. Returns the remaining entries by path.
+fn load_covered_entries(
+    db: &std::sync::Mutex<StatusDb>,
+    filter: &Filter,
+) -> Result<HashMap<String, NewEntry>, SyncError> {
     let db = db_lock(db);
-    for entry in db.all_entries()? {
-        if !filter.covers(&entry.entry.path) {
-            if entry.entry.is_dir {
-                db.delete_subtree(&entry.entry.path)?;
-            } else {
-                db.delete_entry(&entry.entry.path)?;
+    let mut entries: HashMap<String, NewEntry> = db
+        .all_entries()?
+        .into_iter()
+        .map(|entry| (entry.entry.path.clone(), entry.entry))
+        .collect();
+    let uncovered: Vec<String> = entries
+        .keys()
+        .filter(|path| !filter.covers(path))
+        .cloned()
+        .collect();
+    if !uncovered.is_empty() {
+        db.transaction(|db| {
+            for path in &uncovered {
+                db.delete_entry(path)?;
             }
+            Ok(())
+        })?;
+        for path in &uncovered {
+            entries.remove(path);
         }
     }
-    Ok(())
+    Ok(entries)
 }
 
 /// Builds a remote snapshot from the recorded database state — used when
@@ -1175,12 +1189,7 @@ fn mark_state(
     path: &str,
     state: EntryState,
 ) -> Result<(), SyncError> {
-    let db = db_lock(db);
-    if let Some(entry) = db.get_entry(path)? {
-        let mut updated = entry.entry;
-        updated.state = state;
-        db.upsert_entry(&updated)?;
-    }
+    db_lock(db).set_state(path, state)?;
     Ok(())
 }
 
@@ -1194,8 +1203,28 @@ fn upsert_synced(
     remote_size: Option<i64>,
     now: i64,
 ) -> Result<(), SyncError> {
-    let db = db_lock(db);
-    db.upsert_entry(&NewEntry {
+    db_lock(db).upsert_entry(&synced_entry(
+        path,
+        is_dir,
+        local,
+        remote_etag,
+        remote_size,
+        now,
+    ))?;
+    Ok(())
+}
+
+/// The database entry of a path in sync with the given local and remote
+/// state.
+fn synced_entry(
+    path: &str,
+    is_dir: bool,
+    local: LocalNode,
+    remote_etag: Option<String>,
+    remote_size: Option<i64>,
+    now: i64,
+) -> NewEntry {
+    NewEntry {
         path: path.to_owned(),
         is_dir,
         local_mtime: local.mtime,
@@ -1205,8 +1234,7 @@ fn upsert_synced(
         checksum: None,
         last_synced_at: Some(now),
         state: EntryState::Synced,
-    })?;
-    Ok(())
+    }
 }
 
 /// What a scan saw when it detected a conflict: the path, both sides'
@@ -1237,35 +1265,40 @@ fn record_conflict(
     // Both node types are cheap copies/clones; work with values below.
     let local = *local;
     let remote = remote.clone();
-    let db = db_lock(db);
-    let conflict_id = db.record_conflict(&NewConflict {
-        path: path.to_owned(),
-        detected_at: *at,
-        local_mtime: local.and_then(|node| node.mtime),
-        local_size: local.and_then(|node| node.size),
-        remote_etag: remote.as_ref().and_then(|node| node.etag.clone()),
-        remote_size: remote.as_ref().and_then(|node| node.size),
-        remote_mtime: None,
-    })?;
-    let is_dir = local
-        .map(|node| node.is_dir)
-        .or_else(|| remote.as_ref().map(|node| node.is_dir))
-        .unwrap_or(false);
-    let mut entry = match db.get_entry(path)? {
-        Some(entry) => entry.entry,
-        None => NewEntry::new(path, is_dir, EntryState::Conflict),
-    };
-    entry.state = EntryState::Conflict;
-    if let Some(local) = local {
-        entry.local_mtime = local.mtime;
-        entry.local_size = local.size;
-    }
-    if let Some(remote) = remote {
-        entry.remote_etag = remote.etag;
-        entry.remote_size = remote.size;
-    }
-    db.upsert_entry(&entry)?;
-    Ok(conflict_id)
+    // Conflict row and frozen entry are written together: a crash in
+    // between must not leave a conflict whose path is not frozen.
+    db_lock(db)
+        .transaction(|db| {
+            let conflict_id = db.record_conflict(&NewConflict {
+                path: path.to_owned(),
+                detected_at: *at,
+                local_mtime: local.and_then(|node| node.mtime),
+                local_size: local.and_then(|node| node.size),
+                remote_etag: remote.as_ref().and_then(|node| node.etag.clone()),
+                remote_size: remote.as_ref().and_then(|node| node.size),
+                remote_mtime: None,
+            })?;
+            let is_dir = local
+                .map(|node| node.is_dir)
+                .or_else(|| remote.as_ref().map(|node| node.is_dir))
+                .unwrap_or(false);
+            let mut entry = match db.get_entry(path)? {
+                Some(entry) => entry.entry,
+                None => NewEntry::new(path, is_dir, EntryState::Conflict),
+            };
+            entry.state = EntryState::Conflict;
+            if let Some(local) = local {
+                entry.local_mtime = local.mtime;
+                entry.local_size = local.size;
+            }
+            if let Some(remote) = remote {
+                entry.remote_etag = remote.etag;
+                entry.remote_size = remote.size;
+            }
+            db.upsert_entry(&entry)?;
+            Ok(conflict_id)
+        })
+        .map_err(SyncError::from)
 }
 
 /// Records a conflict and applies the job's conflict policy (Phase 6):

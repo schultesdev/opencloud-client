@@ -755,3 +755,38 @@ async fn excessive_retry_after_is_not_waited_for() {
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     server.verify().await;
 }
+
+#[tokio::test]
+async fn put_file_streams_the_file_with_its_length() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/dav/spaces/sid/big.bin"))
+        .and(header("Content-Length", "200000"))
+        .and(header("If-None-Match", "*"))
+        .and(wiremock::matchers::body_bytes(vec![7u8; 200_000]))
+        .respond_with(ResponseTemplate::new(201).append_header("ETag", "\"b1\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = std::env::temp_dir().join(format!("oc-api-put-file-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let source = dir.join("big.bin");
+    std::fs::write(&source, vec![7u8; 200_000]).expect("write");
+
+    let client = WebDavClient::new(&server.uri(), "sid", StaticToken::new("tok")).expect("client");
+    let reported = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = reported.clone();
+    let etag = client
+        .put_file(
+            "big.bin",
+            &source,
+            200_000,
+            Some(oc_api::WriteCondition::CreateNew),
+            move |bytes| seen.store(bytes as usize, Ordering::SeqCst),
+        )
+        .await
+        .expect("upload");
+    assert_eq!(etag.as_deref(), Some("\"b1\""));
+    assert_eq!(reported.load(Ordering::SeqCst), 200_000);
+    let _ = std::fs::remove_dir_all(&dir);
+}

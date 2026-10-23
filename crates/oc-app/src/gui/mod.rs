@@ -33,7 +33,7 @@ use egui::ViewportCommand;
 use oc_api::Space;
 use oc_auth::{AuthClient, KeyringStore, TokenManager};
 use oc_config::{Account, Config, ConflictPolicy, Jobs, LogLevel, Settings, SyncJob};
-use oc_db::{Conflict, ConflictResolution, Stats, StatusDb, db_path};
+use oc_db::{Conflict, ConflictResolution, Stats, db_path};
 use oc_sync::EngineEvent;
 use oc_sync::JobCommand;
 use oc_sync::RunProgress;
@@ -41,6 +41,7 @@ use oc_sync::RunSummary;
 
 use crate::gui::backend::BackendEvent;
 use crate::gui::backend::BackendHandle;
+use crate::gui::backend::JobSnapshot;
 use crate::gui::backend::UiCommand;
 use crate::gui::tray::Tray;
 use crate::gui::tray::TrayAction;
@@ -133,8 +134,6 @@ struct SyncApp {
     accounts: HashMap<String, AccountUi>,
     /// Per-job UI state.
     job_states: HashMap<String, JobUi>,
-    /// Open status databases (GUI-thread connections).
-    dbs: HashMap<String, StatusDb>,
     /// Form for adding an account.
     new_account: NewAccountForm,
     /// Whether the add-account form is expanded.
@@ -199,7 +198,6 @@ impl SyncApp {
             jobs,
             accounts,
             job_states: HashMap::new(),
-            dbs: HashMap::new(),
             new_account: NewAccountForm::default(),
             show_new_account: false,
             tab: Tab::Jobs,
@@ -291,19 +289,20 @@ impl SyncApp {
                 match result {
                     Ok(true) => {
                         self.notify(format!("Konflikt #{conflict_id} in '{job_id}' gelöst"));
-                        self.refresh_dbs();
+                        self.request_snapshots();
                     }
                     Ok(false) => {
                         self.notify(format!(
                             "Konflikt #{conflict_id} in '{job_id}' bleibt offen: \
                              der Server hat sich zwischenzeitlich geändert"
                         ));
-                        self.refresh_dbs();
+                        self.request_snapshots();
                     }
                     Err(error) => self.notify(format!("Konfliktlösung fehlgeschlagen: {error}")),
                 }
             }
             BackendEvent::Message { message } => self.notify(message),
+            BackendEvent::Snapshots(snapshots) => self.apply_snapshots(snapshots),
         }
     }
 
@@ -382,7 +381,7 @@ impl SyncApp {
             }
             EngineEvent::ConflictResolved { job_id, path, .. } => {
                 self.notify(format!("Konflikt in '{job_id}' gelöst: {path}"));
-                self.refresh_dbs();
+                self.request_snapshots();
             }
             EngineEvent::Stopped { job_id } => {
                 let state = self.job_states.entry(job_id).or_default();
@@ -404,57 +403,28 @@ impl SyncApp {
         }
     }
 
-    /// Opens/refreshes the per-job status databases and pulls statistics
-    /// and pending conflicts (own connections; WAL allows concurrency).
-    fn refresh_dbs(&mut self) {
+    /// Asks the backend for fresh database snapshots of all jobs (stats,
+    /// pending conflicts, transfers). The databases are read on the
+    /// backend's blocking threads, never in the frame.
+    fn request_snapshots(&mut self) {
         self.last_refresh = Instant::now();
-        let job_ids: Vec<(String, PathBuf)> = self
-            .jobs
-            .jobs
-            .iter()
-            .map(|job| (job.id.clone(), job.local_path.clone()))
-            .collect();
-        for (job_id, _local_root) in job_ids {
-            let Ok(path) = db_path(&self.config_dir, &job_id) else {
-                continue;
-            };
-            if !path.exists() {
-                self.dbs.remove(&job_id);
-                if let Some(state) = self.job_states.get_mut(&job_id) {
-                    state.stats = None;
-                    state.conflicts.clear();
-                }
+        let job_ids = self.jobs.jobs.iter().map(|job| job.id.clone()).collect();
+        self.backend.send(UiCommand::RefreshSnapshots { job_ids });
+    }
+
+    /// Applies database snapshots from the backend.
+    fn apply_snapshots(&mut self, snapshots: Vec<JobSnapshot>) {
+        for snapshot in snapshots {
+            if !self.jobs.jobs.iter().any(|job| job.id == snapshot.job_id) {
                 continue;
             }
-            if !self.dbs.contains_key(&job_id) {
-                match StatusDb::open(&path) {
-                    Ok(db) => {
-                        self.dbs.insert(job_id.clone(), db);
-                    }
-                    Err(error) => {
-                        self.notify(format!("Status-Datenbank '{job_id}': {error}"));
-                        continue;
-                    }
-                }
+            if let Some(error) = &snapshot.error {
+                self.notify(format!("Status-Datenbank '{}': {error}", snapshot.job_id));
             }
-            let state = self.job_states.entry(job_id.clone()).or_default();
-            let Some(db) = self.dbs.get(&job_id) else {
-                continue;
-            };
-            if let Ok(stats) = db.stats() {
-                state.stats = Some(stats);
-            }
-            if let Ok(conflicts) = db.pending_conflicts() {
-                state.conflicts = conflicts;
-            }
-            let mut transfers = Vec::new();
-            if let Ok(uploading) = db.entries_with_state(oc_db::EntryState::Uploading, 8) {
-                transfers.extend(uploading.iter().map(|entry| entry.entry.path.clone()));
-            }
-            if let Ok(downloading) = db.entries_with_state(oc_db::EntryState::Downloading, 8) {
-                transfers.extend(downloading.iter().map(|entry| entry.entry.path.clone()));
-            }
-            state.transfers = transfers;
+            let state = self.job_states.entry(snapshot.job_id).or_default();
+            state.stats = snapshot.stats;
+            state.conflicts = snapshot.conflicts;
+            state.transfers = snapshot.transfers;
         }
     }
 
@@ -1549,7 +1519,8 @@ impl SyncApp {
                                     ui.label(
                                         egui::RichText::new(describe_side(
                                             conflict.local_size,
-                                            conflict.local_mtime,
+                                            // Recorded in milliseconds.
+                                            conflict.local_mtime.map(|ms| ms.div_euclid(1000)),
                                         ))
                                         .small()
                                         .color(theme.text),
@@ -1935,8 +1906,8 @@ impl SyncApp {
             }
         }
         let children = wizard.tree.children.get("").cloned().unwrap_or_default();
-        for child in children {
-            self.show_tree_node(ui, wizard, &child, 0, account_id, space_id);
+        for child in children.iter() {
+            self.show_tree_node(ui, wizard, child, 0, account_id, space_id);
         }
         ui.add_space(4.0);
         ui.label(
@@ -2037,8 +2008,8 @@ impl SyncApp {
         });
         if wizard.tree.expanded.contains(&path) {
             let children = wizard.tree.children.get(&path).cloned().unwrap_or_default();
-            for child in children {
-                self.show_tree_node(ui, wizard, &child, depth + 1, account_id, space_id);
+            for child in children.iter() {
+                self.show_tree_node(ui, wizard, child, depth + 1, account_id, space_id);
             }
         }
     }
@@ -2136,10 +2107,6 @@ impl SyncApp {
                     if theme::danger(ui, "Entfernen").clicked() {
                         let mut jobs = self.jobs.clone();
                         jobs.jobs.retain(|job| job.id != job_id);
-                        // Close the GUI's connection first, so the
-                        // backend can delete the database file (if the
-                        // save fails, the next refresh reopens it).
-                        self.dbs.remove(&job_id);
                         if self.save_jobs(jobs, true).is_ok() {
                             self.job_states.remove(&job_id);
                             self.notify(format!("Job '{job_id}' entfernt"));
@@ -2175,8 +2142,8 @@ impl App for SyncApp {
         }
         self.drain_events();
         self.poll_tray(ctx);
-        if self.last_refresh.elapsed() > Duration::from_secs(1) {
-            self.refresh_dbs();
+        if self.last_refresh.elapsed() >= Duration::from_secs(1) {
+            self.request_snapshots();
             self.update_tray_status();
         }
         self.show_status_line(ctx);
@@ -2199,8 +2166,15 @@ impl App for SyncApp {
                 });
         }
         self.show_confirm_remove(ctx);
-        // Backend events and tray menu events arrive between frames.
-        ctx.request_repaint_after(Duration::from_millis(500));
+        // Backend events wake the GUI themselves. The idle frame drives
+        // the once-a-second snapshot refresh and the tray polling; while a
+        // pass runs, speed and ETA update more often.
+        let running = self.job_states.values().any(|state| state.running);
+        ctx.request_repaint_after(if running {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(1)
+        });
     }
 }
 
@@ -2227,7 +2201,8 @@ pub fn run(config_dir: Option<&Path>) -> Result<(), String> {
     eframe::run_native(
         "OpenCloud Sync",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            app.backend.set_repaint_context(cc.egui_ctx.clone());
             // tray-icon wants the event loop running before the icon is
             // created (macOS); this closure runs inside it.
             app.tray = Tray::new();

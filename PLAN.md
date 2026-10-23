@@ -303,8 +303,9 @@ Remote geändert? = ETag != DB-Werte
   lokales Zielverzeichnis wählen → **Ordnerauswahl pro Space**: Remote-Baum via
   PROPFIND laden, Checkboxen je Ordner → schreibt `include`-Liste → Job speichern.
 - [x] **Statusanzeige pro Verzeichnis**: Fortschritt während Sync
-  (aktuelle Datei, Warteschlange), Fehlerliste, Konfliktanzahl als Badge im
-  Tray-Tooltip.
+  (Dateizähler, Bytes, Restzeit; je laufender Datei Richtung, Bytes und
+  Geschwindigkeit; Warteschlange), Fehlerliste, Konfliktanzahl und
+  Sync-Fortschritt im Tray-Tooltip.
 - [x] **Tray-Icon**: Status (Sync läuft / Fehler / Konflikt), Fenster
   zeigen/beenden, Pause alles. Fenster-Schließen minimiert in Tray (nicht
   beenden).

@@ -26,6 +26,47 @@ pub enum TrayAction {
     Quit,
 }
 
+/// What the tray tooltip summarizes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TrayStatus {
+    /// At least one job is running a sync pass.
+    pub running: bool,
+    /// Files finished and planned by the running passes (`None` when no
+    /// pass is moving files).
+    pub files: Option<(usize, usize)>,
+    /// Remaining time of the running passes, coarsely formatted (`None`
+    /// while the speed is unknown).
+    pub eta: Option<String>,
+    /// Recorded errors across all jobs.
+    pub errors: u64,
+    /// Pending conflicts across all jobs.
+    pub conflicts: u64,
+}
+
+impl TrayStatus {
+    /// The tooltip text, e.g. `OpenCloud Sync — Synchronisierung läuft ·
+    /// 12/40 Dateien · noch 2 min — 1 Fehler`.
+    fn tooltip(&self) -> String {
+        let mut tooltip = String::from("OpenCloud Sync");
+        if self.running {
+            tooltip.push_str(" — Synchronisierung läuft");
+            if let Some((done, total)) = self.files {
+                tooltip.push_str(&format!(" · {done}/{total} Dateien"));
+            }
+            if let Some(eta) = &self.eta {
+                tooltip.push_str(&format!(" · noch {eta}"));
+            }
+        }
+        if self.errors > 0 {
+            tooltip.push_str(&format!(" — {} Fehler", self.errors));
+        }
+        if self.conflicts > 0 {
+            tooltip.push_str(&format!(" — {} Konflikte", self.conflicts));
+        }
+        tooltip
+    }
+}
+
 /// A change for the tray icon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Update {
@@ -133,18 +174,10 @@ impl Tray {
         self.send(Update::Paused(paused));
     }
 
-    /// Sets the status tooltip, e.g. `OpenCloud Sync — 2 Konflikte`.
-    pub fn set_status(&mut self, running: bool, errors: u64, conflicts: u64) {
-        let mut tooltip = String::from("OpenCloud Sync");
-        if running {
-            tooltip.push_str(" — Synchronisierung läuft");
-        }
-        if errors > 0 {
-            tooltip.push_str(&format!(" — {errors} Fehler"));
-        }
-        if conflicts > 0 {
-            tooltip.push_str(&format!(" — {conflicts} Konflikte"));
-        }
+    /// Sets the status tooltip (see [`TrayStatus::tooltip`]); an
+    /// unchanged text is not re-sent.
+    pub fn set_status(&mut self, status: &TrayStatus) {
+        let tooltip = status.tooltip();
         if self.tooltip.as_deref() != Some(tooltip.as_str()) {
             self.tooltip = Some(tooltip.clone());
             self.send(Update::Tooltip(tooltip));

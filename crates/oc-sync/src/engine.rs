@@ -34,7 +34,7 @@ use crate::error::SyncError;
 use crate::filter::Filter;
 use crate::progress::RunProgress;
 use crate::progress::RunTracker;
-use crate::progress::TransferHandle;
+use crate::progress::TransferDirection;
 use crate::scan::{self, LocalNode, RemoteNode, ServerNames};
 use crate::transfer::{self, LocalGuard, TransferPaths, TransferResult};
 use crate::watch::LocalWatcher;
@@ -104,6 +104,9 @@ pub struct EngineOptions {
     pub offline_backoff_base: Duration,
     /// Upper bound of the offline backoff.
     pub offline_backoff_cap: Duration,
+    /// Minimum time between two live progress events of a running pass
+    /// (the throttle of [`EngineEvent::Progress`] while bodies stream).
+    pub progress_interval: Duration,
 }
 
 impl Default for EngineOptions {
@@ -119,6 +122,7 @@ impl Default for EngineOptions {
             propfind_pause: Duration::ZERO,
             offline_backoff_base: Duration::from_secs(10),
             offline_backoff_cap: Duration::from_secs(60),
+            progress_interval: Duration::from_millis(200),
         }
     }
 }
@@ -251,11 +255,14 @@ impl fmt::Display for EngineEvent {
                         transfers_total,
                         bytes_done,
                         bytes_total,
+                        active,
+                        ..
                     },
             } => write!(
                 f,
                 "[{job_id}] {transfers_done}/{transfers_total} transfers, \
-                 {bytes_done}/{bytes_total} bytes"
+                 {bytes_done}/{bytes_total} bytes, {} active",
+                active.len()
             ),
             Self::RunFinished { job_id, summary } => {
                 write!(f, "[{job_id}] sync run finished: {summary}")
@@ -569,15 +576,9 @@ async fn job_loop<P: TokenProvider + 'static>(
     });
 }
 
-/// A queued transfer: its kind, path, planned bytes, progress handle,
-/// and the running task.
-type QueuedTransfer = (
-    PendingTransfer,
-    String,
-    u64,
-    TransferHandle,
-    JoinHandle<Result<TransferResult, SyncError>>,
-);
+/// A queued transfer: whether it is an upload, its path, and the running
+/// task.
+type QueuedTransfer = (bool, String, JoinHandle<Result<TransferResult, SyncError>>);
 
 /// A queued transfer of one path.
 #[derive(Debug, Clone)]
@@ -597,13 +598,6 @@ enum PendingTransfer {
         /// lands (scan state), so later local edits are not overwritten.
         guard: LocalGuard,
     },
-}
-
-impl PendingTransfer {
-    /// Whether this is an upload.
-    fn is_upload(&self) -> bool {
-        matches!(self, Self::Upload { .. })
-    }
 }
 
 /// One sync pass: recovery, scans, diff, plan execution, bookkeeping.
@@ -775,7 +769,13 @@ async fn run_once<P: TokenProvider + 'static>(
             _ => {}
         }
     }
-    let tracker = RunTracker::new(&job.id, events.clone(), transfers_total, bytes_total);
+    let tracker = RunTracker::new(
+        &job.id,
+        events.clone(),
+        transfers_total,
+        bytes_total,
+        options.progress_interval,
+    );
     if transfers_total > 0 {
         tracker.announce();
     }
@@ -902,18 +902,18 @@ async fn run_once<P: TokenProvider + 'static>(
                 let _ = mark_state(&job.db, &path, EntryState::Uploading);
                 let kind = PendingTransfer::Upload { base_etag, create };
                 let planned = planned_bytes(local.get(&path).and_then(|node| node.size));
-                let (handle, task) =
-                    spawn_transfer(&context, kind.clone(), path.clone(), names.resolve(&path));
-                transfers.push((kind, path, planned, handle, task));
+                let task =
+                    spawn_transfer(&context, kind, path.clone(), names.resolve(&path), planned);
+                transfers.push((true, path, task));
             }
             SyncAction::Download { path, remote } => {
                 let _ = mark_state(&job.db, &path, EntryState::Downloading);
                 let planned = planned_bytes(remote.size);
                 let guard = LocalGuard::from_scan(local.get(&path).copied());
                 let kind = PendingTransfer::Download { remote, guard };
-                let (handle, task) =
-                    spawn_transfer(&context, kind.clone(), path.clone(), names.resolve(&path));
-                transfers.push((kind, path, planned, handle, task));
+                let task =
+                    spawn_transfer(&context, kind, path.clone(), names.resolve(&path), planned);
+                transfers.push((false, path, task));
             }
             SyncAction::Conflict {
                 path,
@@ -969,7 +969,7 @@ async fn run_once<P: TokenProvider + 'static>(
 
     // Transfers ran concurrently; apply their results to the database.
     let mut rescan_needed = false;
-    for (kind, path, planned, handle, task) in transfers {
+    for (is_upload, path, task) in transfers {
         let result = match task.await {
             Ok(result) => result,
             Err(source) => Err(SyncError::Api(ApiError::protocol(format!(
@@ -978,7 +978,6 @@ async fn run_once<P: TokenProvider + 'static>(
         };
         match result {
             Ok(TransferResult::Done(meta)) => {
-                handle.finish(planned);
                 match upsert_synced(
                     &job.db,
                     &path,
@@ -989,7 +988,7 @@ async fn run_once<P: TokenProvider + 'static>(
                     now,
                 ) {
                     Ok(()) => {
-                        if kind.is_upload() {
+                        if is_upload {
                             summary.uploads += 1;
                         } else {
                             summary.downloads += 1;
@@ -1000,7 +999,6 @@ async fn run_once<P: TokenProvider + 'static>(
             }
             Ok(TransferResult::PreconditionFailed) => {
                 // The remote side changed while we uploaded: conflict.
-                handle.abandon();
                 let current_remote = job
                     .dav
                     .propfind(&names.resolve(&path), Depth::Zero)
@@ -1021,16 +1019,17 @@ async fn run_once<P: TokenProvider + 'static>(
                 // edit is kept and the baseline stays as recorded, so the
                 // next pass sees both sides changed and records a
                 // conflict. Reset the transfer state for that pass.
-                handle.abandon();
                 let _ = mark_state(&job.db, &path, EntryState::Synced);
                 rescan_needed = true;
             }
             Err(error) => {
-                handle.abandon();
                 let _ = mark_state(&job.db, &path, EntryState::Error);
                 fail(&mut summary, &path, &error);
             }
         }
+    }
+    if transfers_total > 0 {
+        tracker.complete();
     }
 
     // The root ETag may only vouch for the recorded state when the pass
@@ -1067,36 +1066,41 @@ struct TransferContext<P: TokenProvider> {
 }
 
 /// Spawns one transfer task; the semaphore caps the number of concurrent
-/// transfers (`max_parallel_transfers`). Returns the transfer's progress
-/// handle (for finishing/abandoning it) alongside the task.
+/// transfers (`max_parallel_transfers`). The transfer registers with the
+/// pass's progress tracker once it holds a permit — so the live view
+/// lists running transfers only — and settles there on every outcome:
+/// a completed transfer counts its `planned` bytes, any other result
+/// (conflict, kept local edit, error) is abandoned.
 fn spawn_transfer<P: TokenProvider + 'static>(
     context: &TransferContext<P>,
     kind: PendingTransfer,
     path: String,
     remote_path: String,
-) -> (
-    TransferHandle,
-    JoinHandle<Result<TransferResult, SyncError>>,
-) {
-    let handle = context.tracker.handle();
-    let reporting = handle.clone();
+    planned: u64,
+) -> JoinHandle<Result<TransferResult, SyncError>> {
+    let tracker = context.tracker.clone();
     let dav = context.dav.clone();
     let root = context.root.clone();
     let chunk_size = context.chunk_size;
     let semaphore = context.semaphore.clone();
-    let task = tokio::spawn(async move {
+    tokio::spawn(async move {
         let _permit = semaphore
             .acquire_owned()
             .await
             .map_err(|_| SyncError::Api(ApiError::protocol("transfer semaphore closed")))?;
+        let direction = match kind {
+            PendingTransfer::Upload { .. } => TransferDirection::Upload,
+            PendingTransfer::Download { .. } => TransferDirection::Download,
+        };
+        let handle = tracker.start(&path, direction, planned);
         let paths = TransferPaths {
             root: &root,
             path: &path,
             remote_path: &remote_path,
         };
-        match kind {
+        let result = match kind {
             PendingTransfer::Upload { base_etag, create } => {
-                transfer::upload(dav.as_ref(), paths, base_etag, create, Some(&reporting)).await
+                transfer::upload(dav.as_ref(), paths, base_etag, create, Some(&handle)).await
             }
             PendingTransfer::Download { remote, guard } => {
                 transfer::download(
@@ -1105,13 +1109,17 @@ fn spawn_transfer<P: TokenProvider + 'static>(
                     &remote,
                     chunk_size,
                     guard,
-                    Some(&reporting),
+                    Some(&handle),
                 )
                 .await
             }
+        };
+        match &result {
+            Ok(TransferResult::Done(_)) => handle.finish(planned),
+            _ => handle.abandon(),
         }
-    });
-    (handle, task)
+        result
+    })
 }
 
 /// Checks the size-only matches of the initial sync against the server's

@@ -30,6 +30,24 @@ pub(super) fn format_eta(duration: Duration) -> String {
     }
 }
 
+/// Formats a remaining time coarsely for places that should not change
+/// every second (tray tooltip): `unter 1 min`, `3 min`, `1 h 12 min`.
+pub(super) fn format_eta_coarse(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        "unter 1 min".to_string()
+    } else if secs < 3600 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{} h {:02} min", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Formats a transfer speed (`1.2 MB/s`).
+pub(super) fn format_speed(bytes_per_second: f64) -> String {
+    format!("{}/s", format_bytes(bytes_per_second.max(0.0) as u64))
+}
+
 /// Formats a unix timestamp as `TT.MM.JJJJ SS:MM:SS` (UTC).
 pub(super) fn format_unix(unix: i64) -> String {
     let days = unix.div_euclid(86_400);
@@ -93,6 +111,19 @@ mod tests {
         assert_eq!(format_eta(Duration::from_secs(45)), "45 s");
         assert_eq!(format_eta(Duration::from_secs(125)), "2 min 05 s");
         assert_eq!(format_eta(Duration::from_secs(4320)), "1 h 12 min");
+    }
+
+    #[test]
+    fn format_eta_coarse_rounds_to_minutes() {
+        assert_eq!(format_eta_coarse(Duration::from_secs(45)), "unter 1 min");
+        assert_eq!(format_eta_coarse(Duration::from_secs(125)), "2 min");
+        assert_eq!(format_eta_coarse(Duration::from_secs(4320)), "1 h 12 min");
+    }
+
+    #[test]
+    fn format_speed_appends_per_second() {
+        assert_eq!(format_speed(2048.0), "2.0 KB/s");
+        assert_eq!(format_speed(-5.0), "0 B/s");
     }
 
     #[test]

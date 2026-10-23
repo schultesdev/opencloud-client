@@ -178,7 +178,6 @@ async fn stream_to_part(
     part: &Path,
     progress: Option<&TransferHandle>,
 ) -> Result<u64, SyncError> {
-    use tokio::io::AsyncWriteExt;
     if let Some(parent) = part.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -188,20 +187,7 @@ async fn stream_to_part(
         let mut file = tokio::fs::File::create(part)
             .await
             .map_err(|source| SyncError::io(part, source))?;
-        let mut received = 0u64;
-        while let Some(chunk) = response.chunk().await.map_err(ApiError::from)? {
-            file.write_all(&chunk)
-                .await
-                .map_err(|source| SyncError::io(part, source))?;
-            received += chunk.len() as u64;
-            if let Some(progress) = progress {
-                progress.report(received);
-            }
-        }
-        file.flush()
-            .await
-            .map_err(|source| SyncError::io(part, source))?;
-        Ok(received)
+        stream_body(&mut response, &mut file, part, 0, progress).await
     }
     .await;
     if result.is_err() {
@@ -210,10 +196,37 @@ async fn stream_to_part(
     result
 }
 
-/// Chunked download: repeated `Range` GETs, each appended to the `.part`
-/// file, until the reported size is reached. A server that ignores the
-/// `Range` header (HTTP 200 with the whole body) is handled gracefully.
-/// Each appended chunk is reported to `progress`.
+/// Streams a response body into `file` (open at `part`, already holding
+/// `base` bytes), reporting `base + received` to `progress` after every
+/// network chunk; flushes and returns the new length.
+async fn stream_body(
+    response: &mut reqwest::Response,
+    file: &mut tokio::fs::File,
+    part: &Path,
+    base: u64,
+    progress: Option<&TransferHandle>,
+) -> Result<u64, SyncError> {
+    use tokio::io::AsyncWriteExt;
+    let mut length = base;
+    while let Some(chunk) = response.chunk().await.map_err(ApiError::from)? {
+        file.write_all(&chunk)
+            .await
+            .map_err(|source| SyncError::io(part, source))?;
+        length += chunk.len() as u64;
+        if let Some(progress) = progress {
+            progress.report(length);
+        }
+    }
+    file.flush()
+        .await
+        .map_err(|source| SyncError::io(part, source))?;
+    Ok(length)
+}
+
+/// Chunked download: repeated `Range` GETs, each streamed onto the end of
+/// the `.part` file, until the reported size is reached. A server that
+/// ignores the `Range` header (HTTP 200 with the whole body) is handled
+/// gracefully. Progress is reported per network chunk, not per range.
 async fn chunked_download<P: TokenProvider>(
     dav: &WebDavClient<P>,
     path: &str,
@@ -259,33 +272,32 @@ async fn chunked_download<P: TokenProvider>(
                     .map_err(|source| SyncError::io(target, join_error(source)))??;
             return Ok(local.map(|local| (etag, local)));
         }
-        let bytes = response.bytes().await.map_err(ApiError::from)?;
-        if bytes.is_empty() {
+        // Opened per range (not held across the loop) so the HTTP-200
+        // fallback above can start a fresh part file.
+        let mut response = response;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&part)
+            .await
+            .map_err(|source| SyncError::io(&part, source))?;
+        let written = stream_body(&mut response, &mut file, &part, offset, progress).await?;
+        drop(file);
+        if written == offset {
             return Err(SyncError::Api(ApiError::protocol(format!(
                 "empty range response for '{path}' at offset {offset}"
             ))));
         }
-        let chunk_part = part.clone();
-        let written = tokio::task::spawn_blocking(move || -> Result<u64, SyncError> {
-            append_chunk(&chunk_part, &bytes)?;
-            let length = std::fs::metadata(&chunk_part)
-                .map_err(|source| SyncError::io(&chunk_part, source))?;
-            Ok(length.len())
-        })
-        .await
-        .map_err(|source| SyncError::io(target, join_error(source)))??;
         if written > size {
             return Err(SyncError::Api(ApiError::protocol(format!(
                 "download of '{path}' delivered {written} bytes, expected {size}"
             ))));
         }
         offset = written;
-        if let Some(progress) = progress {
-            progress.report(written);
-        }
     }
 
-    let actual = std::fs::metadata(&part)
+    let actual = tokio::fs::metadata(&part)
+        .await
         .map(|meta| meta.len())
         .map_err(|source| SyncError::io(&part, source))?;
     if actual != size {
@@ -394,18 +406,6 @@ fn finish_atomic(
     }
     std::fs::rename(part, target).map_err(|source| SyncError::io(part, source))?;
     file_node(target).map(Some)
-}
-
-/// Appends one chunk to the `.part` file.
-fn append_chunk(part: &Path, bytes: &[u8]) -> Result<(), SyncError> {
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(part)
-        .map_err(|source| SyncError::io(part, source))?;
-    file.write_all(bytes)
-        .map_err(|source| SyncError::io(part, source))
 }
 
 /// Local metadata of a file as [`LocalNode`].
@@ -550,14 +550,5 @@ mod tests {
                 .expect("write")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn append_chunk_extends_the_part_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let part = dir.path().join("a.txt.part");
-        append_chunk(&part, b"abc").expect("append");
-        append_chunk(&part, b"de").expect("append");
-        assert_eq!(std::fs::read(&part).expect("read"), b"abcde");
     }
 }

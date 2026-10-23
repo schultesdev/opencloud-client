@@ -1,7 +1,7 @@
 //! The "Sync-Jobs" tab: job cards with status, progress, and actions,
 //! the error log, space names, and the removal dialog.
 
-use super::format::{format_bytes, format_eta, format_unix, initial_of};
+use super::format::{format_bytes, format_eta, format_speed, format_unix, initial_of};
 use super::*;
 
 impl SyncApp {
@@ -226,26 +226,22 @@ impl SyncApp {
             });
 
             if state.running {
-                if let Some(progress) = state.progress.filter(|p| p.transfers_total > 0) {
+                if let Some(progress) = state.progress.as_ref().filter(|p| p.transfers_total > 0) {
                     let remaining = progress.bytes_total.saturating_sub(progress.bytes_done);
-                    let speed = state.speed_bps;
-                    let label = format!(
+                    let mut label = format!(
                         "{} von {} Dateien · {} / {}",
                         progress.transfers_done,
                         progress.transfers_total,
                         format_bytes(progress.bytes_done),
                         format_bytes(progress.bytes_total),
                     );
-                    let label = if speed >= 1.0 {
-                        let eta = Duration::from_secs((remaining as f64 / speed) as u64);
-                        format!(
-                            "{label} · {}/s · noch {}",
-                            format_bytes(speed as u64),
+                    if let Some(eta) = state.speed.eta(remaining) {
+                        label.push_str(&format!(
+                            " · {} · noch {}",
+                            format_speed(state.speed.bps()),
                             format_eta(eta)
-                        )
-                    } else {
-                        label
-                    };
+                        ));
+                    }
                     ui.add_space(8.0);
                     ui.add(
                         egui::ProgressBar::new(progress.fraction())
@@ -254,17 +250,25 @@ impl SyncApp {
                             .corner_radius(egui::CornerRadius::same(5))
                             .text(egui::RichText::new(label).small().color(theme.text)),
                     );
-                }
-                if !state.transfers.is_empty() {
-                    theme::ellipsis(
-                        ui,
-                        egui::RichText::new(format!("Aktuell: {}", state.transfers.join(", ")))
-                            .small()
-                            .color(theme.accent),
-                    );
+                    ui.add_space(4.0);
+                    for transfer in &progress.active {
+                        let speed = state
+                            .file_speeds
+                            .get(&transfer.path)
+                            .map(SpeedEstimate::bps)
+                            .unwrap_or(0.0);
+                        show_transfer_row(ui, transfer, speed);
+                    }
+                    let pending = progress.pending();
+                    if pending > 0 {
+                        ui.label(
+                            egui::RichText::new(format!("noch {pending} wartend"))
+                                .small()
+                                .color(theme.text_dim),
+                        );
+                    }
                 }
             }
-
             if !details.is_empty() || state.last_summary.is_some() {
                 theme::divider(ui);
                 if !details.is_empty() {
@@ -347,4 +351,53 @@ impl SyncApp {
                 });
             });
     }
+}
+
+/// One running transfer under the job's progress bar: direction arrow,
+/// ellipsized path, mini bar, and `done / total · speed`. The fixed parts
+/// are laid out from the right so only the path shrinks.
+fn show_transfer_row(ui: &mut egui::Ui, transfer: &oc_sync::TransferProgress, speed: f64) {
+    let theme = theme::palette();
+    let up = transfer.direction == TransferDirection::Upload;
+    let color = if up { theme.accent } else { theme.success };
+    // The planned size comes from the scan; the file may have grown since,
+    // so the fraction is clamped and an unknown size (0) shows no bar fill.
+    let fraction = if transfer.bytes_total > 0 {
+        (transfer.bytes_done as f64 / transfer.bytes_total as f64).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
+    let mut text = if transfer.bytes_total > 0 {
+        format!(
+            "{} / {}",
+            format_bytes(transfer.bytes_done),
+            format_bytes(transfer.bytes_total)
+        )
+    } else {
+        format_bytes(transfer.bytes_done)
+    };
+    if speed >= 1.0 {
+        text.push_str(&format!(" · {}", format_speed(speed)));
+    }
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Fixed width keeps the bar from drifting as the numbers grow.
+            ui.add_sized(
+                [190.0, ui.spacing().interact_size.y],
+                egui::Label::new(egui::RichText::new(text).small().color(theme.text_dim))
+                    .truncate(),
+            );
+            theme::mini_bar(ui, fraction, color);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                theme::arrow(ui, up, color);
+                theme::ellipsis(
+                    ui,
+                    egui::RichText::new(&transfer.path)
+                        .small()
+                        .color(theme.text),
+                )
+                .on_hover_text(&transfer.path);
+            });
+        });
+    });
 }

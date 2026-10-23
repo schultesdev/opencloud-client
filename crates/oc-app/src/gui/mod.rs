@@ -19,6 +19,7 @@ mod conflicts;
 mod format;
 mod jobs;
 mod settings;
+mod speed;
 mod theme;
 mod tray;
 mod wizard;
@@ -50,14 +51,18 @@ use oc_sync::EngineEvent;
 use oc_sync::JobCommand;
 use oc_sync::RunProgress;
 use oc_sync::RunSummary;
+use oc_sync::TransferDirection;
 
 use crate::gui::backend::BackendEvent;
 use crate::gui::backend::BackendHandle;
 use crate::gui::backend::JobSnapshot;
 use crate::gui::backend::UiCommand;
 use crate::gui::format::format_bytes;
+use crate::gui::format::format_eta_coarse;
+use crate::gui::speed::SpeedEstimate;
 use crate::gui::tray::Tray;
 use crate::gui::tray::TrayAction;
+use crate::gui::tray::TrayStatus;
 use crate::gui::wizard::Mode;
 use crate::gui::wizard::Wizard;
 use crate::gui::wizard::derive_include;
@@ -105,15 +110,22 @@ struct JobUi {
     stats: Option<Stats>,
     /// Pending conflicts (refreshed once a second).
     conflicts: Vec<Conflict>,
-    /// Entries currently transferring (from the last stats refresh).
-    transfers: Vec<String>,
     /// Live progress of the running pass (progress events).
     progress: Option<RunProgress>,
-    /// Bytes and arrival time of the last progress event — the basis
-    /// of the speed estimate.
-    progress_at: Option<(u64, Instant)>,
-    /// Smoothed transfer speed in bytes/s (exponential average).
-    speed_bps: f64,
+    /// Speed of the whole pass, from the progress events.
+    speed: SpeedEstimate,
+    /// Speed of each running transfer, by path; pruned to the transfers
+    /// the last event listed.
+    file_speeds: HashMap<String, SpeedEstimate>,
+}
+
+impl JobUi {
+    /// Forgets the live progress of a pass (it ended or never started).
+    fn clear_progress(&mut self) {
+        self.progress = None;
+        self.speed = SpeedEstimate::default();
+        self.file_speeds.clear();
+    }
 }
 
 /// Form state for a new account.
@@ -325,16 +337,13 @@ impl SyncApp {
             EngineEvent::RunStarted { job_id } => {
                 let state = self.job_states.entry(job_id).or_default();
                 state.running = true;
-                state.progress = None;
-                state.progress_at = None;
-                state.speed_bps = 0.0;
+                state.clear_progress();
             }
             EngineEvent::Offline { job_id, retry_in } => {
                 let state = self.job_states.entry(job_id.clone()).or_default();
                 state.offline = true;
                 state.running = false;
-                state.progress = None;
-                state.speed_bps = 0.0;
+                state.clear_progress();
                 self.notify(format!(
                     "Server nicht erreichbar ('{job_id}'): neuer Versuch in {} s",
                     retry_in.as_secs()
@@ -348,31 +357,23 @@ impl SyncApp {
             EngineEvent::Progress { job_id, progress } => {
                 let state = self.job_states.entry(job_id).or_default();
                 let now = Instant::now();
-                if let Some((previous, at)) = state.progress_at {
-                    // Bytes can briefly regress on a retried transfer;
-                    // only rising samples feed the speed estimate.
-                    let gain = progress.bytes_done.saturating_sub(previous);
-                    let elapsed = now.duration_since(at).as_secs_f64();
-                    if gain > 0 && elapsed > 0.05 {
-                        let rate = gain as f64 / elapsed;
-                        state.speed_bps = if state.speed_bps == 0.0 {
-                            rate
-                        } else {
-                            // Smoothed average: new samples shift it
-                            // by 40%.
-                            state.speed_bps * 0.6 + rate * 0.4
-                        };
-                    }
+                state.speed.observe(progress.bytes_done, now);
+                state
+                    .file_speeds
+                    .retain(|path, _| progress.active.iter().any(|t| &t.path == path));
+                for transfer in &progress.active {
+                    state
+                        .file_speeds
+                        .entry(transfer.path.clone())
+                        .or_default()
+                        .observe(transfer.bytes_done, now);
                 }
-                state.progress_at = Some((progress.bytes_done, now));
                 state.progress = Some(progress);
             }
             EngineEvent::RunFinished { job_id, summary } => {
                 let state = self.job_states.entry(job_id).or_default();
                 state.running = false;
-                state.progress = None;
-                state.progress_at = None;
-                state.speed_bps = 0.0;
+                state.clear_progress();
                 state.last_summary = Some(summary);
             }
             EngineEvent::Failed {
@@ -457,7 +458,6 @@ impl SyncApp {
             let state = self.job_states.entry(snapshot.job_id).or_default();
             state.stats = snapshot.stats;
             state.conflicts = snapshot.conflicts;
-            state.transfers = snapshot.transfers;
         }
     }
 
@@ -490,9 +490,24 @@ impl SyncApp {
         }
     }
 
-    /// Updates the tray tooltip from the current job states.
+    /// Updates the tray tooltip from the current job states: running
+    /// passes are summed up (files done/planned, remaining bytes at the
+    /// combined speed).
     fn update_tray_status(&mut self) {
         let running = self.job_states.values().any(|state| state.running);
+        let mut files = (0usize, 0usize);
+        let mut remaining = 0u64;
+        let mut speed = 0.0f64;
+        for state in self.job_states.values().filter(|state| state.running) {
+            if let Some(progress) = state.progress.as_ref().filter(|p| p.transfers_total > 0) {
+                files.0 += progress.transfers_done;
+                files.1 += progress.transfers_total;
+                remaining += progress.bytes_total.saturating_sub(progress.bytes_done);
+                speed += state.speed.bps();
+            }
+        }
+        let eta = (speed >= 1.0 && files.1 > 0)
+            .then(|| format_eta_coarse(Duration::from_secs_f64(remaining as f64 / speed)));
         let errors: u64 = self
             .job_states
             .values()
@@ -504,7 +519,13 @@ impl SyncApp {
             .filter_map(|state| state.stats.map(|stats| stats.conflicts))
             .sum();
         if let Some(tray) = &mut self.tray {
-            tray.set_status(running, errors, conflicts);
+            tray.set_status(&TrayStatus {
+                running,
+                files: (files.1 > 0).then_some(files),
+                eta,
+                errors,
+                conflicts,
+            });
         }
     }
 

@@ -38,7 +38,7 @@ pub use diff::SyncAction;
 pub use engine::{Engine, EngineEvent, EngineOptions, Job, JobCommand, RunSummary};
 pub use error::SyncError;
 pub use filter::Filter;
-pub use progress::{RunProgress, TransferHandle};
+pub use progress::{RunProgress, TransferDirection, TransferHandle, TransferProgress};
 pub use scan::{LocalNode, RemoteNode, RemoteSnapshot, ServerNames};
 pub use transfer::{LocalGuard, TransferMeta, TransferPaths, TransferResult};
 pub use watch::LocalWatcher;

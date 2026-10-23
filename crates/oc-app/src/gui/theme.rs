@@ -319,12 +319,7 @@ pub fn quota_bar(ui: &mut Ui, used: u64, total: Option<u64>, format: impl Fn(u64
                 } else {
                     theme.accent
                 };
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(120.0, 6.0), egui::Sense::hover());
-                let painter = ui.painter();
-                painter.rect_filled(rect, theme.corner(3), theme.card_stroke);
-                let mut filled = rect;
-                filled.set_width((rect.width() * fraction).max(if used > 0 { 3.0 } else { 0.0 }));
-                painter.rect_filled(filled, theme.corner(3), color);
+                mini_bar(ui, fraction, color);
                 ui.label(
                     RichText::new(format!("{} / {}", format(used), format(total)))
                         .small()
@@ -340,6 +335,38 @@ pub fn quota_bar(ui: &mut Ui, used: u64, total: Option<u64>, format: impl Fn(u64
             }
         }
     });
+}
+
+/// A thin painted progress bar (120×6 px) filled to `fraction`
+/// (`0.0`–`1.0`); a started but tiny fraction still shows a sliver.
+pub fn mini_bar(ui: &mut Ui, fraction: f32, color: Color32) {
+    let theme = palette();
+    let fraction = if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(120.0, 6.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, theme.corner(3), theme.card_stroke);
+    let mut filled = rect;
+    filled.set_width((rect.width() * fraction).max(if fraction > 0.0 { 3.0 } else { 0.0 }));
+    painter.rect_filled(filled, theme.corner(3), color);
+}
+
+/// A small painted triangle pointing up (`up`) or down — the direction
+/// of a transfer. Painted, like [`dot`]: the bundled fonts have no
+/// reliable arrow glyphs.
+pub fn arrow(ui: &mut Ui, up: bool, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
+    let rect = rect.shrink(2.0);
+    let points = if up {
+        vec![rect.left_bottom(), rect.center_top(), rect.right_bottom()]
+    } else {
+        vec![rect.left_top(), rect.center_bottom(), rect.right_top()]
+    };
+    ui.painter()
+        .add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
 }
 
 /// A small rounded square with the initial of a name (space/account).

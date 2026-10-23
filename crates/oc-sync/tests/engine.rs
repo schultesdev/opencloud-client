@@ -105,6 +105,9 @@ fn test_options() -> EngineOptions {
         propfind_pause: Duration::ZERO,
         offline_backoff_base: Duration::from_millis(100),
         offline_backoff_cap: Duration::from_millis(400),
+        // Every progress report becomes an event, so tests can assert on
+        // in-flight snapshots deterministically.
+        progress_interval: Duration::ZERO,
     }
 }
 
@@ -320,12 +323,12 @@ async fn run_reports_live_transfer_progress() {
     assert_eq!(summary.uploads, 2);
     assert_eq!(summary.errors, 0);
 
-    // The run published its plan (2 files, 6 bytes) and, throttled, its
-    // progress up to the completed state.
+    // The run published its plan (2 files, 6 bytes), the running
+    // uploads with their bytes, and the completed state.
     let progress: Vec<oc_sync::RunProgress> = events
         .iter()
         .filter_map(|event| match event {
-            EngineEvent::Progress { progress, .. } => Some(*progress),
+            EngineEvent::Progress { progress, .. } => Some(progress.clone()),
             _ => None,
         })
         .collect();
@@ -334,18 +337,41 @@ async fn run_reports_live_transfer_progress() {
         progress.first(),
         Some(&oc_sync::RunProgress {
             transfers_total: 2,
-            transfers_done: 0,
             bytes_total: 6,
-            bytes_done: 0,
+            ..oc_sync::RunProgress::default()
         })
+    );
+    let active: Vec<&oc_sync::TransferProgress> =
+        progress.iter().flat_map(|p| p.active.iter()).collect();
+    assert!(
+        active.iter().any(|t| t.path == "a.txt"
+            && t.direction == oc_sync::TransferDirection::Upload
+            && t.bytes_total == 4
+            && t.bytes_done <= 4),
+        "expected a.txt among the running uploads: {active:?}"
+    );
+    assert!(
+        active
+            .iter()
+            .any(|t| t.path == "b.txt" && t.bytes_total == 2),
+        "expected b.txt among the running uploads: {active:?}"
+    );
+    // Bytes never regress while transfers finish concurrently.
+    assert!(
+        progress
+            .windows(2)
+            .all(|w| w[0].bytes_done <= w[1].bytes_done),
+        "bytes_done regressed: {progress:?}"
     );
     assert_eq!(
         progress.last(),
         Some(&oc_sync::RunProgress {
             transfers_total: 2,
             transfers_done: 2,
+            transfers_failed: 0,
             bytes_total: 6,
             bytes_done: 6,
+            active: vec![],
         })
     );
     engine.stop().await;
@@ -760,7 +786,7 @@ async fn large_downloads_arrive_in_range_chunks() {
         .await;
 
     let mut engine = f.engine(test_options());
-    let (summary, _) = next_run(&mut engine).await;
+    let (summary, events) = next_run(&mut engine).await;
     assert_eq!(summary.downloads, 1);
     assert_eq!(summary.errors, 0);
     f.server.verify().await;
@@ -769,6 +795,22 @@ async fn large_downloads_arrive_in_range_chunks() {
         "0123456789"
     );
     assert!(!f.root.join("big.bin.part").exists());
+
+    // The live view saw the download in flight, with per-chunk bytes.
+    let seen: Vec<(u64, u64)> = events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::Progress { progress, .. } => Some(progress),
+            _ => None,
+        })
+        .flat_map(|p| p.active.iter())
+        .filter(|t| t.path == "big.bin" && t.direction == oc_sync::TransferDirection::Download)
+        .map(|t| (t.bytes_done, t.bytes_total))
+        .collect();
+    assert!(
+        seen.contains(&(4, 10)) || seen.contains(&(8, 10)),
+        "expected a mid-download snapshot of big.bin: {seen:?}"
+    );
     engine.stop().await;
 }
 

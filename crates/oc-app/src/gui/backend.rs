@@ -21,7 +21,7 @@ use std::time::Duration;
 use oc_api::{DavResource, Depth, GraphClient, Space, WebDavClient};
 use oc_auth::{AuthClient, DEFAULT_LOGIN_TIMEOUT, KeyringStore, TokenManager};
 use oc_config::{Config, Jobs, SyncJob};
-use oc_db::{Conflict, ConflictResolution, EntryState, Stats, StatusDb, db_path};
+use oc_db::{Conflict, ConflictResolution, Stats, StatusDb, db_path};
 use oc_sync::{Engine, EngineEvent, EngineOptions, Job, JobCommand};
 use tokio::sync::mpsc;
 
@@ -103,8 +103,6 @@ pub struct JobSnapshot {
     pub stats: Option<Stats>,
     /// Pending conflicts.
     pub conflicts: Vec<Conflict>,
-    /// Paths currently transferring (a few, for display).
-    pub transfers: Vec<String>,
     /// Why the database could not be read, if it could not.
     pub error: Option<String>,
 }
@@ -442,11 +440,16 @@ async fn restart_engine(
 }
 
 /// Forwards engine events into the GUI's event channel until the engine
-/// stops (channel closed). Every event also goes to the process log.
+/// stops (channel closed). Every event also goes to the process log —
+/// the frequent progress snapshots at debug level only.
 fn spawn_forwarder(mut events: mpsc::UnboundedReceiver<EngineEvent>, gui: GuiSink) {
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
-            tracing::info!("{event}");
+            if matches!(event, EngineEvent::Progress { .. }) {
+                tracing::debug!("{event}");
+            } else {
+                tracing::info!("{event}");
+            }
             if !gui.send(BackendEvent::Engine(event)) {
                 break;
             }
@@ -501,13 +504,6 @@ fn read_snapshots(backend: &Backend, job_ids: &[String]) -> Vec<JobSnapshot> {
         let read = (|| -> Result<(), oc_db::DbError> {
             snapshot.stats = Some(db.stats()?);
             snapshot.conflicts = db.pending_conflicts()?;
-            for state in [EntryState::Uploading, EntryState::Downloading] {
-                snapshot.transfers.extend(
-                    db.entries_with_state(state, 8)?
-                        .into_iter()
-                        .map(|entry| entry.entry.path),
-                );
-            }
             Ok(())
         })();
         if let Err(error) = read {

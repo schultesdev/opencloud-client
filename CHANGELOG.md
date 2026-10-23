@@ -384,3 +384,32 @@ versioning follows [Semantic Versioning](https://semver.org/).
 - `oc-app`: `gui/mod.rs` ist aufgeteilt in `accounts.rs`, `jobs.rs`,
   `conflicts.rs`, `settings.rs`, `wizard_view.rs` und `format.rs`; der
   Leerzustand der Tabs ist ein gemeinsamer Baustein (`theme::empty_state`).
+
+### Added (GUI — Transferdetails)
+
+- Jobkarte während eines Laufs: unter dem Fortschrittsbalken eine Zeile je
+  laufendem Transfer mit Richtung (Pfeil hoch/runter), Pfad, Mini-Balken,
+  „übertragen / Größe“ und der Geschwindigkeit dieser Datei; darunter
+  „noch N wartend“. Die Zeilen zeigen nur wirklich laufende Transfers
+  (höchstens `max_parallel_transfers`), nicht mehr die eingereihten.
+- `RunProgress` führt die laufenden Transfers (`active`: Pfad, Richtung,
+  Bytes, Größe) und die abgebrochenen (`transfers_failed`) mit; neue Typen
+  `TransferProgress`/`TransferDirection` in `oc-sync`.
+- Tray-Tooltip nennt bei laufender Synchronisation Dateizähler und
+  Restzeit („12/40 Dateien · noch 2 min“, auf Minuten gerundet).
+- `EngineOptions::progress_interval` (Standard 200 ms) steuert die
+  Drosselung der Fortschritts-Events; Tests setzen 0 und prüfen Snapshots
+  laufender Transfers deterministisch.
+
+### Fixed (Transferfortschritt)
+
+- „X von Y Dateien“ zählt einen Transfer, sobald er fertig ist — nicht erst,
+  wenn die Engine in Planreihenfolge bei ihm ankommt.
+- Die Byte-Anzeige kann beim Abschluss paralleler Transfers nicht mehr kurz
+  zurückspringen (Abschluss und Zählung unter demselben Lock).
+- Chunked Downloads melden den Fortschritt je Netzwerk-Paket statt einmal
+  pro 8-MiB-Range; die Ranges werden direkt in die `.part`-Datei gestreamt
+  statt im Speicher gepuffert.
+- Nach einem fehlgeschlagenen Transfer geht „noch N wartend“ auf 0.
+- Fortschritts-Events werden nur noch auf `debug` geloggt; die
+  einmal pro Sekunde aus der Datenbank gelesene Liste „Aktuell: …“ entfällt.

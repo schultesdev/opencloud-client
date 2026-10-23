@@ -115,7 +115,7 @@ pub fn build(
 
     let mut actions = Vec::new();
     for path in paths {
-        if frozen.contains(path) {
+        if is_frozen(path, frozen) {
             continue;
         }
         let l = local.get(path).copied();
@@ -129,7 +129,25 @@ pub fn build(
         }
     }
 
-    keep_folders_of_conflicts(actions, frozen)
+    keep_folders_with_content(actions, frozen)
+}
+
+/// Whether `path` or one of its ancestor folders is frozen by an open
+/// conflict — nothing below a conflicted folder is touched either.
+fn is_frozen(path: &str, frozen: &HashSet<String>) -> bool {
+    if frozen.is_empty() {
+        return false;
+    }
+    let mut current = path;
+    loop {
+        if frozen.contains(current) {
+            return true;
+        }
+        match current.rsplit_once('/') {
+            Some((parent, _)) => current = parent,
+            None => return false,
+        }
+    }
 }
 
 /// Classification for a path without a DB entry (new on one or both sides).
@@ -286,26 +304,46 @@ fn remote_changed(node: &RemoteNode, entry: &NewEntry) -> bool {
     }
 }
 
-/// Prevents deleting a folder that still contains a conflicted path: the
-/// conflicted files must stay until Phase 6 resolves them.
-fn keep_folders_of_conflicts(
+/// Prevents a folder deletion from destroying content that must survive
+/// it: conflicted paths (open or new), and new or changed files and
+/// folders planned for transfer below the folder. Deleting the folder
+/// first would remove them — the plan runs in path order, so `d` comes
+/// before `d/new.txt`.
+///
+/// Instead of the deletion, the folder is re-created on the side where it
+/// was deleted (`DeleteLocal` → `MkcolRemote`, `DeleteRemote` →
+/// `MkcolLocal`), so the surviving children have a parent to land in.
+/// Unchanged children still follow the deletion.
+fn keep_folders_with_content(
     actions: Vec<SyncAction>,
     frozen: &HashSet<String>,
 ) -> Vec<SyncAction> {
-    let mut protected: Vec<String> = frozen.iter().cloned().collect();
+    let mut protected: BTreeSet<String> = frozen.iter().cloned().collect();
     protected.extend(actions.iter().filter_map(|action| match action {
-        SyncAction::Conflict { path, .. } => Some(path.clone()),
+        SyncAction::Conflict { path, .. }
+        | SyncAction::Upload { path, .. }
+        | SyncAction::Download { path, .. }
+        | SyncAction::MkcolRemote { path }
+        | SyncAction::MkcolLocal { path } => Some(path.clone()),
         _ => None,
     }));
+    let has_protected_child = |path: &str| {
+        let prefix = format!("{path}/");
+        protected
+            .range(prefix.clone()..)
+            .next()
+            .is_some_and(|candidate| candidate.starts_with(&prefix))
+    };
     actions
         .into_iter()
-        .filter(|action| match action {
-            SyncAction::DeleteLocal { path, is_dir: true }
-            | SyncAction::DeleteRemote { path, is_dir: true } => {
-                let prefix = format!("{path}/");
-                !protected.iter().any(|p| p.starts_with(&prefix))
+        .map(|action| match action {
+            SyncAction::DeleteLocal { path, is_dir: true } if has_protected_child(&path) => {
+                SyncAction::MkcolRemote { path }
             }
-            _ => true,
+            SyncAction::DeleteRemote { path, is_dir: true } if has_protected_child(&path) => {
+                SyncAction::MkcolLocal { path }
+            }
+            other => other,
         })
         .collect()
 }
@@ -608,6 +646,151 @@ mod tests {
         assert!(
             plan.iter()
                 .any(|a| matches!(a, SyncAction::Conflict { path, .. } if path == "d/x.txt"))
+        );
+    }
+
+    fn dir_entry(path: &str) -> NewEntry {
+        NewEntry {
+            path: path.to_owned(),
+            is_dir: true,
+            local_mtime: Some(1),
+            local_size: None,
+            remote_etag: None,
+            remote_size: None,
+            checksum: None,
+            last_synced_at: None,
+            state: EntryState::Synced,
+        }
+    }
+
+    fn dir_node() -> LocalNode {
+        LocalNode {
+            is_dir: true,
+            mtime: Some(1),
+            size: None,
+        }
+    }
+
+    #[test]
+    fn remote_folder_deletion_keeps_new_local_children() {
+        // Remote deleted "d"; locally a new file appeared inside it.
+        let local = HashMap::from([
+            ("d".to_owned(), dir_node()),
+            (
+                "d/new.txt".to_owned(),
+                LocalNode {
+                    is_dir: false,
+                    mtime: Some(5),
+                    size: Some(3),
+                },
+            ),
+        ]);
+        let db = HashMap::from([("d".to_owned(), dir_entry("d"))]);
+        let plan = build(&local, &HashMap::new(), &db, &HashSet::new());
+        assert_eq!(
+            plan,
+            vec![
+                SyncAction::MkcolRemote { path: "d".into() },
+                SyncAction::Upload {
+                    path: "d/new.txt".into(),
+                    base_etag: None,
+                    create: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn local_folder_deletion_keeps_new_remote_children() {
+        // Locally deleted "d"; on the server a new file appeared inside it.
+        let remote = HashMap::from([
+            (
+                "d".to_owned(),
+                RemoteNode {
+                    is_dir: true,
+                    etag: Some("\"d\"".into()),
+                    size: None,
+                },
+            ),
+            (
+                "d/new.txt".to_owned(),
+                RemoteNode {
+                    is_dir: false,
+                    etag: Some("\"n\"".into()),
+                    size: Some(3),
+                },
+            ),
+        ]);
+        let db = HashMap::from([("d".to_owned(), dir_entry("d"))]);
+        let plan = build(&HashMap::new(), &remote, &db, &HashSet::new());
+        assert!(matches!(
+            plan.as_slice(),
+            [SyncAction::MkcolLocal { path }, SyncAction::Download { .. }] if path == "d"
+        ));
+    }
+
+    #[test]
+    fn unchanged_children_follow_a_folder_deletion() {
+        // Remote deleted "d" with an unchanged child: the deletion stands.
+        let local = HashMap::from([
+            ("d".to_owned(), dir_node()),
+            (
+                "d/old.txt".to_owned(),
+                LocalNode {
+                    is_dir: false,
+                    mtime: Some(100),
+                    size: Some(10),
+                },
+            ),
+        ]);
+        let mut old = entry("\"e1\"", 100, 10)
+            .remove("a.txt")
+            .expect("seeded entry");
+        old.path = "d/old.txt".into();
+        let db = HashMap::from([
+            ("d".to_owned(), dir_entry("d")),
+            ("d/old.txt".to_owned(), old),
+        ]);
+        let plan = build(&local, &HashMap::new(), &db, &HashSet::new());
+        assert_eq!(
+            plan,
+            vec![
+                SyncAction::DeleteLocal {
+                    path: "d".into(),
+                    is_dir: true,
+                },
+                SyncAction::DeleteLocal {
+                    path: "d/old.txt".into(),
+                    is_dir: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn frozen_folders_freeze_their_subtree() {
+        let local = HashMap::from([(
+            "d/x.txt".to_owned(),
+            LocalNode {
+                is_dir: false,
+                mtime: Some(5),
+                size: Some(3),
+            },
+        )]);
+        let frozen = HashSet::from(["d".to_owned()]);
+        assert!(build(&local, &HashMap::new(), &HashMap::new(), &frozen).is_empty());
+        // A sibling with the same prefix is not frozen.
+        let sibling = HashMap::from([(
+            "dd/x.txt".to_owned(),
+            LocalNode {
+                is_dir: false,
+                mtime: Some(5),
+                size: Some(3),
+            },
+        )]);
+        assert_eq!(
+            build(&sibling, &HashMap::new(), &HashMap::new(), &frozen).len(),
+            1
         );
     }
 }

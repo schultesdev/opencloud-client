@@ -41,7 +41,7 @@ use crate::error::SyncError;
 use crate::scan::LocalNode;
 use crate::scan::RemoteNode;
 use crate::scan::abs_local_path;
-use crate::transfer::{self, TransferResult};
+use crate::transfer::{self, LocalGuard, TransferResult};
 
 /// Outcome of applying a conflict resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +117,18 @@ async fn resolve_server<P: TokenProvider>(
         etag: Some(etag),
         size: conflict.remote_size,
     };
-    match transfer::download(dav, local_root, &conflict.path, &remote, chunk_size, None).await? {
+    // The user (or policy) chose the server side: overwrite unconditionally.
+    match transfer::download(
+        dav,
+        local_root,
+        &conflict.path,
+        &remote,
+        chunk_size,
+        LocalGuard::Any,
+        None,
+    )
+    .await?
+    {
         TransferResult::Done(meta) => {
             record_resolved(
                 db,
@@ -128,10 +139,11 @@ async fn resolve_server<P: TokenProvider>(
             )?;
             Ok(ResolveOutcome::Resolved)
         }
-        // Downloads carry no write condition; this cannot happen.
-        TransferResult::PreconditionFailed => Err(SyncError::Api(ApiError::protocol(
-            "download was rejected by a write condition",
-        ))),
+        // Downloads carry no write condition, and `Any` never keeps the
+        // local file; neither can happen.
+        TransferResult::PreconditionFailed | TransferResult::LocalChanged => Err(SyncError::Api(
+            ApiError::protocol("download was rejected by a write condition"),
+        )),
     }
 }
 
@@ -176,6 +188,10 @@ async fn resolve_local<P: TokenProvider>(
             )?;
             Ok(ResolveOutcome::Resolved)
         }
+        // Uploads never report local changes.
+        TransferResult::LocalChanged => Err(SyncError::Api(ApiError::protocol(
+            "upload reported a local change",
+        ))),
         // The server changed again: record its current state on the
         // pending row; the user resolves anew with fresh information.
         TransferResult::PreconditionFailed => {

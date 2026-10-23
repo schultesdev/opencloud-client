@@ -16,6 +16,7 @@ mod logging;
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
@@ -97,7 +98,10 @@ async fn main() {
     }
     let config_dir = args.config_dir.as_deref();
     let result = match (args.login.as_deref(), args.list_spaces.as_deref()) {
-        (Some(account_id), _) => run_login(account_id, config_dir).await,
+        (Some(account_id), _) => match run_login(account_id, config_dir).await {
+            Ok(()) if args.headless => run_headless(config_dir).await,
+            other => other,
+        },
         (None, Some(account_id)) => run_list_spaces(account_id, config_dir).await,
         (None, None) => {
             if let Some([target, winner, ..]) = args.resolve.as_deref() {
@@ -382,8 +386,32 @@ async fn run_headless(config_dir: Option<&std::path::Path>) -> Result<(), Box<dy
         .map(|account| (account.id.as_str(), account))
         .collect();
 
+    let enabled = oc_config::Jobs {
+        version: jobs.version,
+        jobs: jobs
+            .jobs
+            .iter()
+            .filter(|job| job.enabled)
+            .cloned()
+            .collect(),
+    };
+    let mut overlapping: HashMap<String, String> = HashMap::new();
+    for (a, b) in enabled.overlapping() {
+        overlapping.insert(a.id.clone(), b.id.clone());
+        overlapping.insert(b.id.clone(), a.id.clone());
+    }
+    // One token manager per account, shared by its jobs: separate
+    // managers would refresh with the same (rotating) refresh token.
+    let mut managers: HashMap<String, Arc<TokenManager<KeyringStore>>> = HashMap::new();
     let mut engine_jobs = Vec::new();
-    for job in jobs.jobs.iter().filter(|job| job.enabled) {
+    for job in &enabled.jobs {
+        if let Some(other) = overlapping.get(&job.id) {
+            eprintln!(
+                "skipping job '{}': its local folder overlaps with job '{other}'",
+                job.id
+            );
+            continue;
+        }
         let account = match accounts.get(job.account_id.as_str()) {
             Some(account) => *account,
             None => {
@@ -394,8 +422,15 @@ async fn run_headless(config_dir: Option<&std::path::Path>) -> Result<(), Box<dy
                 continue;
             }
         };
-        let auth = AuthClient::new(&account.server_url)?;
-        let manager = TokenManager::new(auth, KeyringStore::new(), &account.id);
+        let manager = match managers.get(&account.id) {
+            Some(manager) => manager.clone(),
+            None => {
+                let auth = AuthClient::new(&account.server_url)?;
+                let manager = Arc::new(TokenManager::new(auth, KeyringStore::new(), &account.id));
+                managers.insert(account.id.clone(), manager.clone());
+                manager
+            }
+        };
         if !manager.has_stored_login() {
             eprintln!(
                 "skipping job '{}': account '{}' has no stored login (log in first)",
@@ -405,6 +440,12 @@ async fn run_headless(config_dir: Option<&std::path::Path>) -> Result<(), Box<dy
         }
         let dav = oc_api::WebDavClient::new(&account.server_url, &job.space_id, manager)?;
         let db = StatusDb::open(db_path(&config_dir, &job.id)?)?;
+        if db.ensure_identity(&job.identity())? {
+            eprintln!(
+                "job '{}': its status database belonged to another space or folder and was reset",
+                job.id
+            );
+        }
         engine_jobs.push(oc_sync::Job::new(
             &job.id,
             job.local_path.clone(),

@@ -36,11 +36,30 @@ fn default_enabled() -> bool {
 }
 
 impl SyncJob {
+    /// What the job's status database describes: account, space, and
+    /// local root. A database recorded for another identity must not be
+    /// reused (see `oc_db::StatusDb::ensure_identity`).
+    pub fn identity(&self) -> String {
+        format!(
+            "{}\n{}\n{}",
+            self.account_id,
+            self.space_id,
+            self.local_path.display()
+        )
+    }
+
     /// Validates the job: non-empty ids, absolute `local_path`, and valid
     /// `include`/`exclude` patterns.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.id.trim().is_empty() {
             return Err(ConfigError::invalid("job.id must not be empty"));
+        }
+        // The id names the job's status database file (`db/<id>.sqlite`).
+        if matches!(self.id.as_str(), "." | "..") || self.id.contains(['/', '\\', '\0', ':']) {
+            return Err(ConfigError::invalid(format!(
+                "job id '{}' must be a plain file name (no '/', '\\', ':' or '..')",
+                self.id
+            )));
         }
         if self.account_id.trim().is_empty() {
             return Err(ConfigError::invalid(format!(
@@ -122,6 +141,68 @@ impl Jobs {
         }
         Ok(())
     }
+
+    /// Pairs of jobs whose local folders are the same or nested in each
+    /// other. Two jobs mirroring one local tree into different spaces
+    /// would carry each other's uploads and deletions across spaces.
+    /// Comparison is by path components; on macOS and Windows (usually
+    /// case-insensitive filesystems) without regard to case.
+    pub fn overlapping(&self) -> Vec<(&SyncJob, &SyncJob)> {
+        let keys: Vec<Vec<String>> = self
+            .jobs
+            .iter()
+            .map(|job| path_key(&job.local_path))
+            .collect();
+        let mut pairs = Vec::new();
+        for (i, a) in keys.iter().enumerate() {
+            for (j, b) in keys.iter().enumerate().skip(i + 1) {
+                if a.starts_with(b) || b.starts_with(a) {
+                    pairs.push((&self.jobs[i], &self.jobs[j]));
+                }
+            }
+        }
+        pairs
+    }
+
+    /// Rejects overlapping local folders (see [`Jobs::overlapping`]).
+    /// Checked on save, so no new overlap can be configured; existing
+    /// files still load, and the engine skips the affected jobs.
+    pub fn validate_paths(&self) -> Result<(), ConfigError> {
+        match self.overlapping().first() {
+            Some((a, b)) => Err(ConfigError::invalid(format!(
+                "local folders of jobs '{}' ('{}') and '{}' ('{}') overlap",
+                a.id,
+                a.local_path.display(),
+                b.id,
+                b.local_path.display()
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Comparable components of a local path: `.` dropped, `..` applied
+/// lexically, case folded on case-insensitive platforms.
+fn path_key(path: &std::path::Path) -> Vec<String> {
+    use std::path::Component;
+    let mut parts: Vec<String> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop();
+            }
+            other => {
+                let text = other.as_os_str().to_string_lossy();
+                parts.push(if cfg!(any(windows, target_os = "macos")) {
+                    text.to_lowercase()
+                } else {
+                    text.into_owned()
+                });
+            }
+        }
+    }
+    parts
 }
 
 #[cfg(test)]

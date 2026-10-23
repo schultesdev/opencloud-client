@@ -40,5 +40,5 @@ pub use error::SyncError;
 pub use filter::Filter;
 pub use progress::{RunProgress, TransferHandle};
 pub use scan::{LocalNode, RemoteNode, RemoteSnapshot};
-pub use transfer::{TransferMeta, TransferResult};
+pub use transfer::{LocalGuard, TransferMeta, TransferResult};
 pub use watch::LocalWatcher;

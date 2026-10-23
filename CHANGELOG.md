@@ -236,3 +236,34 @@ versioning follows [Semantic Versioning](https://semver.org/).
 - Status-Punkte werden gezeichnet statt als Glyphe gesetzt (die
   eingebauten Schriften enthalten kein „●“, es erschien ein leeres
   Kästchen).
+
+### Fixed (Review, Block 1 — Datenverlust-Risiken)
+
+- `oc-sync`: Eine Ordner-Löschung auf einer Seite löscht keine neuen oder
+  geänderten Dateien mehr, die auf der anderen Seite in diesem Ordner
+  liegen. Der Ordner wird stattdessen dort neu angelegt; unveränderte
+  Kinder folgen weiterhin der Löschung.
+- `oc-sync`: Offene Konflikte frieren den ganzen Teilbaum ein, nicht nur
+  den exakten Pfad.
+- `oc-sync`: Ein Download überschreibt keine lokale Datei mehr, die seit
+  dem Scan bearbeitet wurde (`LocalGuard`); ein Upload erkennt Dateien,
+  die während des Lesens geschrieben wurden.
+- `oc-sync`: Der Root-ETag wird nur nach vollständig fehlerfreien Läufen
+  gespeichert, sonst würde der Shortcut fehlgeschlagene Pfade bis zur
+  nächsten Server-Änderung verdecken.
+- `oc-db`: `delete_subtree` nutzt eine exakte Bereichsabfrage statt
+  `LIKE`; `_`, `%` und Groß-/Kleinschreibung trafen bisher fremde Pfade.
+- `oc-db`/`oc-app`: Die Status-DB ist an Konto, Space und lokalen Ordner
+  ihres Jobs gebunden (`ensure_identity`) und wird bei Abweichung
+  zurückgesetzt. Verwaiste DBs gelöschter Jobs werden entfernt, ihre IDs
+  nicht wieder vergeben.
+- `oc-config`: Atomares Schreiben ohne Lösch-Fallback, mit `fsync` und
+  eindeutigem Temp-Namen; eine unlesbare Datei liefert einen Fehler statt
+  stiller Standardwerte.
+- `oc-config`/`oc-app`: Überlappende lokale Ordner zweier Jobs werden beim
+  Speichern abgelehnt und von der Engine übersprungen; Job-IDs müssen
+  gültige Dateinamen sein.
+- `oc-auth`/`oc-app`: Ein Token-Manager pro Konto statt pro Job; ein
+  wegen gleichzeitiger Rotation abgelehnter Refresh-Token meldet das
+  Konto nicht mehr ab.
+- `oc-app`: `--login` mit `--headless` startet nach dem Login die Engine.

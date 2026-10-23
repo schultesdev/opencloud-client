@@ -36,7 +36,7 @@ use crate::progress::RunProgress;
 use crate::progress::RunTracker;
 use crate::progress::TransferHandle;
 use crate::scan::{self, LocalNode, RemoteNode};
-use crate::transfer::{self, TransferResult};
+use crate::transfer::{self, LocalGuard, TransferResult};
 use crate::watch::LocalWatcher;
 
 /// Configuration of a sync job handed to [`Engine::start`].
@@ -572,6 +572,9 @@ enum PendingTransfer {
     Download {
         /// The remote node (ETag/size) as seen by the scan.
         remote: RemoteNode,
+        /// What the local file must still look like when the download
+        /// lands (scan state), so later local edits are not overwritten.
+        guard: LocalGuard,
     },
 }
 
@@ -862,7 +865,8 @@ async fn run_once<P: TokenProvider + 'static>(
             SyncAction::Download { path, remote } => {
                 let _ = mark_state(&job.db, &path, EntryState::Downloading);
                 let planned = planned_bytes(remote.size);
-                let kind = PendingTransfer::Download { remote };
+                let guard = LocalGuard::from_scan(local.get(&path).copied());
+                let kind = PendingTransfer::Download { remote, guard };
                 let (handle, task) = spawn_transfer(
                     job.dav.clone(),
                     job.local_root.clone(),
@@ -915,6 +919,7 @@ async fn run_once<P: TokenProvider + 'static>(
     }
 
     // Transfers ran concurrently; apply their results to the database.
+    let mut rescan_needed = false;
     for (kind, path, planned, handle, task) in transfers {
         let result = match task.await {
             Ok(result) => result,
@@ -962,6 +967,15 @@ async fn run_once<P: TokenProvider + 'static>(
                 };
                 handle_conflict(job, options, events, &mut summary, &sighting).await;
             }
+            Ok(TransferResult::LocalChanged) => {
+                // The local file was edited while the download ran; the
+                // edit is kept and the baseline stays as recorded, so the
+                // next pass sees both sides changed and records a
+                // conflict. Reset the transfer state for that pass.
+                handle.abandon();
+                let _ = mark_state(&job.db, &path, EntryState::Synced);
+                rescan_needed = true;
+            }
             Err(error) => {
                 handle.abandon();
                 let _ = mark_state(&job.db, &path, EntryState::Error);
@@ -970,10 +984,18 @@ async fn run_once<P: TokenProvider + 'static>(
         }
     }
 
-    if let Some(etag) = root_etag {
-        if let Err(error) = db_lock(&job.db).set_meta("space_etag", &etag) {
-            fail(&mut summary, "", &SyncError::from(error));
-        }
+    // The root ETag may only vouch for the recorded state when the pass
+    // applied everything it planned. After a failed or skipped path the
+    // database still holds the old remote state for it; storing the new
+    // ETag would let the shortcut hide the change until something else
+    // changes on the server, so the next pass must traverse again.
+    let complete = summary.errors == 0 && !rescan_needed;
+    let etag_result = match root_etag.filter(|_| complete) {
+        Some(etag) => db_lock(&job.db).set_meta("space_etag", &etag),
+        None => db_lock(&job.db).delete_meta("space_etag"),
+    };
+    if let Err(error) = etag_result {
+        fail(&mut summary, "", &SyncError::from(error));
     }
     if let Err(error) = db_lock(&job.db).set_last_sync(now) {
         fail(&mut summary, "", &SyncError::from(error));
@@ -1015,13 +1037,14 @@ fn spawn_transfer<P: TokenProvider + 'static>(
                 )
                 .await
             }
-            PendingTransfer::Download { remote } => {
+            PendingTransfer::Download { remote, guard } => {
                 transfer::download(
                     dav.as_ref(),
                     &root,
                     &path,
                     &remote,
                     chunk_size,
+                    guard,
                     Some(&reporting),
                 )
                 .await

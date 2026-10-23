@@ -17,10 +17,9 @@ use crate::paths::{config_path, jobs_path};
 /// file is migrated, deserialized, and validated.
 pub fn load_config(config_dir: &Path) -> Result<Config, ConfigError> {
     let path = config_path(config_dir);
-    if !path.exists() {
+    let Some(mut value) = read_json(&path)? else {
         return Ok(Config::default());
-    }
-    let mut value = read_json(&path)?;
+    };
     migrations::migrate_config(&mut value)?;
     let config: Config =
         serde_json::from_value(value).map_err(|err| ConfigError::parse(&path, err))?;
@@ -34,13 +33,12 @@ pub fn load_config(config_dir: &Path) -> Result<Config, ConfigError> {
 /// is migrated, deserialized, and validated.
 pub fn load_jobs(config_dir: &Path) -> Result<Jobs, ConfigError> {
     let path = jobs_path(config_dir);
-    if !path.exists() {
+    let Some(mut value) = read_json(&path)? else {
         return Ok(Jobs {
             version: crate::CONFIG_VERSION,
             jobs: Vec::new(),
         });
-    }
-    let mut value = read_json(&path)?;
+    };
     migrations::migrate_jobs(&mut value)?;
     let jobs: Jobs = serde_json::from_value(value).map_err(|err| ConfigError::parse(&path, err))?;
     jobs.validate()?;
@@ -58,6 +56,7 @@ pub fn save_config(config_dir: &Path, config: &Config) -> Result<(), ConfigError
 /// Saves `jobs.json` atomically into the given directory.
 pub fn save_jobs(config_dir: &Path, jobs: &Jobs) -> Result<(), ConfigError> {
     jobs.validate()?;
+    jobs.validate_paths()?;
     let mut jobs = jobs.clone();
     jobs.version = crate::CONFIG_VERSION;
     write_json(&jobs_path(config_dir), &jobs)
@@ -79,9 +78,18 @@ pub fn validate_references(config: &Config, jobs: &Jobs) -> Result<(), ConfigErr
     Ok(())
 }
 
-fn read_json(path: &Path) -> Result<serde_json::Value, ConfigError> {
-    let text = fs::read_to_string(path).map_err(|err| ConfigError::io(path, err))?;
-    serde_json::from_str(&text).map_err(|err| ConfigError::parse(path, err))
+/// Reads and parses a JSON file; `None` only when the file does not exist.
+/// Any other read failure (permissions, locks) is an error — falling back
+/// to defaults there would let the next save overwrite the real file.
+fn read_json(path: &Path) -> Result<Option<serde_json::Value>, ConfigError> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(ConfigError::io(path, err)),
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|err| ConfigError::parse(path, err))
 }
 
 /// Serializes `value` pretty-printed and writes it atomically: write to a
@@ -92,10 +100,19 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), ConfigError> {
     atomic_write(path, text.as_bytes())
 }
 
+/// How often a rename blocked by another process (Windows: virus
+/// scanner, indexer) is retried before giving up.
+const RENAME_ATTEMPTS: u32 = 5;
+
 /// Atomically replaces `path` with `contents`.
 ///
-/// Writes to `<path>.tmp` and renames. On Windows, `rename` fails when the
-/// target exists, so the target is removed and the rename retried once.
+/// Writes a uniquely named temp file next to the target (so concurrent
+/// writers — GUI and CLI — never share one), flushes it to disk, and
+/// renames it over the target. `std::fs::rename` replaces an existing
+/// target on every platform (Windows: `MOVEFILE_REPLACE_EXISTING`), so the
+/// original is never deleted first: if the rename fails, the old file is
+/// still intact. A rename refused with `PermissionDenied` (a file briefly
+/// locked by another process on Windows) is retried a few times.
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
     let parent = path
         .parent()
@@ -103,20 +120,66 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), ConfigErr
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|err| ConfigError::io(parent, err))?;
 
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, contents).map_err(|err| ConfigError::io(&tmp_path, err))?;
+    let tmp_path = temp_path(path);
+    let result = write_synced(&tmp_path, contents)
+        .map_err(|err| ConfigError::io(&tmp_path, err))
+        .and_then(|()| rename_with_retry(&tmp_path, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result?;
+    sync_dir(parent);
+    Ok(())
+}
 
-    match fs::rename(&tmp_path, path) {
-        Ok(()) => Ok(()),
-        Err(rename_err) => {
-            // Windows: rename onto an existing file fails; remove and retry.
-            if path.exists() {
-                fs::remove_file(path).map_err(|err| ConfigError::io(path, err))?;
-                fs::rename(&tmp_path, path).map_err(|err| ConfigError::io(path, err))?;
-                Ok(())
-            } else {
-                Err(ConfigError::io(path, rename_err))
+/// A temp file name unique to this process and call:
+/// `<name>.<pid>.<nanos>.tmp`.
+fn temp_path(path: &Path) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{}.{nanos}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Writes `contents` and flushes them to the disk before returning.
+fn write_synced(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = fs::File::create(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+/// Renames `from` onto `to`, retrying briefly while another process holds
+/// the target open (Windows reports that as `PermissionDenied`).
+fn rename_with_retry(from: &Path, to: &Path) -> Result<(), ConfigError> {
+    let mut attempt = 1;
+    loop {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::PermissionDenied
+                    && attempt < RENAME_ATTEMPTS =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)));
+                attempt += 1;
             }
+            Err(err) => return Err(ConfigError::io(to, err)),
         }
     }
+}
+
+/// Persists the rename itself (the directory entry) on Unix; best effort.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(handle) = fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }

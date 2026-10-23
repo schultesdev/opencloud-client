@@ -440,3 +440,56 @@ async fn logout_without_revocation_endpoint_still_clears_the_store() {
     manager.logout().await.expect("logout");
     assert!(!manager.has_stored_login());
 }
+
+#[tokio::test]
+async fn stale_refresh_token_after_concurrent_rotation_keeps_the_login() {
+    let server = MockServer::start().await;
+    let store = InMemoryTokenStore::default();
+
+    // Another manager rotates r1 → r2 while our request with r1 is in
+    // flight; the server then rejects r1 as already used.
+    let rotating = store.clone();
+    Mock::given(method("POST"))
+        .and(path("/konnect/v1/token"))
+        .and(wiremock::matchers::body_string_contains("refresh_token=r1"))
+        .respond_with(move |_: &wiremock::Request| {
+            rotating
+                .save_refresh_token("konto-1", "r2")
+                .expect("rotate");
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "refresh token already used",
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/konnect/v1/token"))
+        .and(wiremock::matchers::body_string_contains("refresh_token=r2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_json(
+            "fresh",
+            Some("r3"),
+            LONG_LIVED,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = AuthClient::new(&server.uri()).expect("valid server");
+    let manager = TokenManager::new(client, store.clone(), "konto-1");
+    manager
+        .apply_login(&tokens("old", INSTANTLY_STALE, Some("r1")))
+        .await
+        .expect("apply login");
+
+    assert_eq!(manager.access_token().await.expect("access"), "fresh");
+    assert_eq!(
+        store
+            .load_refresh_token("konto-1")
+            .expect("store")
+            .as_deref(),
+        Some("r3")
+    );
+    server.verify().await;
+}

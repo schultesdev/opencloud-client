@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
@@ -153,17 +154,19 @@ impl BackendHandle {
 /// and the event receiver to poll each frame.
 pub fn spawn(config_dir: PathBuf) -> Result<(BackendHandle, Receiver<BackendEvent>), String> {
     let (config, jobs) = load_workspace(&config_dir)?;
-    let (mut engine, skipped) = start_engine(&config_dir, &config, &jobs)?;
+    prune_orphan_dbs(&config_dir, &jobs);
+    let managers = Managers::default();
+    let (mut engine, notices) = start_engine(&config_dir, &managers, &config, &jobs)?;
     let (gui_tx, gui_rx) = std_mpsc::channel::<BackendEvent>();
-    for (job_id, reason) in skipped {
-        let _ = gui_tx.send(BackendEvent::Message {
-            message: format!("Job '{job_id}' wurde übersprungen: {reason}"),
-        });
+    for message in notices {
+        let _ = gui_tx.send(BackendEvent::Message { message });
     }
     spawn_forwarder(engine.take_events(), gui_tx.clone());
 
     let (command_tx, command_rx) = mpsc::unbounded_channel();
-    tokio::spawn(backend_task(config_dir, gui_tx, command_rx, engine));
+    tokio::spawn(backend_task(
+        config_dir, managers, gui_tx, command_rx, engine,
+    ));
     Ok((
         BackendHandle {
             commands: command_tx,
@@ -176,6 +179,7 @@ pub fn spawn(config_dir: PathBuf) -> Result<(BackendHandle, Receiver<BackendEven
 /// then stops the engine cleanly.
 async fn backend_task(
     config_dir: PathBuf,
+    managers: Managers,
     gui: Sender<BackendEvent>,
     mut commands: mpsc::UnboundedReceiver<UiCommand>,
     mut engine: Engine,
@@ -192,30 +196,30 @@ async fn backend_task(
             UiCommand::PauseAll => engine.pause_all().await,
             UiCommand::ResumeAll => engine.resume_all().await,
             UiCommand::ApplyJobs => {
-                engine = restart_engine(&config_dir, &gui, engine).await;
+                engine = restart_engine(&config_dir, &managers, &gui, engine).await;
             }
             UiCommand::Login { account_id } => {
-                let result = run_login(&config_dir, &account_id).await;
+                let result = run_login(&config_dir, &managers, &account_id).await;
                 let _ = gui.send(BackendEvent::LoginFinished {
                     account_id: account_id.clone(),
                     result: result.clone(),
                 });
                 if result.is_ok() {
-                    engine = restart_engine(&config_dir, &gui, engine).await;
+                    engine = restart_engine(&config_dir, &managers, &gui, engine).await;
                 }
             }
             UiCommand::Logout { account_id } => {
-                let result = run_logout(&config_dir, &account_id).await;
+                let result = run_logout(&config_dir, &managers, &account_id).await;
                 let _ = gui.send(BackendEvent::LogoutFinished {
                     account_id: account_id.clone(),
                     result: result.clone(),
                 });
                 if result.is_ok() {
-                    engine = restart_engine(&config_dir, &gui, engine).await;
+                    engine = restart_engine(&config_dir, &managers, &gui, engine).await;
                 }
             }
             UiCommand::ListSpaces { account_id } => {
-                let result = run_list_spaces(&config_dir, &account_id).await;
+                let result = run_list_spaces(&config_dir, &managers, &account_id).await;
                 let _ = gui.send(BackendEvent::Spaces {
                     account_id,
                     result: result.map_err(|error| error.to_string()),
@@ -227,7 +231,8 @@ async fn backend_task(
                 path,
                 token,
             } => {
-                let result = run_fetch_children(&config_dir, &account_id, &space_id, &path).await;
+                let result =
+                    run_fetch_children(&config_dir, &managers, &account_id, &space_id, &path).await;
                 let _ = gui.send(BackendEvent::Children {
                     token,
                     result: result.map_err(|error| error.to_string()),
@@ -238,7 +243,8 @@ async fn backend_task(
                 conflict_id,
                 resolution,
             } => {
-                let result = run_resolve(&config_dir, &job_id, conflict_id, resolution).await;
+                let result =
+                    run_resolve(&config_dir, &managers, &job_id, conflict_id, resolution).await;
                 let _ = gui.send(BackendEvent::ResolveFinished {
                     job_id,
                     conflict_id,
@@ -255,6 +261,7 @@ async fn backend_task(
 /// the running jobs (new job, filters, settings, login/logout).
 async fn restart_engine(
     config_dir: &std::path::Path,
+    managers: &Managers,
     gui: &Sender<BackendEvent>,
     mut engine: Engine,
 ) -> Engine {
@@ -268,12 +275,11 @@ async fn restart_engine(
             return engine;
         }
     };
-    match start_engine(config_dir, &config, &jobs) {
-        Ok((mut new_engine, skipped)) => {
-            for (job_id, reason) in skipped {
-                let _ = gui.send(BackendEvent::Message {
-                    message: format!("Job '{job_id}' wurde übersprungen: {reason}"),
-                });
+    prune_orphan_dbs(config_dir, &jobs);
+    match start_engine(config_dir, managers, &config, &jobs) {
+        Ok((mut new_engine, notices)) => {
+            for message in notices {
+                let _ = gui.send(BackendEvent::Message { message });
             }
             spawn_forwarder(new_engine.take_events(), gui.clone());
             new_engine
@@ -322,16 +328,45 @@ fn engine_options(config: &Config) -> EngineOptions {
 /// The concrete token manager type used throughout the backend.
 type Manager = TokenManager<KeyringStore>;
 
-/// Builds the token manager of an account; fails on unknown accounts.
-fn manager(config_dir: &std::path::Path, account_id: &str) -> Result<Manager, String> {
-    let config = oc_config::load_config(config_dir).map_err(|error| error.to_string())?;
-    let account = config
-        .accounts
-        .iter()
-        .find(|account| account.id == account_id)
-        .ok_or_else(|| format!("unbekanntes Konto '{account_id}'"))?;
-    let auth = AuthClient::new(&account.server_url).map_err(|error| error.to_string())?;
-    Ok(TokenManager::new(auth, KeyringStore::new(), &account.id))
+/// One token manager per account, shared by the engine's jobs and the
+/// GUI's one-off requests (login, spaces, folder tree, conflicts). With a
+/// manager per client, two of them would refresh with the same refresh
+/// token; the server rotates it on the first use and rejects the second,
+/// which used to clear the account's login.
+#[derive(Clone, Default)]
+struct Managers(Arc<std::sync::Mutex<ManagerMap>>);
+
+/// Account id → (server URL, shared manager).
+type ManagerMap = HashMap<String, (String, Arc<Manager>)>;
+
+impl Managers {
+    /// The shared manager of `account_id` at `server_url`; a changed
+    /// server URL replaces the cached manager.
+    fn get(&self, account_id: &str, server_url: &str) -> Result<Arc<Manager>, String> {
+        let mut cache = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some((server, manager)) = cache.get(account_id) {
+            if server == server_url {
+                return Ok(manager.clone());
+            }
+        }
+        let auth = AuthClient::new(server_url).map_err(|error| error.to_string())?;
+        let manager = Arc::new(TokenManager::new(auth, KeyringStore::new(), account_id));
+        cache.insert(
+            account_id.to_owned(),
+            (server_url.to_owned(), manager.clone()),
+        );
+        Ok(manager)
+    }
+}
+
+/// The shared token manager of an account; fails on unknown accounts.
+fn manager(
+    config_dir: &std::path::Path,
+    managers: &Managers,
+    account_id: &str,
+) -> Result<Arc<Manager>, String> {
+    let server = server_of(config_dir, account_id)?;
+    managers.get(account_id, &server)
 }
 
 /// Looks up a job and its account's server URL.
@@ -373,8 +408,12 @@ fn server_of(config_dir: &std::path::Path, account_id: &str) -> Result<String, S
 }
 
 /// Interactive browser login for one account.
-async fn run_login(config_dir: &std::path::Path, account_id: &str) -> Result<(), String> {
-    let manager = manager(config_dir, account_id)?;
+async fn run_login(
+    config_dir: &std::path::Path,
+    managers: &Managers,
+    account_id: &str,
+) -> Result<(), String> {
+    let manager = manager(config_dir, managers, account_id)?;
     manager
         .login(true, DEFAULT_LOGIN_TIMEOUT)
         .await
@@ -383,8 +422,12 @@ async fn run_login(config_dir: &std::path::Path, account_id: &str) -> Result<(),
 }
 
 /// Logout of one account: revokes the refresh token and clears the store.
-async fn run_logout(config_dir: &std::path::Path, account_id: &str) -> Result<(), String> {
-    let manager = manager(config_dir, account_id)?;
+async fn run_logout(
+    config_dir: &std::path::Path,
+    managers: &Managers,
+    account_id: &str,
+) -> Result<(), String> {
+    let manager = manager(config_dir, managers, account_id)?;
     manager.logout().await.map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -392,9 +435,10 @@ async fn run_logout(config_dir: &std::path::Path, account_id: &str) -> Result<()
 /// Lists the spaces of an account via the Graph API.
 async fn run_list_spaces(
     config_dir: &std::path::Path,
+    managers: &Managers,
     account_id: &str,
 ) -> Result<Vec<Space>, String> {
-    let manager = manager(config_dir, account_id)?;
+    let manager = manager(config_dir, managers, account_id)?;
     require_login(&manager, account_id)?;
     let server = server_of(config_dir, account_id)?;
     let graph = GraphClient::new(&server, manager).map_err(|error| error.to_string())?;
@@ -404,11 +448,12 @@ async fn run_list_spaces(
 /// Lists the direct subfolders of a remote folder (wizard folder tree).
 async fn run_fetch_children(
     config_dir: &std::path::Path,
+    managers: &Managers,
     account_id: &str,
     space_id: &str,
     path: &str,
 ) -> Result<Vec<DavResource>, String> {
-    let manager = manager(config_dir, account_id)?;
+    let manager = manager(config_dir, managers, account_id)?;
     require_login(&manager, account_id)?;
     let server = server_of(config_dir, account_id)?;
     let dav = WebDavClient::new(&server, space_id, manager).map_err(|error| error.to_string())?;
@@ -427,12 +472,13 @@ async fn run_fetch_children(
 /// Resolves one pending conflict (see `PLAN.md`, Phase 6).
 async fn run_resolve(
     config_dir: &std::path::Path,
+    managers: &Managers,
     job_id: &str,
     conflict_id: i64,
     resolution: ConflictResolution,
 ) -> Result<bool, String> {
     let (job, server) = job_server(config_dir, job_id)?;
-    let manager = manager(config_dir, &job.account_id)?;
+    let manager = managers.get(&job.account_id, &server)?;
     require_login(&manager, &job.account_id)?;
     let dav =
         WebDavClient::new(&server, &job.space_id, manager).map_err(|error| error.to_string())?;
@@ -447,62 +493,94 @@ async fn run_resolve(
 }
 
 /// Builds the engine jobs from config + jobs, skipping accounts without
-/// a stored login; returns the engine and the skipped jobs with reasons.
+/// a stored login and jobs whose local folders overlap; returns the
+/// engine and human-readable notices (skipped jobs, reset databases).
 fn start_engine(
     config_dir: &std::path::Path,
+    managers: &Managers,
     config: &Config,
     jobs: &Jobs,
-) -> Result<(Engine, Vec<(String, String)>), String> {
+) -> Result<(Engine, Vec<String>), String> {
     let servers: HashMap<&str, &str> = config
         .accounts
         .iter()
         .map(|account| (account.id.as_str(), account.server_url.as_str()))
         .collect();
+    let enabled = Jobs {
+        version: jobs.version,
+        jobs: jobs
+            .jobs
+            .iter()
+            .filter(|job| job.enabled)
+            .cloned()
+            .collect(),
+    };
+    let mut overlapping: HashMap<String, String> = HashMap::new();
+    for (a, b) in enabled.overlapping() {
+        overlapping.insert(a.id.clone(), b.id.clone());
+        overlapping.insert(b.id.clone(), a.id.clone());
+    }
     let mut engine_jobs = Vec::new();
-    let mut skipped = Vec::new();
-    for job in jobs.jobs.iter().filter(|job| job.enabled) {
+    let mut notices = Vec::new();
+    let mut skip = |job_id: &str, reason: String| {
+        notices.push(format!("Job '{job_id}' wurde übersprungen: {reason}"));
+    };
+    let mut resets = Vec::new();
+    for job in &enabled.jobs {
+        if let Some(other) = overlapping.get(&job.id) {
+            skip(
+                &job.id,
+                format!("lokaler Ordner überschneidet sich mit Job '{other}'"),
+            );
+            continue;
+        }
         let Some(server) = servers.get(job.account_id.as_str()) else {
-            skipped.push((
-                job.id.clone(),
-                format!("unbekanntes Konto '{}'", job.account_id),
-            ));
+            skip(&job.id, format!("unbekanntes Konto '{}'", job.account_id));
             continue;
         };
-        let manager = match AuthClient::new(server) {
-            Ok(auth) => TokenManager::new(auth, KeyringStore::new(), &job.account_id),
+        let manager = match managers.get(&job.account_id, server) {
+            Ok(manager) => manager,
             Err(error) => {
-                skipped.push((job.id.clone(), format!("Auth-Client: {error}")));
+                skip(&job.id, format!("Auth-Client: {error}"));
                 continue;
             }
         };
         if !manager.has_stored_login() {
-            skipped.push((
-                job.id.clone(),
+            skip(
+                &job.id,
                 format!("Konto '{}' ist nicht angemeldet", job.account_id),
-            ));
+            );
             continue;
         }
         let dav = match WebDavClient::new(server, &job.space_id, manager) {
             Ok(dav) => dav,
             Err(error) => {
-                skipped.push((job.id.clone(), format!("WebDAV-Client: {error}")));
+                skip(&job.id, format!("WebDAV-Client: {error}"));
                 continue;
             }
         };
         let db_path = match db_path(config_dir, &job.id) {
             Ok(path) => path,
             Err(error) => {
-                skipped.push((job.id.clone(), format!("Status-Datenbank-Pfad: {error}")));
+                skip(&job.id, format!("Status-Datenbank-Pfad: {error}"));
                 continue;
             }
         };
         let db = match StatusDb::open(db_path) {
             Ok(db) => db,
             Err(error) => {
-                skipped.push((job.id.clone(), format!("Status-Datenbank: {error}")));
+                skip(&job.id, format!("Status-Datenbank: {error}"));
                 continue;
             }
         };
+        match db.ensure_identity(&job.identity()) {
+            Ok(true) => resets.push(job.id.clone()),
+            Ok(false) => {}
+            Err(error) => {
+                skip(&job.id, format!("Status-Datenbank: {error}"));
+                continue;
+            }
+        }
         match Job::new(
             &job.id,
             job.local_path.clone(),
@@ -512,10 +590,47 @@ fn start_engine(
             db,
         ) {
             Ok(engine_job) => engine_jobs.push(engine_job),
-            Err(error) => skipped.push((job.id.clone(), error.to_string())),
+            Err(error) => skip(&job.id, error.to_string()),
         }
+    }
+    for job_id in resets {
+        notices.push(format!(
+            "Status-Datenbank von Job '{job_id}' gehörte zu einem anderen Space oder Ordner \
+             und wurde zurückgesetzt"
+        ));
     }
     let options = engine_options(config);
     let engine = Engine::start(engine_jobs, options).map_err(|error| error.to_string())?;
-    Ok((engine, skipped))
+    Ok((engine, notices))
+}
+
+/// Deletes status databases (with their WAL/SHM side files) of jobs that
+/// no longer exist. Best effort: a file still held open (Windows) is
+/// left for the next attempt — the identity check guards it meanwhile.
+fn prune_orphan_dbs(config_dir: &std::path::Path, jobs: &Jobs) {
+    let Ok(entries) = std::fs::read_dir(config_dir.join(oc_db::DB_DIR)) else {
+        return;
+    };
+    let known: std::collections::HashSet<&str> =
+        jobs.jobs.iter().map(|job| job.id.as_str()).collect();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some(oc_db::DB_EXTENSION) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if known.contains(stem) {
+            continue;
+        }
+        tracing::info!("removing status database of deleted job '{stem}'");
+        if std::fs::remove_file(&path).is_ok() {
+            for suffix in ["-wal", "-shm"] {
+                let mut side = path.clone().into_os_string();
+                side.push(suffix);
+                let _ = std::fs::remove_file(side);
+            }
+        }
+    }
 }

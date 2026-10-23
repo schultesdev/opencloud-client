@@ -19,10 +19,11 @@ fn job(id: &str, account_id: &str) -> SyncJob {
         space_id: "storage-users-1$89ad5ad2-dead-beef".into(),
         space_name: Some("Projekt Mars".into()),
         local_path: PathBuf::from(if cfg!(windows) {
-            r"C:\Users\max\OpenCloud\projekt-mars"
+            r"C:\Users\max\OpenCloud"
         } else {
-            "/home/max/OpenCloud/projekt-mars"
-        }),
+            "/home/max/OpenCloud"
+        })
+        .join(id),
         enabled: true,
         include: vec!["Dokumente".into(), "Bilder/2026".into()],
         exclude: vec!["tmp".into(), "*.tmp".into(), ".git".into()],
@@ -111,7 +112,56 @@ fn rewrite_replaces_existing_file() {
     let loaded = oc_config::load_config(dir.path()).unwrap();
     assert_eq!(loaded, config);
     // No temp file left behind.
-    assert!(!dir.path().join("config.json.tmp").exists());
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_config_is_an_error_not_defaults() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    oc_config::save_config(dir.path(), &sample_config()).unwrap();
+    let path = dir.path().join("config.json");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root ignores file permissions; only check where they apply.
+    if std::fs::read(&path).is_err() {
+        assert!(oc_config::load_config(dir.path()).is_err());
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn overlapping_job_paths_are_rejected_on_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut jobs = oc_config::Jobs {
+        version: oc_config::CONFIG_VERSION,
+        jobs: vec![job("job-1", "konto-1")],
+    };
+    let mut nested = job("job-2", "konto-1");
+    nested.local_path = jobs.jobs[0].local_path.join("Unterordner");
+    jobs.jobs.push(nested);
+    let err = oc_config::save_jobs(dir.path(), &jobs).unwrap_err();
+    assert!(err.to_string().contains("overlap"), "got: {err}");
+
+    // Same path twice is rejected as well; disjoint paths are fine.
+    jobs.jobs[1].local_path = jobs.jobs[0].local_path.clone();
+    assert!(oc_config::save_jobs(dir.path(), &jobs).is_err());
+    jobs.jobs[1].local_path = jobs.jobs[0].local_path.with_file_name("andere-ablage");
+    oc_config::save_jobs(dir.path(), &jobs).unwrap();
+}
+
+#[test]
+fn job_ids_must_be_safe_file_names() {
+    let mut unsafe_job = job("job-1", "konto-1");
+    unsafe_job.id = "..".into();
+    assert!(unsafe_job.validate().is_err());
+    unsafe_job.id = "a/b".into();
+    assert!(unsafe_job.validate().is_err());
 }
 
 #[test]

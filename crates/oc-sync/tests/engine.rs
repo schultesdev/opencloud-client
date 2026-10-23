@@ -1853,3 +1853,84 @@ async fn reconnect_emits_online_and_drains_the_queue() {
     assert_eq!(entry.entry.remote_etag.as_deref(), Some("\"created\""));
     engine.stop().await;
 }
+
+// --- Folder deletions vs. new content, root-ETag after failures ------------
+
+#[tokio::test]
+async fn remote_folder_deletion_keeps_a_new_local_file_inside() {
+    let f = fixture(&[], &[]).await;
+
+    // The server no longer has folder "d"; locally a new file appeared in it.
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    mount_propfind(&f.server, "", "1", &[("", true, Some("\"root-1\""), None)]).await;
+    Mock::given(method("MKCOL"))
+        .and(path("/dav/spaces/sid/d"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/dav/spaces/sid/d/new.txt"))
+        .and(header("If-None-Match", "*"))
+        .respond_with(ResponseTemplate::new(201).append_header("ETag", "\"n1\""))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+
+    std::fs::create_dir_all(f.root.join("d")).expect("mkdir");
+    std::fs::write(f.root.join("d/new.txt"), "keep me").expect("write");
+    open_db(&f.db_path)
+        .upsert_entry(&NewEntry::new("d", true, EntryState::Synced))
+        .expect("seed");
+
+    let mut engine = f.engine(test_options());
+    let (summary, events) = next_run(&mut engine).await;
+    assert_eq!(summary.errors, 0, "events: {events:?}");
+    assert_eq!(summary.uploads, 1);
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("d/new.txt")).expect("kept"),
+        "keep me"
+    );
+    f.server.verify().await;
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn failed_download_disables_the_root_etag_shortcut() {
+    let f = fixture(&[], &[]).await;
+
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    mount_propfind(
+        &f.server,
+        "",
+        "1",
+        &[
+            ("", true, Some("\"root-1\""), None),
+            ("a.txt", false, Some("\"e1\""), Some(3)),
+        ],
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&f.server)
+        .await;
+
+    let mut options = test_options();
+    options.root_etag_shortcut = true;
+    let mut engine = f.engine(options);
+    let (summary, _) = next_run(&mut engine).await;
+    assert_eq!(summary.errors, 1);
+    // The failed path must be retried by a full traversal, so the root
+    // ETag is not recorded.
+    let db = open_db(&f.db_path);
+    assert_eq!(db.meta("space_etag").expect("meta"), None);
+
+    engine
+        .send("job-1", JobCommand::SyncNow)
+        .await
+        .expect("send");
+    let (summary, _) = next_run(&mut engine).await;
+    assert!(!summary.remote_scan_skipped);
+    engine.stop().await;
+}

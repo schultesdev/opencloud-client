@@ -133,6 +133,59 @@ fn delete_subtree_removes_only_the_prefix_tree() {
 }
 
 #[test]
+fn delete_subtree_treats_wildcards_and_case_literally() {
+    let db = StatusDb::open_in_memory().unwrap();
+    for path in [
+        "my_dir/a.txt",
+        "myXdir/b.txt",
+        "100%/c.txt",
+        "100x/d.txt",
+        "Foo/e.txt",
+        "foo/f.txt",
+    ] {
+        db.upsert_entry(&NewEntry::new(path, false, EntryState::Synced))
+            .unwrap();
+    }
+    assert_eq!(db.delete_subtree("my_dir").unwrap(), 1);
+    assert!(db.get_entry("myXdir/b.txt").unwrap().is_some());
+    assert_eq!(db.delete_subtree("100%").unwrap(), 1);
+    assert!(db.get_entry("100x/d.txt").unwrap().is_some());
+    assert_eq!(db.delete_subtree("Foo").unwrap(), 1);
+    assert!(db.get_entry("foo/f.txt").unwrap().is_some());
+}
+
+#[test]
+fn identity_change_resets_the_database() {
+    let db = StatusDb::open_in_memory().unwrap();
+    // A fresh database adopts the identity.
+    assert!(!db.ensure_identity("acc\nspace-a\n/tmp/a").unwrap());
+    db.upsert_entry(&NewEntry::new("a.txt", false, EntryState::Synced))
+        .unwrap();
+    db.set_meta("space_etag", "\"e\"").unwrap();
+    db.record_conflict(&NewConflict {
+        path: "a.txt".into(),
+        detected_at: 1,
+        local_mtime: None,
+        local_size: None,
+        remote_etag: None,
+        remote_size: None,
+        remote_mtime: None,
+    })
+    .unwrap();
+
+    // Same identity: nothing changes.
+    assert!(!db.ensure_identity("acc\nspace-a\n/tmp/a").unwrap());
+    assert!(db.get_entry("a.txt").unwrap().is_some());
+
+    // Another space or path: the old state is dropped.
+    assert!(db.ensure_identity("acc\nspace-b\n/tmp/a").unwrap());
+    assert!(db.all_entries().unwrap().is_empty());
+    assert!(db.pending_conflicts().unwrap().is_empty());
+    assert_eq!(db.meta("space_etag").unwrap(), None);
+    assert!(!db.ensure_identity("acc\nspace-b\n/tmp/a").unwrap());
+}
+
+#[test]
 fn entries_with_state_filters_and_is_bounded() {
     let db = StatusDb::open_in_memory().unwrap();
     db.upsert_entry(&NewEntry::new("a.txt", false, EntryState::Error))

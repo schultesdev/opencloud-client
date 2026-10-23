@@ -34,6 +34,52 @@ pub enum TransferResult {
     /// failed, HTTP 412): the remote side changed concurrently and the
     /// path must be treated as a conflict.
     PreconditionFailed,
+    /// A download was not applied because the local file changed after
+    /// the scan (see [`LocalGuard`]); the downloaded data is discarded and
+    /// the next pass sees both changes and records a conflict.
+    LocalChanged,
+}
+
+/// What the local target of a download must still look like when the
+/// downloaded file is moved into place. Protects edits made between the
+/// scan and the end of the download from being overwritten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalGuard {
+    /// Overwrite whatever is there (explicit "server wins" resolution).
+    Any,
+    /// The file did not exist at scan time; a file that appeared since
+    /// is kept.
+    Absent,
+    /// The file must still have the scanned mtime and size.
+    Unchanged(LocalNode),
+}
+
+impl LocalGuard {
+    /// The guard for a download planned from a scan: absent or unchanged.
+    pub fn from_scan(local: Option<LocalNode>) -> Self {
+        match local {
+            Some(node) => Self::Unchanged(node),
+            None => Self::Absent,
+        }
+    }
+
+    /// Whether the target's current state still allows the overwrite.
+    fn permits(&self, target: &Path) -> Result<bool, SyncError> {
+        let current = match std::fs::metadata(target) {
+            Ok(metadata) => Some(metadata),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => return Err(SyncError::io(target, source)),
+        };
+        Ok(match (self, current) {
+            (Self::Any, _) | (_, None) => true,
+            (Self::Absent, Some(_)) => false,
+            (Self::Unchanged(node), Some(metadata)) => {
+                !metadata.is_dir()
+                    && unix_mtime(&metadata) == node.mtime
+                    && Some(metadata.len() as i64) == node.size
+            }
+        })
+    }
 }
 
 /// Downloads `path` into the local tree. Files with a known size above
@@ -41,14 +87,17 @@ pub enum TransferResult {
 /// `<name>.part` file; smaller ones (or without a reported size) arrive
 /// as a single GET. In both cases the data lands under the `.part` name
 /// first and is atomically renamed once complete, so a crash never leaves
-/// a half-written file under the real name. `progress` receives
-/// chunk-granular byte counts.
+/// a half-written file under the real name. Before the rename, `guard`
+/// checks that the local file was not changed in the meantime; if it was,
+/// the download is discarded ([`TransferResult::LocalChanged`]).
+/// `progress` receives chunk-granular byte counts.
 pub async fn download<P: TokenProvider>(
     dav: &WebDavClient<P>,
     root: &Path,
     path: &str,
     remote: &RemoteNode,
     chunk_size: u64,
+    guard: LocalGuard,
     progress: Option<&TransferHandle>,
 ) -> Result<TransferResult, SyncError> {
     let target = abs_local_path(root, path)?;
@@ -56,17 +105,21 @@ pub async fn download<P: TokenProvider>(
         .size
         .filter(|size| *size >= 0)
         .map(|size| size as u64);
-    let (etag, local, remote_size) = match size {
+    let landed = match size {
         Some(size) if chunk_size > 0 && size > chunk_size => {
-            let (etag, local) =
-                chunked_download(dav, path, &target, size, chunk_size, progress).await?;
-            (etag, local, Some(size as i64))
+            chunked_download(dav, path, &target, size, chunk_size, guard, progress)
+                .await?
+                .map(|(etag, local)| (etag, local, Some(size as i64)))
         }
-        _ => {
-            let (etag, local) = whole_download(dav, root, path, remote, &target, progress).await?;
-            let remote_size = local.size;
-            (etag, local, remote_size)
-        }
+        _ => whole_download(dav, root, path, remote, &target, guard, progress)
+            .await?
+            .map(|(etag, local)| {
+                let remote_size = local.size;
+                (etag, local, remote_size)
+            }),
+    };
+    let Some((etag, local, remote_size)) = landed else {
+        return Ok(TransferResult::LocalChanged);
     };
     Ok(TransferResult::Done(TransferMeta {
         local,
@@ -75,6 +128,10 @@ pub async fn download<P: TokenProvider>(
     }))
 }
 
+/// What a completed download reports: its ETag and the new local state;
+/// `None` when the guard kept the local file.
+type Landed = Option<(Option<String>, LocalNode)>;
+
 /// Single-request download of a file of unknown or small size.
 async fn whole_download<P: TokenProvider>(
     dav: &WebDavClient<P>,
@@ -82,8 +139,9 @@ async fn whole_download<P: TokenProvider>(
     path: &str,
     remote: &RemoteNode,
     target: &Path,
+    guard: LocalGuard,
     progress: Option<&TransferHandle>,
-) -> Result<(Option<String>, LocalNode), SyncError> {
+) -> Result<Landed, SyncError> {
     let response = dav.get(path).await?;
     let etag = etag_of(&response).or_else(|| remote.etag.clone());
     let bytes = response.bytes().await.map_err(ApiError::from)?;
@@ -91,10 +149,10 @@ async fn whole_download<P: TokenProvider>(
         progress.report(bytes.len() as u64);
     }
     let target = target.to_path_buf();
-    let local = tokio::task::spawn_blocking(move || write_atomic(&target, &bytes))
+    let local = tokio::task::spawn_blocking(move || write_atomic(&target, &bytes, guard))
         .await
         .map_err(|source| SyncError::io(root, join_error(source)))??;
-    Ok((etag, local))
+    Ok(local.map(|local| (etag, local)))
 }
 
 /// Chunked download: repeated `Range` GETs, each appended to the `.part`
@@ -107,8 +165,9 @@ async fn chunked_download<P: TokenProvider>(
     target: &Path,
     size: u64,
     chunk_size: u64,
+    guard: LocalGuard,
     progress: Option<&TransferHandle>,
-) -> Result<(Option<String>, LocalNode), SyncError> {
+) -> Result<Landed, SyncError> {
     let part = part_file(target);
     // A fresh part file per attempt; stale ones are cleaned at run start.
     let stale = part.clone();
@@ -132,10 +191,11 @@ async fn chunked_download<P: TokenProvider>(
                 progress.report(bytes.len() as u64);
             }
             let whole_target = target.to_path_buf();
-            let local = tokio::task::spawn_blocking(move || write_atomic(&whole_target, &bytes))
-                .await
-                .map_err(|source| SyncError::io(target, join_error(source)))??;
-            return Ok((etag, local));
+            let local =
+                tokio::task::spawn_blocking(move || write_atomic(&whole_target, &bytes, guard))
+                    .await
+                    .map_err(|source| SyncError::io(target, join_error(source)))??;
+            return Ok(local.map(|local| (etag, local)));
         }
         if bytes.is_empty() {
             return Err(SyncError::Api(ApiError::protocol(format!(
@@ -171,10 +231,10 @@ async fn chunked_download<P: TokenProvider>(
         ))));
     }
     let (part, final_target) = (part.clone(), target.to_path_buf());
-    let local = tokio::task::spawn_blocking(move || finish_atomic(&part, &final_target))
+    let local = tokio::task::spawn_blocking(move || finish_atomic(&part, &final_target, guard))
         .await
         .map_err(|source| SyncError::io(target, join_error(source)))??;
-    Ok((etag, local))
+    Ok(local.map(|local| (etag, local)))
 }
 
 /// Uploads `path` to the server. `base_etag` guards against concurrent
@@ -234,24 +294,37 @@ pub async fn upload<P: TokenProvider>(
 
 /// Writes `bytes` to `<target>.part`, then renames it atomically onto
 /// `target` ([`finish_atomic`]).
-fn write_atomic(target: &Path, bytes: &[u8]) -> Result<LocalNode, SyncError> {
+fn write_atomic(
+    target: &Path,
+    bytes: &[u8],
+    guard: LocalGuard,
+) -> Result<Option<LocalNode>, SyncError> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|source| SyncError::io(parent, source))?;
     }
     let part = part_file(target);
     std::fs::write(&part, bytes).map_err(|source| SyncError::io(&part, source))?;
-    finish_atomic(&part, target)
+    finish_atomic(&part, target, guard)
 }
 
 /// Renames the completed `.part` file onto its target; read-only targets
 /// are made writable first so replacing and later deleting work on all
-/// platforms.
-fn finish_atomic(part: &Path, target: &Path) -> Result<LocalNode, SyncError> {
+/// platforms. When `guard` reports a local change since the scan, the
+/// part file is discarded instead and `None` is returned.
+fn finish_atomic(
+    part: &Path,
+    target: &Path,
+    guard: LocalGuard,
+) -> Result<Option<LocalNode>, SyncError> {
+    if !guard.permits(target)? {
+        let _ = std::fs::remove_file(part);
+        return Ok(None);
+    }
     if target.exists() {
         make_writable(target)?;
     }
     std::fs::rename(part, target).map_err(|source| SyncError::io(part, source))?;
-    file_node(target)
+    file_node(target).map(Some)
 }
 
 /// Appends one chunk to the `.part` file.
@@ -266,11 +339,21 @@ fn append_chunk(part: &Path, bytes: &[u8]) -> Result<(), SyncError> {
         .map_err(|source| SyncError::io(part, source))
 }
 
-/// Reads a file together with its metadata.
+/// Reads a file together with its metadata. The metadata is taken before
+/// and after reading; if they differ, the file was written to while being
+/// read and the content may not match the recorded state — the upload is
+/// refused (the next pass picks the file up again).
 fn read_with_meta(path: &Path) -> Result<(Vec<u8>, LocalNode), SyncError> {
+    let before = file_node(path)?;
     let content = std::fs::read(path).map_err(|source| SyncError::io(path, source))?;
-    let node = file_node(path)?;
-    Ok((content, node))
+    let after = file_node(path)?;
+    if before != after || after.size != Some(content.len() as i64) {
+        return Err(SyncError::io(
+            path,
+            std::io::Error::other("file changed while it was being read; retrying next pass"),
+        ));
+    }
+    Ok((content, after))
 }
 
 /// Local metadata of a file as [`LocalNode`].
@@ -370,7 +453,9 @@ mod tests {
         permissions.set_readonly(true);
         std::fs::set_permissions(&target, permissions).expect("readonly");
 
-        let node = write_atomic(&target, b"new content").expect("write");
+        let node = write_atomic(&target, b"new content", LocalGuard::Any)
+            .expect("write")
+            .expect("applied");
         assert_eq!(std::fs::read(&target).expect("read"), b"new content");
         assert_eq!(node.size, Some(11));
         assert!(!dir.path().join("a.txt.part").exists());
@@ -381,6 +466,37 @@ mod tests {
                 .expect("meta")
                 .permissions()
                 .readonly()
+        );
+    }
+
+    #[test]
+    fn guards_keep_local_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("a.txt");
+        std::fs::write(&target, b"scanned").expect("write");
+        let scanned = file_node(&target).expect("node");
+
+        // Unchanged since the scan: the download lands.
+        let landed =
+            write_atomic(&target, b"server", LocalGuard::Unchanged(scanned)).expect("write");
+        assert!(landed.is_some());
+        assert_eq!(std::fs::read(&target).expect("read"), b"server");
+
+        // Edited since the scan (size differs): the edit is kept.
+        std::fs::write(&target, b"edited locally").expect("write");
+        let landed =
+            write_atomic(&target, b"server", LocalGuard::Unchanged(scanned)).expect("write");
+        assert!(landed.is_none());
+        assert_eq!(std::fs::read(&target).expect("read"), b"edited locally");
+        assert!(!dir.path().join("a.txt.part").exists());
+
+        // Absent at scan time, created since: kept as well.
+        let fresh = dir.path().join("b.txt");
+        std::fs::write(&fresh, b"new local file").expect("write");
+        assert!(
+            write_atomic(&fresh, b"server", LocalGuard::Absent)
+                .expect("write")
+                .is_none()
         );
     }
 

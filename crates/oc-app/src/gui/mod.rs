@@ -1926,7 +1926,12 @@ impl SyncApp {
                     ));
                     return false;
                 }
-                let id = unique_job_id(&self.jobs, "job-1");
+                // Ids whose status database still exists are not reused:
+                // its baseline belongs to the removed job.
+                let config_dir = self.config_dir.clone();
+                let id = unique_job_id(&self.jobs, "job-1", |id| {
+                    db_path(&config_dir, id).is_ok_and(|path| path.exists())
+                });
                 self.jobs.jobs.push(SyncJob {
                     id: id.clone(),
                     account_id,
@@ -2087,8 +2092,10 @@ fn stored_login(account: &Account) -> Option<bool> {
     Some(manager.has_stored_login())
 }
 
-/// A fresh, unused job id (`job-1`, `job-2`, ...).
-fn unique_job_id(jobs: &Jobs, base: &str) -> String {
+/// A fresh, unused job id (`job-1`, `job-2`, ...); ids already in
+/// `jobs` or reported by `taken` (e.g. a leftover database file) are
+/// skipped.
+fn unique_job_id(jobs: &Jobs, base: &str, taken: impl Fn(&str) -> bool) -> String {
     let existing: HashSet<&str> = jobs.jobs.iter().map(|job| job.id.as_str()).collect();
     let (stem, start) = match base.rsplit_once('-') {
         Some((stem, number)) => (stem, number.parse::<u64>().unwrap_or(1)),
@@ -2097,7 +2104,7 @@ fn unique_job_id(jobs: &Jobs, base: &str) -> String {
     let mut number = start;
     loop {
         let id = format!("{stem}-{number}");
-        if !existing.contains(id.as_str()) {
+        if !existing.contains(id.as_str()) && !taken(&id) {
             return id;
         }
         number += 1;
@@ -2287,9 +2294,11 @@ mod tests {
             include: vec![],
             exclude: vec![],
         });
-        assert_eq!(unique_job_id(&jobs, "job-1"), "job-2");
+        assert_eq!(unique_job_id(&jobs, "job-1", |_| false), "job-2");
         jobs.jobs[0].id = "job-2".into();
-        assert_eq!(unique_job_id(&jobs, "job-1"), "job-1");
+        assert_eq!(unique_job_id(&jobs, "job-1", |_| false), "job-1");
+        // A leftover database of a removed job blocks its id.
+        assert_eq!(unique_job_id(&jobs, "job-1", |id| id == "job-1"), "job-3");
     }
 
     #[test]

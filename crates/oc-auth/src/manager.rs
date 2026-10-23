@@ -139,30 +139,52 @@ impl<S: TokenStore> TokenManager<S> {
 
     /// Refreshes while holding the lock (single-flight) and updates the
     /// stored refresh token when the server rotates it.
+    ///
+    /// A rejected refresh token only clears the stored login when the
+    /// store still holds that very token. If another manager or process
+    /// rotated it in the meantime (the rejected one was stale), the refresh
+    /// is retried once with the current token instead of logging out.
     async fn refresh_locked(&self, guard: &mut Option<ActiveToken>) -> Result<String, AuthError> {
-        let refresh_token = self
+        let mut refresh_token = self
             .store
             .load_refresh_token(&self.account_id)?
             .ok_or(AuthError::NoRefreshToken)?;
-        match self.client.refresh(&refresh_token).await {
-            Ok(tokens) => {
-                if let Some(rotated) = tokens.refresh_token.as_deref() {
-                    self.store.save_refresh_token(&self.account_id, rotated)?;
+        let mut retried = false;
+        loop {
+            match self.client.refresh(&refresh_token).await {
+                Ok(tokens) => {
+                    if let Some(rotated) = tokens.refresh_token.as_deref() {
+                        self.store.save_refresh_token(&self.account_id, rotated)?;
+                    }
+                    let access_token = tokens.access_token.clone();
+                    *guard = Some(ActiveToken::new(&tokens));
+                    return Ok(access_token);
                 }
-                let access_token = tokens.access_token.clone();
-                *guard = Some(ActiveToken::new(&tokens));
-                Ok(access_token)
-            }
-            Err(AuthError::RefreshTokenInvalid { reason }) => {
-                // The server rejected the refresh token for good: drop the
-                // login; the user must authenticate again.
-                *guard = None;
-                let _ = self.store.delete_refresh_token(&self.account_id);
-                Err(AuthError::RefreshTokenInvalid { reason })
-            }
-            Err(err) => {
+                Err(AuthError::RefreshTokenInvalid { reason }) => {
+                    let current = self.store.load_refresh_token(&self.account_id)?;
+                    match current {
+                        Some(current) if current != refresh_token && !retried => {
+                            // Rotated concurrently: ours was stale.
+                            refresh_token = current;
+                            retried = true;
+                        }
+                        Some(current) if current != refresh_token => {
+                            // Rotated again; keep the newer login intact.
+                            *guard = None;
+                            return Err(AuthError::RefreshTokenInvalid { reason });
+                        }
+                        _ => {
+                            // The server rejected the stored token for
+                            // good: drop the login; the user must
+                            // authenticate again.
+                            *guard = None;
+                            let _ = self.store.delete_refresh_token(&self.account_id);
+                            return Err(AuthError::RefreshTokenInvalid { reason });
+                        }
+                    }
+                }
                 // Transient failure: keep the refresh token for a retry.
-                Err(err)
+                Err(err) => return Err(err),
             }
         }
     }

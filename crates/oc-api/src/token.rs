@@ -41,6 +41,19 @@ impl TokenProvider for StaticToken {
     }
 }
 
+/// A shared provider: all clients of one account use the same
+/// [`TokenManager`] behind an `Arc`, so refreshes stay single-flight per
+/// account and a rotated refresh token is never sent twice.
+impl<P: TokenProvider> TokenProvider for std::sync::Arc<P> {
+    fn access_token(&self) -> impl Future<Output = Result<String, ApiError>> + Send {
+        P::access_token(self)
+    }
+
+    fn refresh(&self) -> impl Future<Output = Result<String, ApiError>> + Send {
+        P::refresh(self)
+    }
+}
+
 impl<S: TokenStore> TokenProvider for TokenManager<S> {
     async fn access_token(&self) -> Result<String, ApiError> {
         TokenManager::access_token(self)

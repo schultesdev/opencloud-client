@@ -5,6 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use rusqlite::params;
 
 use crate::error::DbError;
@@ -100,6 +101,50 @@ impl StatusDb {
         Ok(())
     }
 
+    /// Removes a `meta` value; a missing key is fine.
+    pub fn delete_meta(&self, key: &str) -> Result<(), DbError> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
+    /// Binds the database to the job it tracks. `identity` describes what
+    /// the recorded state refers to (account, space, local root). A fresh
+    /// database adopts it; a database recorded for a different identity —
+    /// e.g. a reused job id, or a job pointed at another space or folder —
+    /// is reset (entries, conflicts, space ETag, last sync), because its
+    /// "last synced" baseline would otherwise turn into deletions on the
+    /// new target. Returns whether a reset happened.
+    pub fn ensure_identity(&self, identity: &str) -> Result<bool, DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let stored: Option<String> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'job_identity'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let reset = match stored.as_deref() {
+            Some(stored) if stored == identity => return Ok(false),
+            Some(_) => {
+                tx.execute_batch(
+                    "DELETE FROM entries;
+                     DELETE FROM conflicts;
+                     DELETE FROM meta WHERE key IN ('space_etag', 'last_sync');",
+                )?;
+                true
+            }
+            None => false,
+        };
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('job_identity', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [identity],
+        )?;
+        tx.commit()?;
+        Ok(reset)
+    }
+
     /// Stores when the job last completed a sync run (`meta.last_sync`,
     /// unix seconds).
     pub fn set_last_sync(&self, unix_seconds: i64) -> Result<(), DbError> {
@@ -165,11 +210,15 @@ impl StatusDb {
     /// folder prefix; a sibling named `foo2` is not touched when `foo` is
     /// deleted). Used when files/folders vanish or when selective sync
     /// filters shrink the synced tree. Returns the number of removed rows.
+    ///
+    /// The descendants are selected as the byte range `[path/, path0)` —
+    /// `'0'` is the character right after `'/'` — which is exact and
+    /// case-sensitive (unlike `LIKE`, where `_`/`%` in names are
+    /// wildcards and ASCII case is ignored) and uses the path index.
     pub fn delete_subtree(&self, path: &str) -> Result<usize, DbError> {
-        let prefix = format!("{path}/");
         let removed = self.conn.execute(
-            "DELETE FROM entries WHERE path = ?1 OR path LIKE ?2 || '%'",
-            params![path, prefix],
+            "DELETE FROM entries WHERE path = ?1 OR (path >= ?2 AND path < ?3)",
+            params![path, format!("{path}/"), format!("{path}0")],
         )?;
         Ok(removed)
     }

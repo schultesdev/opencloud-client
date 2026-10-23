@@ -61,6 +61,8 @@ pub struct RemoteSnapshot {
     /// path → server path); empty in the common case. See
     /// [`ServerNames`].
     pub server_names: HashMap<String, String>,
+    /// Server SHA1 checksums of files (lowercase hex), where reported.
+    pub checksums: HashMap<String, String>,
 }
 
 /// Maps normalized (NFC) paths — the keys of scans, diff, and database —
@@ -230,21 +232,16 @@ pub async fn scan_remote_from_root<P: TokenProvider>(
     root_listing: &[DavResource],
     pause: Duration,
 ) -> Result<RemoteSnapshot, SyncError> {
-    let root_etag = root_listing
-        .first()
-        .and_then(|resource| resource.etag.clone());
-    let mut entries = HashMap::new();
-    let mut server_names = HashMap::new();
+    let mut snapshot = RemoteSnapshot {
+        root_etag: root_listing
+            .first()
+            .and_then(|resource| resource.etag.clone()),
+        ..RemoteSnapshot::default()
+    };
     // Folders to list, by their server path (see `ServerNames`).
     let mut pending: VecDeque<String> = VecDeque::new();
     for resource in root_listing.iter().skip(1) {
-        add_remote_child(
-            resource,
-            filter,
-            &mut entries,
-            &mut server_names,
-            &mut pending,
-        );
+        add_remote_child(resource, filter, &mut snapshot, &mut pending);
     }
     while let Some(dir) = pending.pop_front() {
         if !pause.is_zero() {
@@ -258,20 +255,10 @@ pub async fn scan_remote_from_root<P: TokenProvider>(
             Err(source) => return Err(source.into()),
         };
         for resource in children.iter().skip(1) {
-            add_remote_child(
-                resource,
-                filter,
-                &mut entries,
-                &mut server_names,
-                &mut pending,
-            );
+            add_remote_child(resource, filter, &mut snapshot, &mut pending);
         }
     }
-    Ok(RemoteSnapshot {
-        entries,
-        root_etag,
-        server_names,
-    })
+    Ok(snapshot)
 }
 
 /// Records one PROPFIND child if it passes the filter; folders are queued
@@ -279,21 +266,98 @@ pub async fn scan_remote_from_root<P: TokenProvider>(
 fn add_remote_child(
     resource: &DavResource,
     filter: &Filter,
-    entries: &mut HashMap<String, RemoteNode>,
-    server_names: &mut HashMap<String, String>,
+    snapshot: &mut RemoteSnapshot,
     pending: &mut VecDeque<String>,
 ) {
     if resource.path.is_empty() || !filter.covers(&resource.path) {
         return;
     }
     if resource.server_path != resource.path {
-        server_names.insert(resource.path.clone(), resource.server_path.clone());
+        snapshot
+            .server_names
+            .insert(resource.path.clone(), resource.server_path.clone());
     }
     let node = RemoteNode::from_resource(resource);
     if node.is_dir {
         pending.push_back(resource.server_path.clone());
+    } else if let Some(sha1) = resource.sha1() {
+        snapshot.checksums.insert(resource.path.clone(), sha1);
     }
-    entries.insert(resource.path.clone(), node);
+    snapshot.entries.insert(resource.path.clone(), node);
+}
+
+/// Whether the filesystem of `root` folds case (`A.txt` and `a.txt` are
+/// the same file) — the default on macOS and Windows, possible anywhere.
+/// Probed without writing: the root folder's name with flipped case must
+/// resolve to an existing entry. Names without cased letters fall back to
+/// the platform default. A false positive only makes collision detection
+/// stricter.
+pub(crate) fn folds_case(root: &Path) -> bool {
+    let platform_default = cfg!(any(target_os = "macos", windows));
+    let Some(name) = root.file_name().and_then(|name| name.to_str()) else {
+        return platform_default;
+    };
+    let flipped: String = name
+        .chars()
+        .flat_map(|character| -> Vec<char> {
+            if character.is_lowercase() {
+                character.to_uppercase().collect()
+            } else {
+                character.to_lowercase().collect()
+            }
+        })
+        .collect();
+    if flipped == name {
+        return platform_default;
+    }
+    root.with_file_name(flipped).exists()
+}
+
+/// Groups of remote paths that differ only in case. On a case-folding
+/// filesystem each group would land in one local file, and the next pass
+/// would take the "missing" names for local deletions.
+pub(crate) fn case_collisions<'a>(paths: impl Iterator<Item = &'a String>) -> Vec<Vec<String>> {
+    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+    for path in paths {
+        groups
+            .entry(path.to_lowercase())
+            .or_default()
+            .push(path.clone());
+    }
+    let mut collisions: Vec<Vec<String>> = groups
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .map(|mut group| {
+            group.sort();
+            group
+        })
+        .collect();
+    collisions.sort();
+    collisions
+}
+
+/// The SHA1 of a local file (lowercase hex), read in chunks; `None` when
+/// the file cannot be read.
+pub(crate) fn local_sha1(root: &Path, rel: &str) -> Option<String> {
+    use sha1::Digest;
+    use std::io::Read;
+    let mut file = std::fs::File::open(abs_local_path(root, rel).ok()?).ok()?;
+    let mut hasher = sha1::Sha1::new();
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 /// Modification time of a file as unix milliseconds. Second precision
@@ -310,6 +374,41 @@ pub(crate) fn unix_mtime(metadata: &std::fs::Metadata) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn case_collisions_are_grouped() {
+        let paths: Vec<String> = ["A.txt", "a.txt", "b.txt", "Dir/x", "dir/x"]
+            .iter()
+            .map(|path| path.to_string())
+            .collect();
+        assert_eq!(
+            case_collisions(paths.iter()),
+            vec![
+                vec!["A.txt".to_owned(), "a.txt".to_owned()],
+                vec!["Dir/x".to_owned(), "dir/x".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn case_folding_is_probed_via_the_root_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("SyncRoot");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let expected = dir.path().join("sYNCrOOT").exists();
+        assert_eq!(folds_case(&root), expected);
+    }
+
+    #[test]
+    fn local_sha1_matches_the_known_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), "abc").expect("write");
+        assert_eq!(
+            local_sha1(dir.path(), "a.txt").as_deref(),
+            Some("a9993e364706816aba3e25717850c26c9cd0d89d")
+        );
+        assert_eq!(local_sha1(dir.path(), "missing.txt"), None);
+    }
 
     #[test]
     fn server_names_resolve_nested_paths() {

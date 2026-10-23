@@ -209,6 +209,35 @@ pub fn danger(ui: &mut Ui, label: impl Into<egui::WidgetText>) -> Response {
     )
 }
 
+/// The centered placeholder of an empty tab: a title, a hint, and an
+/// optional primary action; returns whether the action was clicked.
+pub fn empty_state(
+    ui: &mut Ui,
+    title: &str,
+    title_color: Color32,
+    hint: &str,
+    action: Option<&str>,
+) -> bool {
+    let theme = palette();
+    let mut clicked = false;
+    ui.vertical_centered(|ui| {
+        ui.add_space(70.0);
+        ui.label(
+            egui::RichText::new(title)
+                .size(20.0)
+                .strong()
+                .color(title_color),
+        );
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(hint).color(theme.text_dim));
+        if let Some(action) = action {
+            ui.add_space(14.0);
+            clicked = primary(ui, action).clicked();
+        }
+    });
+    clicked
+}
+
 /// A square quiet button with a single glyph (refresh, pause, menu) and
 /// a tooltip that names the action.
 pub fn icon_button(ui: &mut Ui, glyph: &str, tooltip: &str) -> Response {

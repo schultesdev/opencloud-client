@@ -2067,3 +2067,90 @@ async fn resolve_server_without_remote_etag_downloads_instead_of_deleting() {
     );
     f.server.verify().await;
 }
+
+#[tokio::test]
+async fn initial_size_matches_are_verified_by_checksum() {
+    let f = fixture(&[], &[]).await;
+    // Same size on both sides; only "same.txt" has the same content.
+    std::fs::write(f.root.join("same.txt"), "abc").expect("write");
+    std::fs::write(f.root.join("other.txt"), "xyz").expect("write");
+    let abc = "a9993e364706816aba3e25717850c26c9cd0d89d";
+    let file = |name: &str, sha1: &str| {
+        format!(
+            " <D:response>\n  <D:href>/dav/spaces/sid/{name}</D:href>\n  <D:propstat>\n   \
+             <D:prop>\n    <D:resourcetype/>\n    <D:getetag>&quot;{name}&quot;</D:getetag>\n    \
+             <D:getcontentlength>3</D:getcontentlength>\n    \
+             <oc:checksums><oc:checksum>SHA1:{sha1} MD5:x</oc:checksum></oc:checksums>\n   \
+             </D:prop>\n   <D:status>HTTP/1.1 200 OK</D:status>\n  </D:propstat>\n </D:response>"
+        )
+    };
+    let body = format!(
+        "<?xml version=\"1.0\"?>\n<D:multistatus xmlns:D=\"DAV:\" \
+         xmlns:oc=\"http://owncloud.org/ns\">\n{}\n{}\n{}\n</D:multistatus>",
+        response_xml("", true, Some("\"root-1\""), None),
+        file("same.txt", abc),
+        // Any SHA1 other than the one of "xyz": same size, other content.
+        file("other.txt", "cb4cc28df0fdbe0ecf9d9662e294b118092a5735"),
+    );
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/dav/spaces/sid/"))
+        .and(header("Depth", "1"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(body))
+        .mount(&f.server)
+        .await;
+
+    let mut engine = f.engine(test_options());
+    let (summary, _) = next_run(&mut engine).await;
+    assert_eq!(summary.conflicts, 1);
+    let db = open_db(&f.db_path);
+    let pending = db.pending_conflicts().expect("conflicts");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].path, "other.txt");
+    assert_eq!(
+        db.get_entry("same.txt")
+            .expect("db")
+            .expect("entry")
+            .entry
+            .state,
+        EntryState::Synced
+    );
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn case_only_name_collisions_are_frozen_on_case_folding_filesystems() {
+    let f = fixture(&[], &[]).await;
+    let folds_case = f.root.with_file_name("ROOT").exists();
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    mount_propfind(
+        &f.server,
+        "",
+        "1",
+        &[
+            ("", true, Some("\"root-1\""), None),
+            ("A.txt", false, Some("\"a1\""), Some(1)),
+            ("a.txt", false, Some("\"a2\""), Some(1)),
+        ],
+    )
+    .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x"))
+        .mount(&f.server)
+        .await;
+
+    let mut engine = f.engine(test_options());
+    let (summary, events) = next_run(&mut engine).await;
+    if folds_case {
+        assert_eq!(summary.downloads, 0, "events: {events:?}");
+        assert_eq!(summary.errors, 1);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Failed { error, .. } if error.contains("upper/lower case")
+        )));
+    } else {
+        // A case-sensitive filesystem holds both files.
+        assert_eq!(summary.downloads, 2);
+    }
+    engine.stop().await;
+}

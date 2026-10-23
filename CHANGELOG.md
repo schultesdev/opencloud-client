@@ -369,3 +369,18 @@ versioning follows [Semantic Versioning](https://semver.org/).
 - `oc-app`: Ein geänderter Log-Level gilt sofort, ohne Neustart.
 - `oc-api`: Die ungenutzte Hilfsfunktion `with_retry` entfällt; die
   Retry-Logik liegt allein im HTTP-Kern.
+- `oc-api`/`oc-sync`: Der PROPFIND fragt `oc:checksums` ab. Gleich große
+  Dateien ohne bisherige Basis gelten beim Initial-Sync nur noch als
+  identisch, wenn die SHA1 übereinstimmt; sonst entsteht ein Konflikt.
+- `oc-sync`: Auf Dateisystemen ohne Unterscheidung der Groß-/
+  Kleinschreibung werden Server-Namen, die sich nur darin unterscheiden,
+  erkannt, gemeldet und eingefroren, statt sich lokal zu überschreiben
+  und danach auf dem Server gelöscht zu werden.
+- `oc-app`: „Alle pausieren“ markiert auch die einzelnen Job-Karten als
+  pausiert, egal ob über die Kopfleiste oder den Tray ausgelöst.
+
+### Changed (Review, Block 5)
+
+- `oc-app`: `gui/mod.rs` ist aufgeteilt in `accounts.rs`, `jobs.rs`,
+  `conflicts.rs`, `settings.rs`, `wizard_view.rs` und `format.rs`; der
+  Leerzustand der Tabs ist ein gemeinsamer Baustein (`theme::empty_state`).

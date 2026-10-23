@@ -71,6 +71,23 @@ pub struct DavResource {
     pub last_modified: Option<String>,
     /// Free space in bytes below the collection, if reported.
     pub quota_available_bytes: Option<u64>,
+    /// Content checksums reported by the server (`oc:checksums`), e.g.
+    /// `SHA1:… MD5:… ADLER32:…`; see [`DavResource::sha1`].
+    pub checksums: Option<String>,
+}
+
+impl DavResource {
+    /// The server's SHA1 of the content (lowercase hex), if reported.
+    pub fn sha1(&self) -> Option<String> {
+        self.checksums
+            .as_deref()?
+            .split_whitespace()
+            .find_map(|entry| {
+                let (kind, value) = entry.split_once(':')?;
+                kind.eq_ignore_ascii_case("sha1")
+                    .then(|| value.to_ascii_lowercase())
+            })
+    }
 }
 
 /// WebDAV client scoped to one space.
@@ -385,6 +402,7 @@ impl<P: TokenProvider> WebDavClient<P> {
             etag: raw.etag,
             last_modified: raw.last_modified,
             quota_available_bytes: raw.quota_available_bytes,
+            checksums: raw.checksums,
         })
     }
 

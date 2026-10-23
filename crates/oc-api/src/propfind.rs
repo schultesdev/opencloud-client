@@ -12,13 +12,14 @@ use crate::error::ApiError;
 /// PROPFIND body requesting the properties the sync engine needs:
 /// resource type, ETag, size, mtime, and free space for collections.
 pub(crate) const PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<d:propfind xmlns:d="DAV:">
+<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
  <d:prop>
   <d:resourcetype/>
   <d:getetag/>
   <d:getcontentlength/>
   <d:getlastmodified/>
   <d:quota-available-bytes/>
+  <oc:checksums/>
  </d:prop>
 </d:propfind>"#;
 
@@ -40,6 +41,8 @@ pub(crate) struct RawResource {
     /// A `<status>` directly inside `<response>` (RFC 4918 allows one in
     /// place of propstats, e.g. `404` for a resource that is gone).
     pub status: Option<String>,
+    /// `oc:checksums` content, e.g. `SHA1:… MD5:… ADLER32:…`.
+    pub checksums: Option<String>,
 }
 
 /// Whether a `HTTP/1.1 200 OK`-style status line carries a 2xx code.
@@ -58,6 +61,7 @@ struct PropStat {
     size: Option<u64>,
     last_modified: Option<String>,
     quota_available_bytes: Option<u64>,
+    checksums: Option<String>,
 }
 
 impl PropStat {
@@ -75,6 +79,7 @@ enum Pending {
     Size,
     LastModified,
     QuotaAvailable,
+    Checksum,
 }
 
 /// Parses a `207 Multi-Status` PROPFIND response body.
@@ -147,6 +152,7 @@ pub(crate) fn parse_multistatus(xml: &str) -> Result<Vec<RawResource>, ApiError>
                             resource.quota_available_bytes = resource
                                 .quota_available_bytes
                                 .or(stage.quota_available_bytes);
+                            resource.checksums = resource.checksums.take().or(stage.checksums);
                         }
                     }
                 }
@@ -205,6 +211,10 @@ fn handle_open(
             *pending = Some(Pending::QuotaAvailable);
             text.clear();
         }
+        "checksum" => {
+            *pending = Some(Pending::Checksum);
+            text.clear();
+        }
         _ => {}
     }
 }
@@ -226,6 +236,7 @@ fn handle_close(
             | "getcontentlength"
             | "getlastmodified"
             | "quota-available-bytes"
+            | "checksum"
     );
     let Some(kind) = pending else {
         return Ok(());
@@ -266,6 +277,18 @@ fn handle_close(
                 stage.quota_available_bytes = parse_quota_bytes(&value)?;
             }
         }
+        Pending::Checksum => {
+            if let Some(stage) = propstat {
+                if !value.is_empty() {
+                    // Several <oc:checksum> elements are joined.
+                    let joined = match stage.checksums.take() {
+                        Some(previous) => format!("{previous} {value}"),
+                        None => value,
+                    };
+                    stage.checksums = Some(joined);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -303,6 +326,27 @@ fn local_name(name: quick_xml::name::QName<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owncloud_checksums_are_collected() {
+        let xml = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+ <d:response>
+  <d:href>/dav/spaces/sid/a.txt</d:href>
+  <d:propstat>
+   <d:prop>
+    <oc:checksums><oc:checksum>SHA1:abc MD5:def ADLER32:01</oc:checksum></oc:checksums>
+   </d:prop>
+   <d:status>HTTP/1.1 200 OK</d:status>
+  </d:propstat>
+ </d:response>
+</d:multistatus>"#;
+        let resources = parse_multistatus(xml).expect("parse");
+        assert_eq!(
+            resources[0].checksums.as_deref(),
+            Some("SHA1:abc MD5:def ADLER32:01")
+        );
+    }
 
     #[test]
     fn responses_with_an_error_status_are_dropped() {

@@ -10,6 +10,16 @@ use oc_db::DbError;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SyncError {
+    /// Server paths differ only in case and cannot coexist on the local,
+    /// case-folding filesystem; they are left alone until one is renamed.
+    #[error(
+        "'{paths}' differ only in upper/lower case and cannot be synced side by side \
+         on this filesystem; rename one of them on the server"
+    )]
+    CaseCollision {
+        /// The colliding paths, joined for display.
+        paths: String,
+    },
     /// A request against the server failed (network, auth, protocol).
     #[error("server request failed: {0}")]
     Api(#[from] ApiError),

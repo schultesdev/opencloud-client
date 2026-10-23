@@ -683,10 +683,10 @@ async fn run_once<P: TokenProvider + 'static>(
     let skip_remote =
         options.root_etag_shortcut && stored_etag.is_some() && stored_etag == root_etag;
 
-    let (remote, names) = if skip_remote {
+    let (remote, names, checksums) = if skip_remote {
         summary.remote_scan_skipped = true;
         let names = db_lock(&job.db).server_names().unwrap_or_default();
-        (remote_from_db(&db_entries), names)
+        (remote_from_db(&db_entries), names, HashMap::new())
     } else {
         let listing = match job.dav.propfind("", Depth::One).await {
             Ok(listing) => listing,
@@ -708,7 +708,7 @@ async fn run_once<P: TokenProvider + 'static>(
                 if let Err(error) = db_lock(&job.db).replace_server_names(&snapshot.server_names) {
                     fail(&mut summary, "", &SyncError::from(error));
                 }
-                (snapshot.entries, snapshot.server_names)
+                (snapshot.entries, snapshot.server_names, snapshot.checksums)
             }
             Err(error) => {
                 abort(&mut summary, &mut aborted, error);
@@ -741,8 +741,21 @@ async fn run_once<P: TokenProvider + 'static>(
         fail(&mut summary, &path, &error);
         frozen.insert(path);
     }
+    // Server names that differ only in case cannot coexist on a
+    // case-folding filesystem: freeze them (and their subtrees) instead
+    // of letting one overwrite the other and the next pass delete it.
+    if scan::folds_case(&job.local_root) {
+        for group in scan::case_collisions(remote.keys()) {
+            let error = SyncError::CaseCollision {
+                paths: group.join("', '"),
+            };
+            fail(&mut summary, &group[0], &error);
+            frozen.extend(group);
+        }
+    }
 
     let plan = diff::build(&local, &remote, &db_entries, &frozen);
+    let plan = verify_unrecorded_matches(plan, &checksums, &job.local_root).await;
 
     // What the run plans to move — the denominator of the live
     // progress events (uploads weigh their local size, downloads their
@@ -1099,6 +1112,66 @@ fn spawn_transfer<P: TokenProvider + 'static>(
         }
     });
     (handle, task)
+}
+
+/// Checks the size-only matches of the initial sync against the server's
+/// checksums. Without a recorded baseline, the diff treats a file that
+/// exists on both sides with equal size as in sync; two different files
+/// of equal size would then silently pair up, and the next change on
+/// either side would overwrite the other. Where the server reports a
+/// SHA1, the local file is hashed (on a blocking thread); a mismatch
+/// turns the match into a conflict. Unreadable files keep the size match.
+async fn verify_unrecorded_matches(
+    plan: Vec<SyncAction>,
+    checksums: &HashMap<String, String>,
+    root: &std::path::Path,
+) -> Vec<SyncAction> {
+    let candidates: Vec<(usize, String, String)> = plan
+        .iter()
+        .enumerate()
+        .filter_map(|(index, action)| match action {
+            SyncAction::RecordSynced {
+                path,
+                is_dir: false,
+                local: Some(_),
+                remote: Some(_),
+            } => checksums
+                .get(path)
+                .map(|sha1| (index, path.clone(), sha1.clone())),
+            _ => None,
+        })
+        .collect();
+    if candidates.is_empty() {
+        return plan;
+    }
+    let root = root.to_path_buf();
+    let mismatched: HashSet<usize> = tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .filter(|(_, path, expected)| {
+                scan::local_sha1(&root, path).is_some_and(|actual| actual != *expected)
+            })
+            .map(|(index, ..)| index)
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+    plan.into_iter()
+        .enumerate()
+        .map(|(index, action)| match action {
+            SyncAction::RecordSynced {
+                path,
+                local,
+                remote,
+                ..
+            } if mismatched.contains(&index) => SyncAction::Conflict {
+                path,
+                local,
+                remote,
+            },
+            other => other,
+        })
+        .collect()
 }
 
 /// A plan step that only writes the database (batched per pass).

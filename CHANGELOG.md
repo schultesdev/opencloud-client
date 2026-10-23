@@ -413,3 +413,15 @@ versioning follows [Semantic Versioning](https://semver.org/).
 - Nach einem fehlgeschlagenen Transfer geht „noch N wartend“ auf 0.
 - Fortschritts-Events werden nur noch auf `debug` geloggt; die
   einmal pro Sekunde aus der Datenbank gelesene Liste „Aktuell: …“ entfällt.
+
+### Added (GUI — Info-Tab)
+
+- Neuer Tab „Info“: Version, Autor, Website (www.schultes.dev), Lizenz
+  (Apache-2.0) und Link zu OpenCloud; dazu Plattform/Build sowie
+  Konfigurations- und Protokollordner mit „Öffnen“-Button.
+- Die Angaben stammen aus `[workspace.package]` (`authors`, `homepage`
+  neu); für das GitHub-Projekt und den Issue-Tracker steht ein Platzhalter
+  („Link folgt“), der automatisch zu Links wird, sobald `repository`
+  gesetzt ist.
+- `LICENSE` im Repository-Wurzelverzeichnis: unveränderter Text der
+  Apache License 2.0.

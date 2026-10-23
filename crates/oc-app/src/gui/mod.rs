@@ -1,5 +1,6 @@
-//! The GUI (Phase 7): main window with the three areas "Konten & Server",
-//! "Sync-Jobs", and "Konflikte", plus the new-job wizard and the tray icon.
+//! The GUI (Phase 7): main window with the tabs "Konten", "Sync-Jobs",
+//! "Konflikte", "Einstellungen", and "Info", plus the new-job wizard and
+//! the tray icon.
 //!
 //! The engine is attached exclusively through the backend's event and
 //! command channels (see [`backend`]); job statistics and pending
@@ -8,7 +9,7 @@
 //!
 //! Layout: this module holds the app state, event handling, tray, status
 //! line, and the frame loop; each tab renders in its own module
-//! (`accounts`, `jobs`, `conflicts`, `settings`), the wizard in
+//! (`accounts`, `jobs`, `conflicts`, `settings`, `info`), the wizard in
 //! `wizard_view` (state in `wizard`), formatting helpers in `format`, and
 //! the visual building blocks in `theme`.
 
@@ -17,6 +18,7 @@ mod autostart;
 pub mod backend;
 mod conflicts;
 mod format;
+mod info;
 mod jobs;
 mod settings;
 mod speed;
@@ -78,6 +80,8 @@ enum Tab {
     Conflicts,
     /// App settings (interval, transfers, policy, autostart, logging).
     Settings,
+    /// About the program: version, author, license, links, directories.
+    Info,
 }
 
 /// UI state of one account.
@@ -588,7 +592,7 @@ impl SyncApp {
             });
     }
 
-    /// The three main tabs; the conflicts tab is badged with their count.
+    /// The main tabs; the conflicts tab is badged with their count.
     fn show_tabs(&mut self, ctx: &Context) {
         let theme = theme::palette();
         let conflicts: u64 = self
@@ -629,6 +633,7 @@ impl SyncApp {
                         (Tab::Jobs, "Sync-Jobs"),
                         (Tab::Conflicts, "Konflikte"),
                         (Tab::Settings, "Einstellungen"),
+                        (Tab::Info, "Info"),
                     ] {
                         if tab_button(ui, candidate == self.tab, label) {
                             tab = candidate;
@@ -741,6 +746,7 @@ impl App for SyncApp {
                     Tab::Jobs => self.show_jobs(ui),
                     Tab::Conflicts => self.show_conflicts(ui),
                     Tab::Settings => self.show_settings(ui),
+                    Tab::Info => self.show_info(ui),
                 });
         }
         self.show_confirm_remove(ctx);

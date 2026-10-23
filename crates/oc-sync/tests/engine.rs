@@ -1204,7 +1204,8 @@ fn seeded_conflict(f: &Setup, remote_etag: Option<&str>) -> (DirectJob, i64) {
             local_mtime: Some(200),
             local_size: Some(10),
             remote_etag: remote_etag.map(str::to_owned),
-            remote_size: Some(10),
+            // A deleted remote is recorded without ETag and size.
+            remote_size: remote_etag.map(|_| 10),
             remote_mtime: None,
         })
         .unwrap();
@@ -2021,4 +2022,48 @@ async fn sync_now_runs_once_while_paused_and_keeps_the_pause() {
     let more = tokio::time::timeout(Duration::from_millis(700), next_run(&mut engine)).await;
     assert!(more.is_err(), "a paused job ran again: {more:?}");
     engine.stop().await;
+}
+
+#[tokio::test]
+async fn resolve_server_without_remote_etag_downloads_instead_of_deleting() {
+    let f = fixture(&[], &[]).await;
+    std::fs::write(f.root.join("a.txt"), "local edit").unwrap();
+    let dav = WebDavClient::new(&f.server.uri(), "sid", StaticToken::new("tok")).unwrap();
+    let db = StatusDb::open(&f.db_path).unwrap();
+    // The server reported the file, but without an ETag.
+    let conflict_id = db
+        .record_conflict(&NewConflict {
+            path: "a.txt".to_owned(),
+            detected_at: 200,
+            local_mtime: Some(200),
+            local_size: Some(10),
+            remote_etag: None,
+            remote_size: Some(6),
+            remote_mtime: None,
+        })
+        .unwrap();
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("server"))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+
+    let db = std::sync::Mutex::new(db);
+    let outcome = resolve(
+        &dav,
+        &db,
+        &f.root,
+        conflict_id,
+        ConflictResolution::Server,
+        1024,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, ResolveOutcome::Resolved);
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("a.txt")).unwrap(),
+        "server"
+    );
+    f.server.verify().await;
 }

@@ -1,14 +1,11 @@
 //! Retry logic: exponential backoff with optional jitter.
 //!
-//! [`RetryConfig`] describes the policy, [`with_retry`] applies it to a
-//! fallible async operation whose errors implement the classification via
-//! [`ApiError::is_retryable`]. The API clients additionally honor the
-//! `Retry-After` hint of 429 responses.
+//! [`RetryConfig`] describes the policy; the clients' shared HTTP core
+//! applies it per request, classifying failures via
+//! [`ApiError::is_retryable`](crate::ApiError::is_retryable) and honoring
+//! `Retry-After` hints.
 
-use std::future::Future;
 use std::time::Duration;
-
-use crate::error::ApiError;
 
 /// Retry policy for API requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,30 +58,6 @@ impl RetryConfig {
     }
 }
 
-/// Runs `op` until it succeeds, fails with a non-retryable
-/// [`ApiError`], or the attempts are exhausted; sleeps the computed backoff
-/// between attempts.
-pub async fn with_retry<T, F, Fut>(config: &RetryConfig, mut op: F) -> Result<T, ApiError>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, ApiError>>,
-{
-    let max_attempts = config.max_attempts.max(1);
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        match op().await {
-            Ok(value) => return Ok(value),
-            Err(err) => {
-                if attempt >= max_attempts || !err.is_retryable() {
-                    return Err(err);
-                }
-                tokio::time::sleep(config.backoff(attempt)).await;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,63 +90,5 @@ mod tests {
             assert!(delay >= Duration::from_millis(500));
             assert!(delay <= Duration::from_millis(1500));
         }
-    }
-
-    #[tokio::test]
-    async fn retries_transient_errors_until_success() {
-        let config = RetryConfig::immediate();
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = std::sync::Arc::clone(&calls);
-        let result: Result<usize, ApiError> = with_retry(&config, move || {
-            let counter = std::sync::Arc::clone(&counter);
-            async move {
-                let calls = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                if calls < 3 {
-                    Err(ApiError::Server { code: 503 })
-                } else {
-                    Ok(calls)
-                }
-            }
-        })
-        .await;
-        assert_eq!(result.expect("succeeds on third attempt"), 3);
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
-    }
-
-    #[tokio::test]
-    async fn non_retryable_errors_short_circuit() {
-        let config = RetryConfig::immediate();
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = std::sync::Arc::clone(&calls);
-        let result: Result<(), ApiError> = with_retry(&config, move || {
-            let counter = std::sync::Arc::clone(&counter);
-            async move {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Err(ApiError::PreconditionFailed)
-            }
-        })
-        .await;
-        assert!(matches!(result, Err(ApiError::PreconditionFailed)));
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn exhausts_attempts_and_returns_last_error() {
-        let config = RetryConfig::immediate();
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = std::sync::Arc::clone(&calls);
-        let result: Result<(), ApiError> = with_retry(&config, move || {
-            let counter = std::sync::Arc::clone(&counter);
-            async move {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Err(ApiError::Server { code: 502 })
-            }
-        })
-        .await;
-        assert!(matches!(result, Err(ApiError::Server { code: 502 })));
-        assert_eq!(
-            calls.load(std::sync::atomic::Ordering::SeqCst) as u32,
-            config.max_attempts
-        );
     }
 }

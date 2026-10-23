@@ -843,14 +843,14 @@ impl SyncApp {
                             ui.label("Sync-Intervall");
                             ui.add(
                                 DragValue::new(&mut self.settings_edit.sync_interval_secs)
-                                    .range(1..=86400)
+                                    .range(1..=oc_config::MAX_SYNC_INTERVAL_SECS)
                                     .suffix(" s"),
                             );
                             ui.end_row();
                             ui.label("Parallele Transfers");
                             ui.add(
                                 DragValue::new(&mut self.settings_edit.max_parallel_transfers)
-                                    .range(1..=32),
+                                    .range(1..=oc_config::MAX_PARALLEL_TRANSFERS),
                             );
                             ui.end_row();
                             ui.label("Bei Konflikten");
@@ -1052,6 +1052,7 @@ impl SyncApp {
         let mut config = self.config.clone();
         config.settings = self.settings_edit.clone();
         if self.save_config(config).is_ok() {
+            crate::logging::set_level(self.config.settings.log_level);
             self.backend.send(UiCommand::ApplyJobs);
             self.engine_restarted();
         }

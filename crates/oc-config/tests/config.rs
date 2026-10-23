@@ -301,3 +301,18 @@ fn paths_point_into_config_dir() {
     );
     assert_eq!(oc_config::jobs_path(dir), PathBuf::from("/base/jobs.json"));
 }
+
+#[test]
+fn settings_upper_bounds_are_enforced() {
+    let mut config = sample_config();
+    config.settings.max_parallel_transfers = oc_config::MAX_PARALLEL_TRANSFERS + 1;
+    assert!(config.validate().is_err());
+    config.settings.max_parallel_transfers = oc_config::MAX_PARALLEL_TRANSFERS;
+    config.settings.sync_interval_secs = oc_config::MAX_SYNC_INTERVAL_SECS + 1;
+    assert!(config.validate().is_err());
+    config.settings.sync_interval_secs = 60;
+    config.settings.propfind_pause_ms = oc_config::MAX_PROPFIND_PAUSE_MS + 1;
+    assert!(config.validate().is_err());
+    config.settings.propfind_pause_ms = 0;
+    config.validate().unwrap();
+}

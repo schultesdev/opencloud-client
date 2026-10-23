@@ -231,7 +231,7 @@ impl AuthClient {
                 .map_err(|err| AuthError::Browser(err.to_string()))?;
         }
 
-        let callback = listener.wait(timeout).await?;
+        let callback = listener.wait_for_state(timeout, &state).await?;
         let code = validate_callback(&callback, &state)?;
         let tokens = client
             .exchange_code(&code, &redirect_uri, &pkce.verifier)

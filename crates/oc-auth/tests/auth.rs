@@ -565,3 +565,35 @@ async fn simultaneous_401s_refresh_once() {
     );
     server.verify().await;
 }
+
+#[tokio::test]
+async fn callback_listener_ignores_foreign_states_and_idle_connections() {
+    let listener = CallbackListener::bind().await.expect("bind");
+    let redirect_uri = listener.redirect_uri();
+    let address = redirect_uri
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_owned();
+    let handle = tokio::spawn(async move {
+        listener
+            .wait_for_state(Duration::from_secs(10), "mine")
+            .await
+    });
+
+    // A browser pre-connection that never sends anything...
+    let _idle = tokio::net::TcpStream::connect(&address)
+        .await
+        .expect("connect");
+    // ...and a response for another login must not end or block the wait.
+    let foreign = reqwest::get(format!("{redirect_uri}?code=x&state=theirs"))
+        .await
+        .expect("foreign");
+    assert_eq!(foreign.status(), 400);
+    let started = std::time::Instant::now();
+    reqwest::get(format!("{redirect_uri}?code=real&state=mine"))
+        .await
+        .expect("redirect");
+    let callback = handle.await.expect("join").expect("callback");
+    assert_eq!(callback.code.as_deref(), Some("real"));
+    assert!(started.elapsed() < Duration::from_secs(5));
+}

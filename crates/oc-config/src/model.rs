@@ -138,18 +138,32 @@ impl Default for Settings {
     }
 }
 
+/// Upper bound of `sync_interval_secs` (one day).
+pub const MAX_SYNC_INTERVAL_SECS: u64 = 86_400;
+/// Upper bound of `max_parallel_transfers`.
+pub const MAX_PARALLEL_TRANSFERS: u32 = 32;
+/// Upper bound of `propfind_pause_ms` (ten seconds per folder).
+pub const MAX_PROPFIND_PAUSE_MS: u64 = 10_000;
+
 impl Settings {
-    /// Validates the settings ranges.
+    /// Validates the settings ranges. The upper bounds match what the GUI
+    /// offers; a hand-edited file cannot ask for, say, four billion
+    /// parallel transfers or a pause that stalls a scan for hours.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.sync_interval_secs == 0 {
-            return Err(ConfigError::invalid(
-                "settings.sync_interval_secs must be at least 1",
-            ));
+        if !(1..=MAX_SYNC_INTERVAL_SECS).contains(&self.sync_interval_secs) {
+            return Err(ConfigError::invalid(format!(
+                "settings.sync_interval_secs must be between 1 and {MAX_SYNC_INTERVAL_SECS}"
+            )));
         }
-        if self.max_parallel_transfers == 0 {
-            return Err(ConfigError::invalid(
-                "settings.max_parallel_transfers must be at least 1",
-            ));
+        if !(1..=MAX_PARALLEL_TRANSFERS).contains(&self.max_parallel_transfers) {
+            return Err(ConfigError::invalid(format!(
+                "settings.max_parallel_transfers must be between 1 and {MAX_PARALLEL_TRANSFERS}"
+            )));
+        }
+        if self.propfind_pause_ms > MAX_PROPFIND_PAUSE_MS {
+            return Err(ConfigError::invalid(format!(
+                "settings.propfind_pause_ms must be at most {MAX_PROPFIND_PAUSE_MS}"
+            )));
         }
         Ok(())
     }

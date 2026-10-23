@@ -205,10 +205,7 @@ pub fn danger(ui: &mut Ui, label: impl Into<egui::WidgetText>) -> Response {
         Button::new(label)
             .fill(Color32::TRANSPARENT)
             .corner_radius(theme.corner(8))
-            .stroke(Stroke::new(
-                1.0_f32,
-                Color32::from_rgba_unmultiplied(235, 100, 105, 110),
-            )),
+            .stroke(Stroke::new(1.0_f32, tint(theme.error, 110))),
     )
 }
 

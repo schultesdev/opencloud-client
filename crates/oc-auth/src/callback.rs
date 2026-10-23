@@ -68,56 +68,96 @@ impl CallbackListener {
     /// Stray requests (e.g. a browser prefetching `/favicon.ico`) are
     /// answered and ignored; the listener keeps waiting.
     pub async fn wait(self, timeout: Duration) -> Result<Callback, AuthError> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        self.wait_for(timeout, None).await
+    }
+
+    /// Like [`CallbackListener::wait`], but only a response carrying
+    /// `expected_state` ends the wait. Any other request on the port —
+    /// another local program guessing it, a stale browser tab — is
+    /// rejected and ignored instead of failing the login.
+    pub async fn wait_for_state(
+        self,
+        timeout: Duration,
+        expected_state: &str,
+    ) -> Result<Callback, AuthError> {
+        self.wait_for(timeout, Some(expected_state.to_owned()))
+            .await
+    }
+
+    /// Accepts connections until one carries a matching authorization
+    /// response. Connections are served concurrently, so a browser's idle
+    /// pre-connection cannot hold up the real redirect.
+    async fn wait_for(
+        self,
+        timeout: Duration,
+        expected_state: Option<String>,
+    ) -> Result<Callback, AuthError> {
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        let (found_tx, mut found_rx) = tokio::sync::mpsc::unbounded_channel();
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(AuthError::Timeout {
-                    timeout_secs: timeout.as_secs(),
-                });
-            }
-            let (stream, _) = match tokio::time::timeout(remaining, self.listener.accept()).await {
-                Ok(accept) => accept?,
-                Err(_) => {
+            tokio::select! {
+                _ = &mut deadline => {
                     return Err(AuthError::Timeout {
                         timeout_secs: timeout.as_secs(),
                     });
                 }
-            };
-            if let Some(callback) = Self::handle(stream).await? {
-                return Ok(callback);
+                Some(callback) = found_rx.recv() => return Ok(callback),
+                accepted = self.listener.accept() => {
+                    let (stream, _) = accepted?;
+                    let found = found_tx.clone();
+                    let expected = expected_state.clone();
+                    tokio::spawn(async move {
+                        if let Some(callback) = handle(stream, expected.as_deref()).await {
+                            let _ = found.send(callback);
+                        }
+                    });
+                }
             }
         }
-    }
-
-    /// Reads one HTTP request, answers it, and returns `Some` when it is an
-    /// authorization response.
-    async fn handle(mut stream: TcpStream) -> Result<Option<Callback>, AuthError> {
-        let head = match read_request_head(&mut stream).await {
-            Ok(head) => head,
-            Err(_) => {
-                return Ok(None);
-            }
-        };
-        let mut parts = head.split(' ');
-        let method = parts.next().unwrap_or_default();
-        let target = parts.next().unwrap_or_default();
-        if method != "GET" {
-            respond(&mut stream, 405, "Method Not Allowed", "").await;
-            return Ok(None);
-        }
-        let query = target
-            .split_once('?')
-            .map_or(String::new(), |(_, q)| q.to_string());
-        let callback = Callback::from_query(&query);
-        if callback == Callback::default() {
-            respond(&mut stream, 404, "Not Found", "").await;
-            return Ok(None);
-        }
-        respond(&mut stream, 200, "OK", SUCCESS_PAGE).await;
-        Ok(Some(callback))
     }
 }
+
+/// Reads one HTTP request, answers it, and returns the authorization
+/// response it carries — `None` for anything else (other paths or
+/// methods, no OAuth parameters, a foreign `state`).
+async fn handle(mut stream: TcpStream, expected_state: Option<&str>) -> Option<Callback> {
+    let head = read_request_head(&mut stream).await.ok()?;
+    let mut parts = head.split(' ');
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    if method != "GET" {
+        respond(&mut stream, 405, "Method Not Allowed", "").await;
+        return None;
+    }
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    // The redirect URI is the root (`http://127.0.0.1:<port>/`).
+    if path != "/" {
+        respond(&mut stream, 404, "Not Found", "").await;
+        return None;
+    }
+    let callback = Callback::from_query(query);
+    if callback == Callback::default() {
+        respond(&mut stream, 404, "Not Found", "").await;
+        return None;
+    }
+    if expected_state.is_some_and(|expected| callback.state.as_deref() != Some(expected)) {
+        respond(&mut stream, 400, "Bad Request", FOREIGN_PAGE).await;
+        return None;
+    }
+    if callback.error.is_some() {
+        respond(&mut stream, 200, "OK", FAILURE_PAGE).await;
+    } else {
+        respond(&mut stream, 200, "OK", SUCCESS_PAGE).await;
+    }
+    Some(callback)
+}
+
+/// Page for a refused or failed login.
+const FAILURE_PAGE: &str = "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"><title>OpenCloud Sync</title></head><body><h1>Anmeldung nicht abgeschlossen</h1><p>Die Anmeldung wurde abgelehnt oder ist fehlgeschlagen. Dieses Fenster kann geschlossen werden.</p></body></html>";
+
+/// Page for a request that does not belong to the running login.
+const FOREIGN_PAGE: &str = "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"><title>OpenCloud Sync</title></head><body><h1>Unbekannte Anmeldung</h1><p>Diese Antwort gehört nicht zur laufenden Anmeldung.</p></body></html>";
 
 /// Success page shown in the browser after the redirect.
 const SUCCESS_PAGE: &str = "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"><title>OpenCloud Sync</title></head><body><h1>Anmeldung erfolgreich</h1><p>Dieses Fenster kann geschlossen werden; die Synchronisation wird fortgesetzt.</p></body></html>";

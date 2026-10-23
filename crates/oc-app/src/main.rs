@@ -28,6 +28,11 @@ use oc_db::{StatusDb, db_path};
 /// OpenCloud sync client.
 #[derive(Debug, Parser)]
 #[command(name = "opencloud-sync", version, about = "Sync client for OpenCloud")]
+#[command(group(
+    clap::ArgGroup::new("mode")
+        .args(["login", "logout", "list_spaces", "conflicts", "resolve", "status", "sync_once"])
+        .multiple(false)
+))]
 struct Args {
     /// Run without GUI: start the sync engine only (CLI mode).
     #[arg(long)]
@@ -39,6 +44,21 @@ struct Args {
     /// in and start the engine in one call.
     #[arg(long, value_name = "ACCOUNT_ID")]
     login: Option<String>,
+
+    /// Logs an account out: revokes its refresh token at the server (best
+    /// effort) and removes it from the OS keyring.
+    #[arg(long, value_name = "ACCOUNT_ID")]
+    logout: Option<String>,
+
+    /// Prints every job with its state: login, files and folders,
+    /// pending conflicts, errors, and the last sync.
+    #[arg(long)]
+    status: bool,
+
+    /// Runs one sync pass for every enabled job and exits; the exit code
+    /// is non-zero when a pass reported errors (for cron/scripts).
+    #[arg(long)]
+    sync_once: bool,
 
     /// Lists the spaces of the account via the Graph API and prints id,
     /// type, and name of each space. Requires a prior `--login`.
@@ -85,9 +105,12 @@ async fn main() {
     );
     let cli_only = args.headless
         || args.login.is_some()
+        || args.logout.is_some()
         || args.list_spaces.is_some()
         || args.conflicts
-        || args.resolve.is_some();
+        || args.resolve.is_some()
+        || args.status
+        || args.sync_once;
     if !cli_only {
         // The GUI is the default; it blocks until the user quits.
         if let Err(error) = gui::run(args.config_dir.as_deref()) {
@@ -97,21 +120,25 @@ async fn main() {
         return;
     }
     let config_dir = args.config_dir.as_deref();
-    let result = match (args.login.as_deref(), args.list_spaces.as_deref()) {
-        (Some(account_id), _) => match run_login(account_id, config_dir).await {
-            Ok(()) if args.headless => run_headless(config_dir).await,
+    // The modes exclude each other (clap group "mode"); --headless may
+    // follow a --login.
+    let result = if let Some(account_id) = args.login.as_deref() {
+        match run_login(account_id, config_dir).await {
+            Ok(()) if args.headless => run_headless(config_dir, false).await,
             other => other,
-        },
-        (None, Some(account_id)) => run_list_spaces(account_id, config_dir).await,
-        (None, None) => {
-            if let Some([target, winner, ..]) = args.resolve.as_deref() {
-                run_resolve(config_dir, target, winner).await
-            } else if args.conflicts {
-                run_conflicts(config_dir)
-            } else {
-                run_headless(config_dir).await
-            }
         }
+    } else if let Some(account_id) = args.logout.as_deref() {
+        run_logout(account_id, config_dir).await
+    } else if let Some(account_id) = args.list_spaces.as_deref() {
+        run_list_spaces(account_id, config_dir).await
+    } else if let Some([target, winner, ..]) = args.resolve.as_deref() {
+        run_resolve(config_dir, target, winner).await
+    } else if args.conflicts {
+        run_conflicts(config_dir)
+    } else if args.status {
+        run_status(config_dir)
+    } else {
+        run_headless(config_dir, args.sync_once).await
     };
     if let Err(error) = result {
         eprintln!("error: {error}");
@@ -156,6 +183,68 @@ async fn run_login(
         "login complete; refresh token stored for account '{}'",
         account.id
     );
+    Ok(())
+}
+
+/// Logs an account out: revokes and removes its refresh token.
+async fn run_logout(
+    account_id: &str,
+    config_dir: Option<&std::path::Path>,
+) -> Result<(), Box<dyn Error>> {
+    let account = find_account(config_dir, account_id)?;
+    let auth = AuthClient::new(&account.server_url)?;
+    let manager = TokenManager::new(auth, KeyringStore::new(), &account.id);
+    manager.logout().await?;
+    println!("account '{}' logged out", account.id);
+    Ok(())
+}
+
+/// Prints every job's state from config, keyring, and status database.
+fn run_status(config_dir: Option<&std::path::Path>) -> Result<(), Box<dyn Error>> {
+    let (config_dir, config, jobs) = load_workspace(config_dir)?;
+    if jobs.jobs.is_empty() {
+        println!("no jobs configured");
+        return Ok(());
+    }
+    let mut logins: HashMap<&str, bool> = HashMap::new();
+    for account in &config.accounts {
+        let logged_in = AuthClient::new(&account.server_url)
+            .map(|auth| TokenManager::new(auth, KeyringStore::new(), &account.id))
+            .is_ok_and(|manager| manager.has_stored_login());
+        logins.insert(account.id.as_str(), logged_in);
+    }
+    for job in &jobs.jobs {
+        let login = if logins
+            .get(job.account_id.as_str())
+            .copied()
+            .unwrap_or(false)
+        {
+            "logged in"
+        } else {
+            "not logged in"
+        };
+        let state = if job.enabled { "enabled" } else { "disabled" };
+        println!(
+            "{} ({state}, account '{}' {login}) -> {}",
+            job.id,
+            job.account_id,
+            job.local_path.display()
+        );
+        match open_job_db(&config_dir, &job.id)? {
+            Some(db) => {
+                let stats = db.stats()?;
+                let last = stats
+                    .last_sync
+                    .map(|unix| format!("{unix} (unix)"))
+                    .unwrap_or_else(|| "never".into());
+                println!(
+                    "    {} files, {} folders, {} conflicts, {} errors, last sync {last}",
+                    stats.files, stats.dirs, stats.conflicts, stats.errors
+                );
+            }
+            None => println!("    not synced yet"),
+        }
+    }
     Ok(())
 }
 
@@ -289,17 +378,18 @@ async fn run_resolve(
             let conflict_id: i64 = target
                 .parse()
                 .map_err(|_| format!("invalid conflict id '{target}'"))?;
-            let matches: Vec<&oc_config::SyncJob> = jobs
-                .jobs
-                .iter()
-                .filter(|job| {
-                    open_job_db(&config_dir, &job.id)
-                        .ok()
-                        .flatten()
-                        .and_then(|db| db.get_conflict(conflict_id).ok().flatten())
-                        .is_some_and(|conflict| conflict.status == ConflictStatus::Pending)
-                })
-                .collect();
+            let mut matches: Vec<&oc_config::SyncJob> = Vec::new();
+            for job in &jobs.jobs {
+                let Some(db) = open_job_db(&config_dir, &job.id)? else {
+                    continue;
+                };
+                let pending = db
+                    .get_conflict(conflict_id)?
+                    .is_some_and(|conflict| conflict.status == ConflictStatus::Pending);
+                if pending {
+                    matches.push(job);
+                }
+            }
             match matches.as_slice() {
                 [job] => (*job, conflict_id),
                 [] => return Err(format!("no pending conflict with id {conflict_id}").into()),
@@ -376,8 +466,12 @@ async fn run_resolve(
 }
 
 /// Loads config and jobs, starts the engine for every enabled job, and
-/// prints its events until Ctrl-C.
-async fn run_headless(config_dir: Option<&std::path::Path>) -> Result<(), Box<dyn Error>> {
+/// prints its events until Ctrl-C — or, with `once`, until every job
+/// finished one pass (an error then fails the call).
+async fn run_headless(
+    config_dir: Option<&std::path::Path>,
+    once: bool,
+) -> Result<(), Box<dyn Error>> {
     let (config_dir, config, jobs) = load_workspace(config_dir)?;
 
     let accounts: HashMap<&str, &Account> = config
@@ -469,17 +563,29 @@ async fn run_headless(config_dir: Option<&std::path::Path>) -> Result<(), Box<dy
         ..oc_sync::EngineOptions::default()
     };
     let mut engine = oc_sync::Engine::start(engine_jobs, options)?;
-    println!(
-        "sync engine started ({} job(s)); press Ctrl-C to exit",
-        engine.job_count()
-    );
+    if once {
+        println!("running one pass for {} job(s)", engine.job_count());
+    } else {
+        println!(
+            "sync engine started ({} job(s)); press Ctrl-C to exit",
+            engine.job_count()
+        );
+    }
 
+    // `--sync-once`: the first finished pass of every job ends the run.
+    let mut finished: HashMap<String, oc_sync::RunSummary> = HashMap::new();
     loop {
         tokio::select! {
             event = engine.events_mut().recv() => match event {
                 Some(event) => {
                     tracing::info!("{event}");
                     println!("{event}");
+                    if let oc_sync::EngineEvent::RunFinished { job_id, summary } = event {
+                        finished.entry(job_id).or_insert(summary);
+                        if once && finished.len() >= engine.job_count() {
+                            break;
+                        }
+                    }
                 }
                 None => break,
             },
@@ -488,5 +594,15 @@ async fn run_headless(config_dir: Option<&std::path::Path>) -> Result<(), Box<dy
     }
     engine.stop().await;
     println!("sync engine stopped");
+    if once {
+        let failed: Vec<&String> = finished
+            .iter()
+            .filter(|(_, summary)| summary.errors > 0)
+            .map(|(job_id, _)| job_id)
+            .collect();
+        if !failed.is_empty() {
+            return Err(format!("pass reported errors in job(s) {failed:?}").into());
+        }
+    }
     Ok(())
 }

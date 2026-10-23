@@ -351,3 +351,21 @@ versioning follows [Semantic Versioning](https://semver.org/).
   Blocking-Thread.
 - `oc-app`: Der Wizard-Ordnerbaum kopiert seine Einträge nicht mehr pro
   Frame; `derive_include` ist linear in der Tiefe.
+
+### Fixed (Review, Block 5 — Aufräumen und Härtung)
+
+- `oc-sync`: Eine Server-Datei ohne ETag gilt bei der Konfliktlösung
+  nicht mehr als gelöscht; „Server übernehmen“ lädt sie herunter, statt
+  die lokale Datei zu löschen.
+- `oc-auth`: Der Login-Listener bedient Verbindungen parallel (eine
+  stumme Vorab-Verbindung des Browsers bremst nichts mehr), akzeptiert
+  nur den Pfad `/` und den eigenen `state` und zeigt bei Ablehnung eine
+  passende Seite.
+- `oc-config`: Obergrenzen für Intervall, parallele Transfers und
+  PROPFIND-Pause, gleich denen der GUI.
+- `oc-app`: Neue CLI-Modi `--logout`, `--status` und `--sync-once`;
+  Modus-Flags schließen sich gegenseitig aus. `--resolve` mit bloßer ID
+  meldet DB-Fehler statt sie zu verschlucken.
+- `oc-app`: Ein geänderter Log-Level gilt sofort, ohne Neustart.
+- `oc-api`: Die ungenutzte Hilfsfunktion `with_retry` entfällt; die
+  Retry-Logik liegt allein im HTTP-Kern.

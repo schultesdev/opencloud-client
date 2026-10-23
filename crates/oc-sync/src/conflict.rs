@@ -112,15 +112,15 @@ async fn resolve_server<P: TokenProvider>(
     remote_path: &str,
     chunk_size: u64,
 ) -> Result<ResolveOutcome, SyncError> {
-    let Some(etag) = conflict.remote_etag.clone() else {
+    if !remote_exists(conflict) {
         // The server side was deleted: accept the deletion locally.
         remove_local(local_root, &conflict.path)?;
         db_lock(db).delete_entry(&conflict.path)?;
         return Ok(ResolveOutcome::Resolved);
-    };
+    }
     let remote = RemoteNode {
         is_dir: false,
-        etag: Some(etag),
+        etag: conflict.remote_etag.clone(),
         size: conflict.remote_size,
     };
     // The user (or policy) chose the server side: overwrite unconditionally.
@@ -168,8 +168,9 @@ async fn resolve_local<P: TokenProvider>(
     }
     // `create` covers the "remote was deleted, local changed" case: the
     // upload re-creates the file; a server that got a new file in the
-    // meantime rejects `If-None-Match` with 412 — handled below.
-    let create = conflict.remote_etag.is_none();
+    // meantime rejects `If-None-Match` with 412 — handled below. A remote
+    // file without ETag cannot be guarded and is overwritten as chosen.
+    let create = !remote_exists(conflict);
     let paths = TransferPaths {
         root: local_root,
         path: &conflict.path,
@@ -206,6 +207,14 @@ async fn resolve_local<P: TokenProvider>(
             Ok(ResolveOutcome::RemoteChanged)
         }
     }
+}
+
+/// Whether the server side of a conflict existed at detection: a deleted
+/// remote is recorded without ETag *and* size. (A server may omit the
+/// ETag of an existing file; that must not read as "deleted", or "server
+/// wins" would delete the local file.)
+fn remote_exists(conflict: &Conflict) -> bool {
+    conflict.remote_etag.is_some() || conflict.remote_size.is_some()
 }
 
 /// Records the state after a successful resolution: the entry is back

@@ -1,6 +1,7 @@
 //! Tray icon (Phase 7): status tooltip (running/errors/conflicts), menu
 //! with show/pause/quit, and close-to-tray. Events are polled from the
-//! global `tray-icon` channels each frame — no extra event loop needed.
+//! global `tray-icon` channels each frame. On Linux the icon runs on its
+//! own gtk thread (tray-icon requires a gtk main loop there).
 
 use tray_icon::TrayIcon;
 use tray_icon::TrayIconBuilder;
@@ -25,43 +26,111 @@ pub enum TrayAction {
     Quit,
 }
 
-/// The tray icon handle; keep it alive or the icon disappears.
-pub struct Tray {
+/// A change for the tray icon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Update {
+    /// Switch the pause menu label.
+    Paused(bool),
+    /// Replace the status tooltip.
+    Tooltip(String),
+}
+
+/// The platform tray objects; they must stay on the thread that created
+/// them (they are not `Send`).
+struct Parts {
     icon: TrayIcon,
-    show: MenuItem,
     toggle: MenuItem,
+}
+
+/// Builds icon and menu; `None` when the platform rejected the icon.
+fn build() -> Option<Parts> {
+    let show = MenuItem::with_id(SHOW_ID, "Fenster zeigen", true, None);
+    let toggle = MenuItem::with_id(TOGGLE_ID, "Alle pausieren", true, None);
+    let quit = MenuItem::with_id(QUIT_ID, "Beenden", true, None);
+    let separator = PredefinedMenuItem::separator();
+    let menu = Menu::new();
+    let _ = menu.append(&show);
+    let _ = menu.append(&toggle);
+    let _ = menu.append(&separator);
+    let _ = menu.append(&quit);
+    let icon = tray_icon::Icon::from_rgba(ICON_RGBA.to_vec(), ICON_WIDTH, ICON_HEIGHT).ok()?;
+    let icon = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("OpenCloud Sync")
+        .with_icon(icon)
+        .build()
+        .ok()?;
+    Some(Parts { icon, toggle })
+}
+
+/// Applies one update to the tray objects.
+fn apply(parts: &Parts, update: Update) {
+    match update {
+        Update::Paused(paused) => parts.toggle.set_text(if paused {
+            "Alle fortsetzen"
+        } else {
+            "Alle pausieren"
+        }),
+        Update::Tooltip(tooltip) => {
+            let _ = parts.icon.set_tooltip(Some(&tooltip));
+        }
+    }
+}
+
+/// Menu item ids; menu events are matched by id on every platform.
+const SHOW_ID: &str = "show";
+/// See [`SHOW_ID`].
+const TOGGLE_ID: &str = "toggle-pause";
+/// See [`SHOW_ID`].
+const QUIT_ID: &str = "quit";
+
+/// The tray icon handle; keep it alive or the icon disappears.
+///
+/// On macOS and Windows the icon lives on the GUI thread (create it once
+/// the event loop runs, i.e. in eframe's app creator). On Linux it needs a
+/// running gtk main loop on its own thread: the icon is built there and
+/// receives updates through a channel.
+pub struct Tray {
+    #[cfg(not(target_os = "linux"))]
+    parts: Parts,
+    #[cfg(target_os = "linux")]
+    updates: std::sync::mpsc::Sender<Update>,
+    /// The last tooltip sent (the status is refreshed every second;
+    /// unchanged values are not re-applied).
+    tooltip: Option<String>,
 }
 
 impl Tray {
     /// Builds the tray icon; `None` when the platform rejected it (the
     /// app keeps running without tray).
     pub fn new() -> Option<Self> {
-        let show = MenuItem::with_id("show", "Fenster zeigen", true, None);
-        let toggle = MenuItem::with_id("toggle-pause", "Alle pausieren", true, None);
-        let quit = MenuItem::with_id("quit", "Beenden", true, None);
-        let separator = PredefinedMenuItem::separator();
-        let menu = Menu::new();
-        let _ = menu.append(&show);
-        let _ = menu.append(&toggle);
-        let _ = menu.append(&separator);
-        let _ = menu.append(&quit);
-        let icon = tray_icon::Icon::from_rgba(ICON_RGBA.to_vec(), ICON_WIDTH, ICON_HEIGHT).ok()?;
-        let icon = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_tooltip("OpenCloud Sync")
-            .with_icon(icon)
-            .build()
-            .ok()?;
-        Some(Self { icon, show, toggle })
+        #[cfg(not(target_os = "linux"))]
+        {
+            build().map(|parts| Self {
+                parts,
+                tooltip: None,
+            })
+        }
+        #[cfg(target_os = "linux")]
+        {
+            linux::spawn().map(|updates| Self {
+                updates,
+                tooltip: None,
+            })
+        }
+    }
+
+    /// Hands an update to the tray objects.
+    fn send(&self, update: Update) {
+        #[cfg(not(target_os = "linux"))]
+        apply(&self.parts, update);
+        #[cfg(target_os = "linux")]
+        let _ = self.updates.send(update);
     }
 
     /// Updates the pause label ("Alle pausieren" / "Alle fortsetzen").
     pub fn set_paused(&self, paused: bool) {
-        self.toggle.set_text(if paused {
-            "Alle fortsetzen"
-        } else {
-            "Alle pausieren"
-        });
+        self.send(Update::Paused(paused));
     }
 
     /// Sets the status tooltip, e.g. `OpenCloud Sync — 2 Konflikte`.
@@ -76,19 +145,21 @@ impl Tray {
         if conflicts > 0 {
             tooltip.push_str(&format!(" — {conflicts} Konflikte"));
         }
-        let _ = self.icon.set_tooltip(Some(&tooltip));
+        if self.tooltip.as_deref() != Some(tooltip.as_str()) {
+            self.tooltip = Some(tooltip.clone());
+            self.send(Update::Tooltip(tooltip));
+        }
     }
 
     /// Drains pending menu and tray events into actions.
     pub fn poll(&self) -> Vec<TrayAction> {
         let mut actions = Vec::new();
         while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == self.show.id() {
-                actions.push(TrayAction::Show);
-            } else if event.id == self.toggle.id() {
-                actions.push(TrayAction::TogglePause);
-            } else if event.id.0 == "quit" {
-                actions.push(TrayAction::Quit);
+            match event.id.0.as_str() {
+                SHOW_ID => actions.push(TrayAction::Show),
+                TOGGLE_ID => actions.push(TrayAction::TogglePause),
+                QUIT_ID => actions.push(TrayAction::Quit),
+                _ => {}
             }
         }
         // Left-click shows the window (Windows/Linux tray behavior).
@@ -104,5 +175,53 @@ impl Tray {
             actions.push(TrayAction::Show);
         }
         actions
+    }
+}
+
+/// The gtk thread hosting the tray icon on Linux.
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::Update;
+
+    /// Starts the gtk thread and builds the icon there; returns the
+    /// update channel, or `None` when gtk or the icon is unavailable
+    /// (e.g. no appindicator) — the app then runs without tray.
+    pub(super) fn spawn() -> Option<mpsc::Sender<Update>> {
+        let (updates, inbox) = mpsc::channel::<Update>();
+        let (ready_tx, ready_rx) = mpsc::channel::<bool>();
+        std::thread::Builder::new()
+            .name("oc-tray".to_owned())
+            .spawn(move || {
+                if gtk::init().is_err() {
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+                let Some(parts) = super::build() else {
+                    let _ = ready_tx.send(false);
+                    return;
+                };
+                let _ = ready_tx.send(true);
+                gtk::glib::timeout_add_local(Duration::from_millis(250), move || {
+                    loop {
+                        match inbox.try_recv() {
+                            Ok(update) => super::apply(&parts, update),
+                            Err(mpsc::TryRecvError::Empty) => {
+                                return gtk::glib::ControlFlow::Continue;
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                // The app dropped its tray handle.
+                                gtk::main_quit();
+                                return gtk::glib::ControlFlow::Break;
+                            }
+                        }
+                    }
+                });
+                gtk::main();
+            })
+            .ok()?;
+        ready_rx.recv().ok().filter(|ready| *ready).map(|_| updates)
     }
 }

@@ -1988,3 +1988,37 @@ async fn nfd_named_server_folders_are_addressed_by_their_server_spelling() {
     f.server.verify().await;
     engine.stop().await;
 }
+
+#[tokio::test]
+async fn sync_now_runs_once_while_paused_and_keeps_the_pause() {
+    let f = fixture(&[], &[]).await;
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    mount_propfind(&f.server, "", "1", &[("", true, Some("\"root-1\""), None)]).await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(201).append_header("ETag", "\"p1\""))
+        .mount(&f.server)
+        .await;
+
+    let mut options = test_options();
+    options.sync_interval = Duration::from_millis(200);
+    let mut engine = f.engine(options);
+    next_run(&mut engine).await;
+    engine
+        .send("job-1", JobCommand::Pause)
+        .await
+        .expect("pause");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    std::fs::write(f.root.join("now.txt"), "x").expect("write");
+    engine
+        .send("job-1", JobCommand::SyncNow)
+        .await
+        .expect("sync now");
+    let (run, _) = next_run(&mut engine).await;
+    assert_eq!(run.uploads, 1);
+
+    // Still paused: the short interval triggers no further pass.
+    let more = tokio::time::timeout(Duration::from_millis(700), next_run(&mut engine)).await;
+    assert!(more.is_err(), "a paused job ran again: {more:?}");
+    engine.stop().await;
+}

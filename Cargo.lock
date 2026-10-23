@@ -3186,6 +3186,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "eframe",
+ "gtk",
  "oc-api",
  "oc-auth",
  "oc-config",

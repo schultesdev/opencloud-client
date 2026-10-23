@@ -33,6 +33,9 @@ pub struct SpacesState {
     pub loading: bool,
     /// The loaded spaces, once available.
     pub list: Option<Vec<Space>>,
+    /// Why the last request failed; no new request is sent until the
+    /// user retries (otherwise every frame would send one).
+    pub error: Option<String>,
 }
 
 /// The lazily loaded remote folder tree (wizard step 4).
@@ -42,6 +45,9 @@ pub struct FolderTree {
     pub children: HashMap<String, Vec<DavResource>>,
     /// Pending child requests: path -> correlation token.
     pub loading: HashMap<String, u32>,
+    /// Failed child requests: path -> error. Not re-sent automatically;
+    /// [`FolderTree::retry`] clears the failure.
+    pub failed: HashMap<String, String>,
     /// Expanded folders.
     pub expanded: HashSet<String>,
     /// Selected folders (the job's `include` list).
@@ -62,7 +68,10 @@ impl FolderTree {
         server_path: &str,
         send: impl FnOnce(UiCommand),
     ) {
-        if self.children.contains_key(path) || self.loading.contains_key(path) {
+        if self.children.contains_key(path)
+            || self.loading.contains_key(path)
+            || self.failed.contains_key(path)
+        {
             return;
         }
         self.next_token = self.next_token.wrapping_add(1);
@@ -91,12 +100,22 @@ impl FolderTree {
         self.loading.remove(&path);
         match result {
             Ok(children) => {
+                self.failed.remove(&path);
                 self.children.insert(path.clone(), children);
                 self.expanded.insert(path);
                 true
             }
-            Err(_) => true,
+            Err(error) => {
+                self.failed.insert(path, error);
+                true
+            }
         }
+    }
+
+    /// Forgets a failed request for `path`, so the next
+    /// [`FolderTree::fetch`] sends it again.
+    pub fn retry(&mut self, path: &str) {
+        self.failed.remove(path);
     }
 
     /// Whether a folder or one of its descendants is selected (drives the
@@ -199,8 +218,11 @@ impl Wizard {
     pub fn apply_spaces(&mut self, result: Result<Vec<Space>, String>) {
         self.spaces.loading = false;
         match result {
-            Ok(list) => self.spaces.list = Some(list),
-            Err(error) => self.status = Some(error),
+            Ok(list) => {
+                self.spaces.list = Some(list);
+                self.spaces.error = None;
+            }
+            Err(error) => self.spaces.error = Some(error),
         }
     }
 
@@ -208,11 +230,12 @@ impl Wizard {
     /// ignored); reports whether the answer was consumed. Errors land
     /// in the wizard's status line.
     pub fn apply_children(&mut self, token: u32, result: Result<Vec<DavResource>, String>) -> bool {
-        match &result {
-            Ok(_) => self.status = None,
-            Err(error) => self.status = Some(error.clone()),
+        let status = result.as_ref().err().cloned();
+        let consumed = self.tree.apply_children(token, result);
+        if consumed {
+            self.status = status;
         }
-        self.tree.apply_children(token, result)
+        consumed
     }
 
     /// Resets the space-dependent state (after choosing another space).
@@ -230,6 +253,29 @@ mod tests {
 
     fn set(paths: &[&str]) -> HashSet<String> {
         paths.iter().map(|path| path.to_string()).collect()
+    }
+
+    #[test]
+    fn failed_requests_are_not_resent_until_retried() {
+        let mut tree = FolderTree::default();
+        let mut sent = 0;
+        tree.fetch("a", "s", "", "", |_| sent += 1);
+        let token = tree.next_token;
+        assert!(tree.apply_children(token, Err("boom".into())));
+        // Every frame calls fetch again; nothing is sent.
+        tree.fetch("a", "s", "", "", |_| sent += 1);
+        tree.fetch("a", "s", "", "", |_| sent += 1);
+        assert_eq!(sent, 1);
+        tree.retry("");
+        tree.fetch("a", "s", "", "", |_| sent += 1);
+        assert_eq!(sent, 2);
+    }
+
+    #[test]
+    fn stale_answers_leave_the_status_alone() {
+        let mut wizard = Wizard::default();
+        assert!(!wizard.apply_children(42, Err("old".into())));
+        assert_eq!(wizard.status, None);
     }
 
     #[test]

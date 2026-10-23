@@ -40,13 +40,14 @@ pub enum UiCommand {
     PauseAll,
     /// Resume all jobs.
     ResumeAll,
-    /// Resolve a pending conflict: download the server version over the
-    /// local file (`Server`) or upload the local version (`Local`).
-    ResolveConflict {
-        /// The job the conflict belongs to.
+    /// Resolve pending conflicts of one job: download the server version
+    /// over the local file (`Server`) or upload the local version
+    /// (`Local`). One answer per conflict ([`BackendEvent::ResolveFinished`]).
+    ResolveConflicts {
+        /// The job the conflicts belong to.
         job_id: String,
-        /// The conflict row id.
-        conflict_id: i64,
+        /// The conflict row ids, resolved one after the other.
+        conflict_ids: Vec<i64>,
         /// Which side wins.
         resolution: ConflictResolution,
     },
@@ -165,9 +166,15 @@ pub fn spawn(config_dir: PathBuf) -> Result<(BackendHandle, Receiver<BackendEven
     spawn_forwarder(engine.take_events(), gui_tx.clone());
 
     let (command_tx, command_rx) = mpsc::unbounded_channel();
-    tokio::spawn(backend_task(
-        config_dir, managers, gui_tx, command_rx, engine,
-    ));
+    let backend = Backend {
+        config_dir,
+        managers,
+        gui: gui_tx,
+        // Weak: the backend must not keep its own command channel open,
+        // or it would never notice the GUI quitting.
+        internal: command_tx.downgrade(),
+    };
+    tokio::spawn(backend_task(backend, command_rx, engine));
     Ok((
         BackendHandle {
             commands: command_tx,
@@ -176,12 +183,41 @@ pub fn spawn(config_dir: PathBuf) -> Result<(BackendHandle, Receiver<BackendEven
     ))
 }
 
-/// The backend task: serves UI commands until the GUI drops its handle,
-/// then stops the engine cleanly.
-async fn backend_task(
+/// What the backend's tasks share.
+#[derive(Clone)]
+struct Backend {
+    /// The configuration directory.
     config_dir: PathBuf,
+    /// Token managers per account.
     managers: Managers,
+    /// The GUI's event channel.
     gui: Sender<BackendEvent>,
+    /// The backend's own command channel (e.g. to restart the engine after
+    /// a login finished in its own task).
+    internal: mpsc::WeakUnboundedSender<UiCommand>,
+}
+
+impl Backend {
+    /// Sends an event to the GUI; a closed GUI is ignored.
+    fn report(&self, event: BackendEvent) {
+        let _ = self.gui.send(event);
+    }
+
+    /// Asks the backend task for an engine restart.
+    fn request_restart(&self) {
+        if let Some(commands) = self.internal.upgrade() {
+            let _ = commands.send(UiCommand::ApplyJobs);
+        }
+    }
+}
+
+/// The backend task: serves UI commands until the GUI drops its handle,
+/// then stops the engine cleanly. Engine commands are applied in order;
+/// requests that talk to the server (login, spaces, folder tree,
+/// conflicts) run as their own tasks, so a pending browser login does
+/// not hold up pause/resume or the wizard.
+async fn backend_task(
+    backend: Backend,
     mut commands: mpsc::UnboundedReceiver<UiCommand>,
     mut engine: Engine,
 ) {
@@ -189,7 +225,7 @@ async fn backend_task(
         match command {
             UiCommand::JobCmd { job_id, command } => {
                 if engine.send(&job_id, command).await.is_err() {
-                    let _ = gui.send(BackendEvent::Message {
+                    backend.report(BackendEvent::Message {
                         message: format!("Job '{job_id}' läuft nicht mehr (Engine neustarten?)"),
                     });
                 }
@@ -197,33 +233,43 @@ async fn backend_task(
             UiCommand::PauseAll => engine.pause_all().await,
             UiCommand::ResumeAll => engine.resume_all().await,
             UiCommand::ApplyJobs => {
-                engine = restart_engine(&config_dir, &managers, &gui, engine).await;
+                engine =
+                    restart_engine(&backend.config_dir, &backend.managers, &backend.gui, engine)
+                        .await;
             }
             UiCommand::Login { account_id } => {
-                let result = run_login(&config_dir, &managers, &account_id).await;
-                let _ = gui.send(BackendEvent::LoginFinished {
-                    account_id: account_id.clone(),
-                    result: result.clone(),
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    let result =
+                        run_login(&backend.config_dir, &backend.managers, &account_id).await;
+                    let ok = result.is_ok();
+                    backend.report(BackendEvent::LoginFinished { account_id, result });
+                    if ok {
+                        backend.request_restart();
+                    }
                 });
-                if result.is_ok() {
-                    engine = restart_engine(&config_dir, &managers, &gui, engine).await;
-                }
             }
             UiCommand::Logout { account_id } => {
-                let result = run_logout(&config_dir, &managers, &account_id).await;
-                let _ = gui.send(BackendEvent::LogoutFinished {
-                    account_id: account_id.clone(),
-                    result: result.clone(),
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    let result =
+                        run_logout(&backend.config_dir, &backend.managers, &account_id).await;
+                    let ok = result.is_ok();
+                    backend.report(BackendEvent::LogoutFinished { account_id, result });
+                    if ok {
+                        backend.request_restart();
+                    }
                 });
-                if result.is_ok() {
-                    engine = restart_engine(&config_dir, &managers, &gui, engine).await;
-                }
             }
             UiCommand::ListSpaces { account_id } => {
-                let result = run_list_spaces(&config_dir, &managers, &account_id).await;
-                let _ = gui.send(BackendEvent::Spaces {
-                    account_id,
-                    result: result.map_err(|error| error.to_string()),
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    let result =
+                        run_list_spaces(&backend.config_dir, &backend.managers, &account_id).await;
+                    backend.report(BackendEvent::Spaces {
+                        account_id,
+                        result: result.map_err(|error| error.to_string()),
+                    });
                 });
             }
             UiCommand::FetchChildren {
@@ -232,24 +278,30 @@ async fn backend_task(
                 path,
                 token,
             } => {
-                let result =
-                    run_fetch_children(&config_dir, &managers, &account_id, &space_id, &path).await;
-                let _ = gui.send(BackendEvent::Children {
-                    token,
-                    result: result.map_err(|error| error.to_string()),
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    let result = run_fetch_children(
+                        &backend.config_dir,
+                        &backend.managers,
+                        &account_id,
+                        &space_id,
+                        &path,
+                    )
+                    .await;
+                    backend.report(BackendEvent::Children {
+                        token,
+                        result: result.map_err(|error| error.to_string()),
+                    });
                 });
             }
-            UiCommand::ResolveConflict {
+            UiCommand::ResolveConflicts {
                 job_id,
-                conflict_id,
+                conflict_ids,
                 resolution,
             } => {
-                let result =
-                    run_resolve(&config_dir, &managers, &job_id, conflict_id, resolution).await;
-                let _ = gui.send(BackendEvent::ResolveFinished {
-                    job_id,
-                    conflict_id,
-                    result,
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    run_resolve(&backend, &job_id, &conflict_ids, resolution).await;
                 });
             }
         }
@@ -260,22 +312,28 @@ async fn backend_task(
 /// Rebuilds the engine from the current `config.json`/`jobs.json` and
 /// wires a fresh event forwarder. Used after every change that affects
 /// the running jobs (new job, filters, settings, login/logout).
+///
+/// The configuration is loaded and validated before the running engine is
+/// stopped: an unreadable file keeps the current engine running.
 async fn restart_engine(
     config_dir: &std::path::Path,
     managers: &Managers,
     gui: &Sender<BackendEvent>,
     mut engine: Engine,
 ) -> Engine {
-    engine.stop().await;
     let (config, jobs) = match load_workspace(config_dir) {
         Ok(pair) => pair,
         Err(error) => {
             let _ = gui.send(BackendEvent::Message {
-                message: format!("Konfiguration unlesbar, Engine gestoppt: {error}"),
+                message: format!(
+                    "Konfiguration unlesbar, die Engine läuft mit dem bisherigen Stand weiter: \
+                     {error}"
+                ),
             });
             return engine;
         }
     };
+    engine.stop().await;
     prune_orphan_dbs(config_dir, &jobs);
     match start_engine(config_dir, managers, &config, &jobs) {
         Ok((mut new_engine, notices)) => {
@@ -287,7 +345,9 @@ async fn restart_engine(
         }
         Err(error) => {
             let _ = gui.send(BackendEvent::Message {
-                message: format!("Sync-Engine konnte nicht gestartet werden: {error}"),
+                message: format!(
+                    "Sync-Engine konnte nicht gestartet werden, alle Jobs stehen: {error}"
+                ),
             });
             engine
         }
@@ -470,14 +530,55 @@ async fn run_fetch_children(
     Ok(folders)
 }
 
-/// Resolves one pending conflict (see `PLAN.md`, Phase 6).
+/// Resolves pending conflicts of one job (see `PLAN.md`, Phase 6) with
+/// one client and one database connection, reporting each outcome.
 async fn run_resolve(
+    backend: &Backend,
+    job_id: &str,
+    conflict_ids: &[i64],
+    resolution: ConflictResolution,
+) {
+    let setup = resolve_setup(&backend.config_dir, &backend.managers, job_id);
+    let (dav, db, local_path) = match setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            for &conflict_id in conflict_ids {
+                backend.report(BackendEvent::ResolveFinished {
+                    job_id: job_id.to_owned(),
+                    conflict_id,
+                    result: Err(error.clone()),
+                });
+            }
+            return;
+        }
+    };
+    let chunk = EngineOptions::default().download_chunk_size;
+    for &conflict_id in conflict_ids {
+        let result = oc_sync::resolve(&dav, &db, &local_path, conflict_id, resolution, chunk)
+            .await
+            .map(|outcome| matches!(outcome, oc_sync::ResolveOutcome::Resolved))
+            .map_err(|error| error.to_string());
+        backend.report(BackendEvent::ResolveFinished {
+            job_id: job_id.to_owned(),
+            conflict_id,
+            result,
+        });
+    }
+}
+
+/// Client, database, and local root for resolving a job's conflicts.
+type ResolveSetup = (
+    WebDavClient<Arc<Manager>>,
+    std::sync::Mutex<StatusDb>,
+    PathBuf,
+);
+
+/// Builds what [`run_resolve`] needs for one job.
+fn resolve_setup(
     config_dir: &std::path::Path,
     managers: &Managers,
     job_id: &str,
-    conflict_id: i64,
-    resolution: ConflictResolution,
-) -> Result<bool, String> {
+) -> Result<ResolveSetup, String> {
     let (job, server) = job_server(config_dir, job_id)?;
     let manager = managers.get(&job.account_id, &server)?;
     require_login(&manager, &job.account_id)?;
@@ -485,12 +586,7 @@ async fn run_resolve(
         WebDavClient::new(&server, &job.space_id, manager).map_err(|error| error.to_string())?;
     let db_path = db_path(config_dir, &job.id).map_err(|error| error.to_string())?;
     let db = StatusDb::open(db_path).map_err(|error| error.to_string())?;
-    let db = std::sync::Mutex::new(db);
-    let chunk = EngineOptions::default().download_chunk_size;
-    let outcome = oc_sync::resolve(&dav, &db, &job.local_path, conflict_id, resolution, chunk)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(matches!(outcome, oc_sync::ResolveOutcome::Resolved))
+    Ok((dav, std::sync::Mutex::new(db), job.local_path))
 }
 
 /// Builds the engine jobs from config + jobs, skipping accounts without

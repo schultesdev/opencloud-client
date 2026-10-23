@@ -348,7 +348,8 @@ pub struct Engine {
 impl Engine {
     /// Starts one task per job and returns the engine handle. Each job
     /// runs a sync pass immediately, then on watcher triggers and the
-    /// periodic interval.
+    /// periodic interval. A job whose watcher cannot be installed runs
+    /// with the interval only (reported as [`EngineEvent::Failed`]).
     pub fn start<P: TokenProvider + 'static>(
         jobs: Vec<Job<P>>,
         options: EngineOptions,
@@ -359,12 +360,24 @@ impl Engine {
         for job in jobs {
             let (command_tx, command_rx) = mpsc::channel(16);
             let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
+            // A failing watcher (e.g. inotify limit reached) must not keep
+            // the other jobs from starting: the job falls back to the
+            // periodic scan, and the failure is reported.
             let watcher = if options.watch {
-                Some(LocalWatcher::start(
-                    job.local_root.clone(),
-                    options.debounce,
-                    trigger_tx,
-                )?)
+                match LocalWatcher::start(job.local_root.clone(), options.debounce, trigger_tx) {
+                    Ok(watcher) => Some(watcher),
+                    Err(error) => {
+                        let _ = event_tx.send(EngineEvent::Failed {
+                            job_id: job.id.clone(),
+                            path: String::new(),
+                            error: format!(
+                                "file watcher unavailable, falling back to the periodic scan: \
+                                 {error}"
+                            ),
+                        });
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -458,6 +471,8 @@ async fn job_loop<P: TokenProvider + 'static>(
 ) {
     let mut paused = false;
     let mut pending = true; // one pass right after startup
+    // A `SyncNow` runs one pass even while paused; the pause stays.
+    let mut forced = false;
     // Offline bookkeeping: `backoff` doubles per failed attempt, capped;
     // no pass starts before `next_attempt` while the server is down.
     let mut offline = false;
@@ -471,8 +486,9 @@ async fn job_loop<P: TokenProvider + 'static>(
     );
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        if pending && !paused && tokio::time::Instant::now() >= next_attempt {
+        if pending && (!paused || forced) && tokio::time::Instant::now() >= next_attempt {
             pending = false;
+            forced = false;
             let _ = events.send(EngineEvent::RunStarted {
                 job_id: job.id.clone(),
             });
@@ -527,13 +543,18 @@ async fn job_loop<P: TokenProvider + 'static>(
                 }
             }
             // Wake for the next offline retry attempt.
-            _ = tokio::time::sleep_until(next_attempt), if pending && !paused => {}
+            _ = tokio::time::sleep_until(next_attempt), if pending && (!paused || forced) => {}
             command = commands.recv() => match command {
                 Some(JobCommand::Pause) => paused = true,
-                Some(JobCommand::Resume) | Some(JobCommand::SyncNow) => {
-                    // Catch up on what changed while the job was paused;
-                    // an explicit run also cancels an offline backoff.
-                    paused = false;
+                Some(command @ (JobCommand::Resume | JobCommand::SyncNow)) => {
+                    // Resume catches up on what changed while the job was
+                    // paused; SyncNow runs one pass and keeps a pause.
+                    // Either cancels an offline backoff.
+                    if command == JobCommand::Resume {
+                        paused = false;
+                    } else {
+                        forced = true;
+                    }
                     pending = true;
                     offline = false;
                     backoff = options.offline_backoff_base;

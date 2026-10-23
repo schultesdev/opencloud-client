@@ -153,6 +153,12 @@ struct SyncApp {
     paused_all: bool,
     /// The tray icon, when the platform allows one.
     tray: Option<Tray>,
+    /// Set by the tray's "Beenden": the next close request is honored
+    /// instead of hiding the window.
+    quitting: bool,
+    /// Conflicts with a resolution request in flight (job id, conflict
+    /// id); their buttons stay disabled until the backend answers.
+    resolving: HashSet<(String, i64)>,
     /// Whether the OS autostart entry is currently present.
     autostart_active: bool,
     /// Whether the theme has been applied to the context (once).
@@ -202,7 +208,10 @@ impl SyncApp {
             message: None,
             errors: Vec::new(),
             paused_all: false,
-            tray: Tray::new(),
+            // Created in eframe's app creator, once the event loop runs.
+            tray: None,
+            quitting: false,
+            resolving: HashSet::new(),
             autostart_active: crate::gui::autostart::is_enabled(),
             styled: false,
             icon: None,
@@ -277,20 +286,23 @@ impl SyncApp {
                 job_id,
                 conflict_id,
                 result,
-            } => match result {
-                Ok(true) => {
-                    self.notify(format!("Konflikt #{conflict_id} in '{job_id}' gelöst"));
-                    self.refresh_dbs();
+            } => {
+                self.resolving.remove(&(job_id.clone(), conflict_id));
+                match result {
+                    Ok(true) => {
+                        self.notify(format!("Konflikt #{conflict_id} in '{job_id}' gelöst"));
+                        self.refresh_dbs();
+                    }
+                    Ok(false) => {
+                        self.notify(format!(
+                            "Konflikt #{conflict_id} in '{job_id}' bleibt offen: \
+                             der Server hat sich zwischenzeitlich geändert"
+                        ));
+                        self.refresh_dbs();
+                    }
+                    Err(error) => self.notify(format!("Konfliktlösung fehlgeschlagen: {error}")),
                 }
-                Ok(false) => {
-                    self.notify(format!(
-                        "Konflikt #{conflict_id} in '{job_id}' bleibt offen: \
-                         der Server hat sich zwischenzeitlich geändert"
-                    ));
-                    self.refresh_dbs();
-                }
-                Err(error) => self.notify(format!("Konfliktlösung fehlgeschlagen: {error}")),
-            },
+            }
             BackendEvent::Message { message } => self.notify(message),
         }
     }
@@ -448,9 +460,10 @@ impl SyncApp {
 
     /// Handles tray menu actions and the close-to-tray behavior.
     fn poll_tray(&mut self, ctx: &Context) {
-        // The close button hides the window instead of quitting (tray);
-        // quitting goes through the tray menu.
-        if ctx.input(|i| i.viewport().close_requested()) {
+        // With a tray, the close button hides the window and quitting
+        // goes through the tray menu. Without one (platform refused it),
+        // closing quits — a hidden window could never be brought back.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting && self.tray.is_some() {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
@@ -479,6 +492,7 @@ impl SyncApp {
                     }
                 }
                 TrayAction::Quit => {
+                    self.quitting = true;
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
             }
@@ -901,7 +915,9 @@ impl SyncApp {
                         .spacing(egui::Vec2::new(24.0, 10.0))
                         .show(ui, |ui| {
                             ui.label("Bei Anmeldung starten");
-                            let mut autostart = self.settings_edit.autostart;
+                            // The checkbox shows the OS state, which is
+                            // what actually starts the app.
+                            let mut autostart = self.autostart_active;
                             ui.horizontal(|ui| {
                                 if ui.checkbox(&mut autostart, "").changed() {
                                     self.toggle_autostart(autostart);
@@ -971,8 +987,13 @@ impl SyncApp {
         };
         match result {
             Ok(()) => {
+                // The OS entry changed right away, so the setting is saved
+                // right away too ("Verwerfen" must not undo only half).
                 self.settings_edit.autostart = autostart;
                 self.autostart_active = autostart;
+                let mut config = self.config.clone();
+                config.settings.autostart = autostart;
+                let _ = self.save_config(config);
                 self.notify(if autostart {
                     "Autostart aktiviert"
                 } else {
@@ -999,47 +1020,71 @@ impl SyncApp {
             self.new_account.error = Some(format!("Konto '{}' existiert bereits", account.id));
             return false;
         }
+        let account_id = account.id.clone();
+        let mut config = self.config.clone();
+        config.accounts.push(account);
+        if let Err(error) = self.save_config(config) {
+            self.new_account.error = Some(format!("Speichern fehlgeschlagen: {error}"));
+            return false;
+        }
         self.new_account.error = None;
         self.accounts.insert(
-            account.id.clone(),
+            account_id,
             AccountUi {
                 logged_in: Some(false),
                 ..AccountUi::default()
             },
         );
-        self.config.accounts.push(account);
-        self.persist_config();
         self.new_account = NewAccountForm::default();
         true
     }
 
-    /// Persists the GUI's config copy.
-    fn persist_config(&mut self) {
-        match oc_config::save_config(&self.config_dir, &self.config) {
-            Ok(()) => self.notify("Konfiguration gespeichert"),
-            Err(error) => self.notify(format!("Speichern fehlgeschlagen: {error}")),
+    /// Saves `config` and, only on success, makes it the GUI's copy — a
+    /// failed save must not leave the GUI showing state that is not on
+    /// disk (and that a later save would write after all).
+    fn save_config(&mut self, config: Config) -> Result<(), String> {
+        match oc_config::save_config(&self.config_dir, &config) {
+            Ok(()) => {
+                self.config = config;
+                self.notify("Konfiguration gespeichert");
+                Ok(())
+            }
+            Err(error) => {
+                self.notify(format!("Speichern fehlgeschlagen: {error}"));
+                Err(error.to_string())
+            }
         }
     }
 
-    /// Persists the GUI's jobs copy and restarts the engine.
-    fn persist_jobs(&mut self) {
-        match oc_config::save_jobs(&self.config_dir, &self.jobs) {
+    /// Saves `jobs` and, only on success, makes it the GUI's copy (see
+    /// [`SyncApp::save_config`]). With `restart`, the engine picks the
+    /// change up.
+    fn save_jobs(&mut self, jobs: Jobs, restart: bool) -> Result<(), String> {
+        match oc_config::save_jobs(&self.config_dir, &jobs) {
             Ok(()) => {
-                self.notify("Jobs gespeichert");
-                self.backend.send(UiCommand::ApplyJobs);
-                self.engine_restarted();
+                self.jobs = jobs;
+                if restart {
+                    self.backend.send(UiCommand::ApplyJobs);
+                    self.engine_restarted();
+                }
+                Ok(())
             }
-            Err(error) => self.notify(format!("Speichern fehlgeschlagen: {error}")),
+            Err(error) => {
+                self.notify(format!("Speichern fehlgeschlagen: {error}"));
+                Err(error.to_string())
+            }
         }
     }
 
     /// Saves the edited settings and restarts the engine (interval,
     /// parallel transfers, conflict policy).
     fn save_settings(&mut self) {
-        self.config.settings = self.settings_edit.clone();
-        self.persist_config();
-        self.backend.send(UiCommand::ApplyJobs);
-        self.engine_restarted();
+        let mut config = self.config.clone();
+        config.settings = self.settings_edit.clone();
+        if self.save_config(config).is_ok() {
+            self.backend.send(UiCommand::ApplyJobs);
+            self.engine_restarted();
+        }
     }
 
     /// The "Sync-Jobs" tab.
@@ -1115,13 +1160,13 @@ impl SyncApp {
         let Some(name) = self.lookup_space_name(&job.account_id, &job.space_id) else {
             return job.space_id.clone();
         };
-        if let Some(stored) = self.jobs.jobs.iter_mut().find(|stored| stored.id == job.id) {
+        let mut jobs = self.jobs.clone();
+        if let Some(stored) = jobs.jobs.iter_mut().find(|stored| stored.id == job.id) {
             stored.space_name = Some(name.clone());
             // Informational only — the engine does not read it, so no
-            // restart is triggered.
-            if let Err(error) = oc_config::save_jobs(&self.config_dir, &self.jobs) {
-                self.notify(format!("Speichern fehlgeschlagen: {error}"));
-            }
+            // restart is triggered. A failed save is retried next frame
+            // at the latest; the name is shown either way.
+            let _ = self.save_jobs(jobs, false);
         }
         name
     }
@@ -1247,7 +1292,7 @@ impl SyncApp {
                         theme::primary(ui, "Jetzt synchronisieren")
                     });
                     if sync_now.inner.clicked() {
-                        state.paused = false;
+                        // One pass now; a paused job stays paused.
                         self.backend.send(UiCommand::JobCmd {
                             job_id: job.id.clone(),
                             command: JobCommand::SyncNow,
@@ -1380,6 +1425,10 @@ impl SyncApp {
             });
             return;
         }
+        // Clicks are collected while rendering and sent afterwards;
+        // conflicts already being resolved keep their buttons disabled.
+        let mut requests: Vec<(String, Vec<i64>, ConflictResolution)> = Vec::new();
+        let resolving = &self.resolving;
         ScrollArea::vertical().show(ui, |ui| {
             theme::content_column(ui, |ui| {
                 ui.add_space(4.0);
@@ -1391,23 +1440,33 @@ impl SyncApp {
                         theme::heading(ui, &title);
                         theme::badge(ui, list.len() as u64, theme.error);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::quiet(ui, "Alle: Client behalten").clicked() {
-                                for conflict in &list {
-                                    self.backend.send(UiCommand::ResolveConflict {
-                                        job_id: job_id.clone(),
-                                        conflict_id: conflict.id,
-                                        resolution: ConflictResolution::Local,
-                                    });
-                                }
+                            let open: Vec<i64> = list
+                                .iter()
+                                .map(|conflict| conflict.id)
+                                .filter(|id| !resolving.contains(&(job_id.clone(), *id)))
+                                .collect();
+                            let any_open = !open.is_empty();
+                            if ui
+                                .add_enabled_ui(any_open, |ui| {
+                                    theme::quiet(ui, "Alle: Client behalten")
+                                })
+                                .inner
+                                .clicked()
+                            {
+                                requests.push((
+                                    job_id.clone(),
+                                    open.clone(),
+                                    ConflictResolution::Local,
+                                ));
                             }
-                            if theme::quiet(ui, "Alle: Server übernehmen").clicked() {
-                                for conflict in &list {
-                                    self.backend.send(UiCommand::ResolveConflict {
-                                        job_id: job_id.clone(),
-                                        conflict_id: conflict.id,
-                                        resolution: ConflictResolution::Server,
-                                    });
-                                }
+                            if ui
+                                .add_enabled_ui(any_open, |ui| {
+                                    theme::quiet(ui, "Alle: Server übernehmen")
+                                })
+                                .inner
+                                .clicked()
+                            {
+                                requests.push((job_id.clone(), open, ConflictResolution::Server));
                             }
                         });
                     });
@@ -1421,19 +1480,36 @@ impl SyncApp {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if theme::primary(ui, "Client behalten").clicked() {
-                                            self.backend.send(UiCommand::ResolveConflict {
-                                                job_id: job_id.clone(),
-                                                conflict_id: conflict.id,
-                                                resolution: ConflictResolution::Local,
-                                            });
+                                        let busy =
+                                            resolving.contains(&(job_id.clone(), conflict.id));
+                                        if busy {
+                                            ui.spinner();
                                         }
-                                        if theme::quiet(ui, "Server übernehmen").clicked() {
-                                            self.backend.send(UiCommand::ResolveConflict {
-                                                job_id: job_id.clone(),
-                                                conflict_id: conflict.id,
-                                                resolution: ConflictResolution::Server,
-                                            });
+                                        if ui
+                                            .add_enabled_ui(!busy, |ui| {
+                                                theme::primary(ui, "Client behalten")
+                                            })
+                                            .inner
+                                            .clicked()
+                                        {
+                                            requests.push((
+                                                job_id.clone(),
+                                                vec![conflict.id],
+                                                ConflictResolution::Local,
+                                            ));
+                                        }
+                                        if ui
+                                            .add_enabled_ui(!busy, |ui| {
+                                                theme::quiet(ui, "Server übernehmen")
+                                            })
+                                            .inner
+                                            .clicked()
+                                        {
+                                            requests.push((
+                                                job_id.clone(),
+                                                vec![conflict.id],
+                                                ConflictResolution::Server,
+                                            ));
                                         }
                                         ui.with_layout(
                                             egui::Layout::top_down(egui::Align::Min),
@@ -1501,6 +1577,27 @@ impl SyncApp {
                     ui.add_space(10.0);
                 }
             });
+        });
+        for (job_id, conflict_ids, resolution) in requests {
+            self.resolve_conflicts(job_id, conflict_ids, resolution);
+        }
+    }
+
+    /// Sends a resolution request and marks the conflicts as in progress
+    /// until the backend answers.
+    fn resolve_conflicts(
+        &mut self,
+        job_id: String,
+        conflict_ids: Vec<i64>,
+        resolution: ConflictResolution,
+    ) {
+        for id in &conflict_ids {
+            self.resolving.insert((job_id.clone(), *id));
+        }
+        self.backend.send(UiCommand::ResolveConflicts {
+            job_id,
+            conflict_ids,
+            resolution,
         });
     }
 
@@ -1678,6 +1775,23 @@ impl SyncApp {
             );
             return;
         }
+        if let Some(error) = wizard.spaces.error.clone() {
+            ui.label(
+                egui::RichText::new(format!("Spaces konnten nicht geladen werden: {error}"))
+                    .small()
+                    .color(theme.error),
+            );
+            if theme::quiet(ui, "Erneut versuchen").clicked() {
+                wizard.spaces.error = None;
+                if let Some(state) = self.accounts.get_mut(account_id) {
+                    // Drop a cached failure so the request is sent again.
+                    if matches!(state.spaces, Some(Err(_))) {
+                        state.spaces = None;
+                    }
+                }
+            }
+            return;
+        }
         if wizard.spaces.list.is_none() && !wizard.spaces.loading {
             match account.and_then(|state| state.spaces.as_ref()) {
                 Some(Ok(list)) => wizard.spaces.list = Some(list.clone()),
@@ -1810,6 +1924,16 @@ impl SyncApp {
                     .color(theme.text_dim),
             );
         }
+        if let Some(error) = wizard.tree.failed.get("").cloned() {
+            ui.label(
+                egui::RichText::new(format!("Ordner konnten nicht geladen werden: {error}"))
+                    .small()
+                    .color(theme.error),
+            );
+            if theme::quiet(ui, "Erneut versuchen").clicked() {
+                wizard.tree.retry("");
+            }
+        }
         let children = wizard.tree.children.get("").cloned().unwrap_or_default();
         for child in children {
             self.show_tree_node(ui, wizard, &child, 0, account_id, space_id);
@@ -1854,14 +1978,27 @@ impl SyncApp {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let expanded = wizard.tree.expanded.contains(&path);
             let loaded = wizard.tree.children.contains_key(&path);
+            let failed = wizard.tree.failed.contains_key(&path);
             let toggle = if wizard.tree.loading.contains_key(&path) {
                 "…"
+            } else if failed {
+                "!"
             } else if expanded {
                 "▾"
             } else {
                 "▸"
             };
-            if ui.small_button(toggle).clicked() {
+            let button = ui.small_button(toggle);
+            let button = match wizard.tree.failed.get(&path) {
+                Some(error) => {
+                    button.on_hover_text(format!("Fehler: {error} — klicken zum Wiederholen"))
+                }
+                None => button,
+            };
+            if button.clicked() {
+                if failed {
+                    wizard.tree.retry(&path);
+                }
                 if !loaded {
                     wizard
                         .tree
@@ -1935,7 +2072,8 @@ impl SyncApp {
                 let id = unique_job_id(&self.jobs, "job-1", |id| {
                     db_path(&config_dir, id).is_ok_and(|path| path.exists())
                 });
-                self.jobs.jobs.push(SyncJob {
+                let mut jobs = self.jobs.clone();
+                jobs.jobs.push(SyncJob {
                     id: id.clone(),
                     account_id,
                     space_id,
@@ -1945,26 +2083,25 @@ impl SyncApp {
                     include,
                     exclude: Vec::new(),
                 });
-                if let Err(error) = oc_config::save_jobs(&self.config_dir, &self.jobs) {
-                    self.notify(format!("Speichern fehlgeschlagen: {error}"));
+                if let Err(error) = self.save_jobs(jobs, true) {
+                    wizard.status = Some(error);
                     return false;
                 }
                 self.notify(format!("Job '{id}' angelegt"));
             }
             Mode::EditFolders { job_id } => {
-                let Some(job) = self.jobs.jobs.iter_mut().find(|job| job.id == job_id) else {
+                let mut jobs = self.jobs.clone();
+                let Some(job) = jobs.jobs.iter_mut().find(|job| job.id == job_id) else {
                     return false;
                 };
                 job.include = include;
-                if let Err(error) = oc_config::save_jobs(&self.config_dir, &self.jobs) {
-                    self.notify(format!("Speichern fehlgeschlagen: {error}"));
+                if let Err(error) = self.save_jobs(jobs, true) {
+                    wizard.status = Some(error);
                     return false;
                 }
                 self.notify(format!("Ordnerauswahl von '{job_id}' gespeichert"));
             }
         }
-        self.backend.send(UiCommand::ApplyJobs);
-        self.engine_restarted();
         true
     }
 
@@ -1988,7 +2125,8 @@ impl SyncApp {
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(
-                        "Die lokalen Dateien bleiben erhalten; die Statusdatenbank wird behalten.",
+                        "Die lokalen Dateien bleiben erhalten; die Statusdatenbank des Jobs \
+                         wird gelöscht.",
                     )
                     .small()
                     .color(theme.text_dim),
@@ -1996,11 +2134,17 @@ impl SyncApp {
                 ui.add_space(10.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if theme::danger(ui, "Entfernen").clicked() {
-                        self.jobs.jobs.retain(|job| job.id != job_id);
-                        self.job_states.remove(&job_id);
+                        let mut jobs = self.jobs.clone();
+                        jobs.jobs.retain(|job| job.id != job_id);
+                        // Close the GUI's connection first, so the
+                        // backend can delete the database file (if the
+                        // save fails, the next refresh reopens it).
                         self.dbs.remove(&job_id);
+                        if self.save_jobs(jobs, true).is_ok() {
+                            self.job_states.remove(&job_id);
+                            self.notify(format!("Job '{job_id}' entfernt"));
+                        }
                         self.confirm_remove = None;
-                        self.persist_jobs();
                     }
                     if theme::quiet(ui, "Abbrechen").clicked() {
                         self.confirm_remove = None;
@@ -2083,7 +2227,12 @@ pub fn run(config_dir: Option<&Path>) -> Result<(), String> {
     eframe::run_native(
         "OpenCloud Sync",
         options,
-        Box::new(move |_cc| Ok(Box::new(app))),
+        Box::new(move |_cc| {
+            // tray-icon wants the event loop running before the icon is
+            // created (macOS); this closure runs inside it.
+            app.tray = Tray::new();
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|error| error.to_string())
 }

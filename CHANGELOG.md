@@ -298,3 +298,30 @@ versioning follows [Semantic Versioning](https://semver.org/).
   Endpunkte; Server-URLs mit Unterpfad funktionieren; mehrere gleichzeitige
   401 lösen nur einen Refresh aus; Token-Antworten ohne `expires_in`
   werden akzeptiert.
+
+### Fixed (Review, Block 3 — GUI-Korrektheit)
+
+- `oc-app`: „Beenden“ im Tray beendet die App; ohne Tray schließt das
+  Fensterkreuz die App, statt das Fenster unerreichbar zu verstecken.
+- `oc-app`: Das Tray-Icon entsteht erst bei laufender Event-Loop (macOS)
+  und läuft unter Linux auf einem eigenen gtk-Thread, wie `tray-icon`
+  es verlangt.
+- `oc-app`: Der Wizard sendet fehlgeschlagene Ordner- und
+  Space-Anfragen nicht mehr in jedem Frame neu; stattdessen gibt es
+  „Erneut versuchen“.
+- `oc-app`: Konto-, Job- und Einstellungsänderungen werden erst nach
+  erfolgreichem Speichern übernommen; ein Speicherfehler hinterlässt
+  keine Phantom-Jobs mehr.
+- `oc-app`: Der Engine-Neustart prüft die Konfiguration, bevor die
+  laufende Engine gestoppt wird.
+- `oc-app`: Login, Spaces, Ordnerbaum und Konfliktlösung laufen als
+  eigene Tasks; ein offener Browser-Login blockiert nichts mehr.
+  „Alle: …“ löst die Konflikte eines Jobs mit einer Verbindung; laufende
+  Lösungen sperren ihre Buttons.
+- `oc-app`: Autostart-Einträge maskieren den Programmpfad je Plattform,
+  „deaktivieren“ meldet echte Fehler, „aktiv“ heißt „zeigt auf dieses
+  Programm“; die Einstellung wird beim Umschalten sofort gespeichert.
+- `oc-sync`/`oc-app`: „Jetzt synchronisieren“ läuft auch bei pausiertem
+  Job einmal und hebt die Pause nicht mehr auf.
+- `oc-sync`: Ein nicht installierbarer Dateiwächter verhindert den Start
+  der Engine nicht mehr; der Job nutzt dann den periodischen Scan.

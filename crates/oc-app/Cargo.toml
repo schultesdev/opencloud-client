@@ -30,3 +30,8 @@ workspace = true
 
 [target."cfg(windows)".dependencies]
 winreg = "0.56.0"
+
+# tray-icon needs a gtk main loop on Linux (see gui/tray.rs); the same
+# gtk version is already pulled in by tray-icon/muda and rfd.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"

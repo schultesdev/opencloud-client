@@ -208,3 +208,31 @@ versioning follows [Semantic Versioning](https://semver.org/).
   Propstat-404, Namensraumvarianten, malformed), URL-Encoding, NFC,
   Graph-/WebDAV-Operationen, Fehlermapping, Retry-/Retry-After-Logik und
   401-Neuanmeldung — jeweils mit `wiremock`.
+
+### Changed (GUI-Überarbeitung, `oc-app`)
+
+- Inhalte aller Tabs und des Wizards laufen in einer zentrierten Spalte
+  (max. 960 px); Karten wirken auf breiten Fenstern nicht mehr leer.
+- Konten-Tab: kompakte Kontokarten (Avatar, Server, Status-Pille,
+  An-/Abmelden, Spaces aktualisieren); Spaces mit Typ-Chip und
+  Quota-Balken. „Konto hinzufügen“ als aufklappbares Formular.
+- Neuer Tab „Einstellungen“ (Synchronisation / Programm) mit Hinweis
+  auf ungespeicherte Änderungen und „Verwerfen“.
+- Job-Karten: Status-Pille, „Jetzt synchronisieren“, Pause-Icon und
+  ein Menü für Öffnen, Ordnerauswahl und Entfernen statt fünf
+  gleichrangiger Buttons; Details und Fortschritt darunter.
+- Konflikte gruppiert nach Space-Name mit Anzahl, Lokal/Server als
+  Tabelle.
+- Wizard lädt die Spaces automatisch (bzw. übernimmt bereits geladene)
+  und warnt bei nicht angemeldetem Konto.
+- Statuszeile meldet „Server nicht erreichbar“, wenn ein Job offline ist.
+- Minimale Fenstergröße auf 760×520 gesenkt; der Titel im Kopf entfällt
+  bei schmalen Fenstern.
+
+### Fixed (GUI)
+
+- Quota ohne bekanntes Limit zeigt „8.2 GB belegt“ statt
+  „8.2 GB von 0 B belegt“.
+- Status-Punkte werden gezeichnet statt als Glyphe gesetzt (die
+  eingebauten Schriften enthalten kein „●“, es erschien ein leeres
+  Kästchen).

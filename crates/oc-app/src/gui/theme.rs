@@ -1,6 +1,7 @@
 //! The visual theme of the GUI: a coherent color palette (dark base,
 //! blue accent, semantic status colors) plus reusable building blocks —
-//! cards, status dots, count badges, primary buttons, and avatars.
+//! cards, status pills, count badges, quota bars, primary buttons,
+//! avatars, and the centered content column every tab lives in.
 //!
 //! Everything the UI paints goes through here, so the look can be tuned
 //! in one place (`palette()` / [`apply`]).
@@ -20,6 +21,10 @@ use egui::Vec2;
 /// Font scale applied to the built-in fonts (1.06 reads friendlier at
 /// desktop sizes than the tiny egui default).
 const FONT_SCALE: f32 = 1.06;
+
+/// Maximum width of the content column: on wide windows the cards stay
+/// readable instead of stretching across the whole width.
+pub const CONTENT_MAX_WIDTH: f32 = 960.0;
 
 /// The palette of the app.
 #[derive(Debug, Clone, Copy)]
@@ -110,8 +115,8 @@ pub fn apply(ctx: &Context) {
     visuals.widgets.open.weak_bg_fill = theme.card;
     visuals.widgets.open.corner_radius = theme.corner(8);
 
-    style.spacing.item_spacing = Vec2::new(10.0, 8.0);
-    style.spacing.button_padding = Vec2::new(14.0, 7.0);
+    style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+    style.spacing.button_padding = Vec2::new(12.0, 6.0);
     style.spacing.interact_size.y = 21.0;
     ctx.set_style(style);
 }
@@ -133,6 +138,24 @@ fn scale_fonts(ctx: &Context) {
         fonts.font_data.insert(name, std::sync::Arc::new(data));
     }
     ctx.set_fonts(fonts);
+}
+
+/// A centered column of at most [`CONTENT_MAX_WIDTH`]: the tabs and the
+/// wizard render inside it, so cards keep a readable width on wide
+/// windows. Narrower windows get the full available width.
+pub fn content_column<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    let available = ui.available_width();
+    let width = available.min(CONTENT_MAX_WIDTH);
+    let margin = ((available - width) / 2.0).max(0.0);
+    ui.horizontal_top(|ui| {
+        ui.add_space(margin);
+        ui.vertical(|ui| {
+            ui.set_width(width);
+            add_contents(ui)
+        })
+        .inner
+    })
+    .inner
 }
 
 /// A rounded card (job rows, accounts, conflicts, wizard steps).
@@ -189,29 +212,61 @@ pub fn danger(ui: &mut Ui, label: impl Into<egui::WidgetText>) -> Response {
     )
 }
 
+/// A square quiet button with a single glyph (refresh, pause, menu) and
+/// a tooltip that names the action.
+pub fn icon_button(ui: &mut Ui, glyph: &str, tooltip: &str) -> Response {
+    let theme = palette();
+    ui.add(
+        Button::new(RichText::new(glyph).size(14.0).color(theme.text))
+            .fill(Color32::TRANSPARENT)
+            .corner_radius(theme.corner(8))
+            .stroke(Stroke::new(1.0_f32, theme.card_stroke))
+            .min_size(Vec2::new(30.0, 30.0)),
+    )
+    .on_hover_text(tooltip)
+}
+
 /// A single-line label that ellipsizes when it does not fit the row
 /// (paths, URLs), so right-aligned buttons never overlap the text.
 pub fn ellipsis(ui: &mut Ui, text: impl Into<egui::WidgetText>) -> Response {
     ui.add(egui::Label::new(text).truncate())
 }
 
-/// A colored status dot followed by a label.
+/// A colored status dot followed by a label (status line, empty states).
 pub fn status(ui: &mut Ui, color: Color32, label: impl Into<RichText>) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("\u{25cf}").color(color).size(11.0));
+        dot(ui, color, 4.0);
         ui.label(label.into().color(palette().text));
     });
 }
 
+/// A status pill: tinted rounded box with a colored dot and a short
+/// label (login state, job state) — compact enough for card headers.
+/// Painted directly, so it looks the same in left- and right-aligned rows.
+pub fn pill(ui: &mut Ui, color: Color32, label: impl Into<String>) {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.into(), egui::FontId::proportional(12.5), color);
+    let (pad_x, pad_y, dot_radius, gap) = (9.0, 4.0, 3.5, 6.0);
+    let size = Vec2::new(
+        pad_x * 2.0 + dot_radius * 2.0 + gap + galley.size().x,
+        (pad_y * 2.0 + galley.size().y).max(24.0),
+    );
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, palette().corner(8), tint(color, 40));
+    let dot_center = egui::pos2(rect.left() + pad_x + dot_radius, rect.center().y);
+    painter.circle_filled(dot_center, dot_radius, color);
+    let text_pos = egui::pos2(
+        dot_center.x + dot_radius + gap,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    painter.galley(text_pos, galley, color);
+}
+
 /// A count badge (conflicts, errors) drawn next to labels.
 pub fn badge(ui: &mut Ui, count: u64, color: Color32) {
-    chip(Color32::from_rgba_unmultiplied(
-        color.r(),
-        color.g(),
-        color.b(),
-        48,
-    ))
-    .show(ui, |ui| {
+    chip(tint(color, 48)).show(ui, |ui| {
         ui.label(
             RichText::new(count.to_string())
                 .color(color)
@@ -221,9 +276,49 @@ pub fn badge(ui: &mut Ui, count: u64, color: Color32) {
     });
 }
 
+/// A thin quota bar with the used/total text next to it. Without a
+/// known total (`None` or `0`, i.e. unlimited) only the used amount is
+/// shown.
+pub fn quota_bar(ui: &mut Ui, used: u64, total: Option<u64>, format: impl Fn(u64) -> String) {
+    let theme = palette();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        match total {
+            Some(total) if total > 0 => {
+                let fraction = (used as f64 / total as f64).clamp(0.0, 1.0) as f32;
+                let color = if fraction > 0.9 {
+                    theme.error
+                } else if fraction > 0.75 {
+                    theme.warning
+                } else {
+                    theme.accent
+                };
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(120.0, 6.0), egui::Sense::hover());
+                let painter = ui.painter();
+                painter.rect_filled(rect, theme.corner(3), theme.card_stroke);
+                let mut filled = rect;
+                filled.set_width((rect.width() * fraction).max(if used > 0 { 3.0 } else { 0.0 }));
+                painter.rect_filled(filled, theme.corner(3), color);
+                ui.label(
+                    RichText::new(format!("{} / {}", format(used), format(total)))
+                        .small()
+                        .color(theme.text_dim),
+                );
+            }
+            _ => {
+                ui.label(
+                    RichText::new(format!("{} belegt", format(used)))
+                        .small()
+                        .color(theme.text_dim),
+                );
+            }
+        }
+    });
+}
+
 /// A small rounded square with the initial of a name (space/account).
-pub fn avatar(ui: &mut Ui, initial: &str, color: Color32) {
-    let size = Vec2::new(34.0, 34.0);
+pub fn avatar(ui: &mut Ui, initial: &str, color: Color32, size: f32) {
+    let size = Vec2::splat(size);
     ui.allocate_ui(size, |ui| {
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
         ui.painter()
@@ -232,7 +327,7 @@ pub fn avatar(ui: &mut Ui, initial: &str, color: Color32) {
             rect.center(),
             egui::Align2::CENTER_CENTER,
             initial,
-            egui::FontId::proportional(17.0),
+            egui::FontId::proportional(size.y / 2.0),
             color,
         );
     });
@@ -241,6 +336,26 @@ pub fn avatar(ui: &mut Ui, initial: &str, color: Color32) {
 /// A section heading (slightly larger than body text).
 pub fn heading(ui: &mut Ui, label: impl Into<RichText>) {
     ui.label(label.into().size(16.0).strong().color(palette().text));
+}
+
+/// A small, dimmed, upper-case label that groups rows inside a card
+/// ("SPACES", "LETZTER LAUF").
+pub fn section_label(ui: &mut Ui, label: &str) {
+    ui.label(
+        RichText::new(label.to_uppercase())
+            .size(11.0)
+            .strong()
+            .color(palette().text_dim),
+    );
+}
+
+/// A hairline separator inside a card, with vertical breathing room.
+pub fn divider(ui: &mut Ui) {
+    ui.add_space(6.0);
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, palette().card_stroke);
+    ui.add_space(6.0);
 }
 
 /// A step number in a filled circle (wizard).
@@ -258,4 +373,16 @@ pub fn step(ui: &mut Ui, number: u32, label: &str) {
         ui.label(RichText::new(label).strong().size(15.0).color(theme.text));
     });
     ui.add_space(2.0);
+}
+
+/// A filled circle of the given radius, vertically centered in the row
+/// (painted: the bundled fonts have no reliable bullet glyph).
+pub fn dot(ui: &mut Ui, color: Color32, radius: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(radius * 2.0 + 2.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), radius, color);
+}
+
+/// The color with the given alpha (tinted fills behind colored text).
+fn tint(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }

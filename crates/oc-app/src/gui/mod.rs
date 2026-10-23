@@ -57,6 +57,8 @@ enum Tab {
     Jobs,
     /// Pending conflicts.
     Conflicts,
+    /// App settings (interval, transfers, policy, autostart, logging).
+    Settings,
 }
 
 /// UI state of one account.
@@ -135,6 +137,8 @@ struct SyncApp {
     dbs: HashMap<String, StatusDb>,
     /// Form for adding an account.
     new_account: NewAccountForm,
+    /// Whether the add-account form is expanded.
+    show_new_account: bool,
     /// The active main tab.
     tab: Tab,
     /// The wizard, when open.
@@ -191,6 +195,7 @@ impl SyncApp {
             job_states: HashMap::new(),
             dbs: HashMap::new(),
             new_account: NewAccountForm::default(),
+            show_new_account: false,
             tab: Tab::Jobs,
             wizard: None,
             confirm_remove: None,
@@ -519,12 +524,20 @@ impl SyncApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 14.0;
+                    let offline = self.job_states.values().any(|state| state.offline);
                     if self.paused_all {
                         theme::status(ui, theme.warning, "Alle Jobs pausiert");
-                    } else if let Some(message) = &message {
-                        ui.label(egui::RichText::new(message).small().color(theme.text));
                     } else {
-                        theme::status(ui, theme.success, "Bereit");
+                        if offline {
+                            theme::status(ui, theme.error, "Server nicht erreichbar");
+                        }
+                        match &message {
+                            Some(message) => {
+                                ui.label(egui::RichText::new(message).small().color(theme.text));
+                            }
+                            None if !offline => theme::status(ui, theme.success, "Bereit"),
+                            None => {}
+                        }
                     }
                     ui.label(
                         egui::RichText::new(format!("{} Jobs", self.jobs.jobs.len()))
@@ -571,18 +584,25 @@ impl SyncApp {
                                 .fit_to_exact_size(egui::Vec2::splat(28.0)),
                         );
                     }
-                    ui.label(
-                        egui::RichText::new("OpenCloud Sync")
-                            .size(17.0)
-                            .strong()
-                            .color(theme.text),
-                    );
-                    ui.add_space(24.0);
+                    // Narrow windows drop the title so the tabs and the
+                    // right-hand buttons never overlap.
+                    if ui.available_width() > 900.0 {
+                        ui.label(
+                            egui::RichText::new("OpenCloud Sync")
+                                .size(17.0)
+                                .strong()
+                                .color(theme.text),
+                        );
+                        ui.add_space(24.0);
+                    } else {
+                        ui.add_space(8.0);
+                    }
                     let mut tab = self.tab;
                     for (candidate, label) in [
-                        (Tab::Accounts, "Konten & Server"),
+                        (Tab::Accounts, "Konten"),
                         (Tab::Jobs, "Sync-Jobs"),
                         (Tab::Conflicts, "Konflikte"),
+                        (Tab::Settings, "Einstellungen"),
                     ] {
                         if tab_button(ui, candidate == self.tab, label) {
                             tab = candidate;
@@ -599,9 +619,7 @@ impl SyncApp {
                     // panel. Placed last, its buttons pin to the right
                     // edge.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::primary(ui, "+ Neuen Job anlegen").clicked()
-                            && self.wizard.is_none()
-                        {
+                        if theme::primary(ui, "+ Neuer Job").clicked() && self.wizard.is_none() {
                             self.wizard = Some(Wizard::new());
                         }
                         if self.paused_all {
@@ -624,256 +642,350 @@ impl SyncApp {
             });
     }
 
-    /// The "Konten & Server" tab: accounts with login state, the spaces
-    /// and quota view, the add-account form, and the settings.
+    /// The "Konten" tab: one card per account (login state, spaces and
+    /// quota), followed by the collapsible add-account form.
     fn show_accounts(&mut self, ui: &mut egui::Ui) {
         let theme = theme::palette();
+        let accounts = self.config.accounts.clone();
+        if accounts.is_empty() && !self.show_new_account {
+            ui.vertical_centered(|ui| {
+                ui.add_space(70.0);
+                ui.label(
+                    egui::RichText::new("Noch kein Konto")
+                        .size(20.0)
+                        .strong()
+                        .color(theme.text),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Verbinde einen OpenCloud-Server, um Spaces synchronisieren zu können.",
+                    )
+                    .color(theme.text_dim),
+                );
+                ui.add_space(14.0);
+                if theme::primary(ui, "Konto hinzufügen…").clicked() {
+                    self.show_new_account = true;
+                }
+            });
+            return;
+        }
         ScrollArea::vertical().show(ui, |ui| {
-            ui.add_space(4.0);
-            for account in self.config.accounts.clone() {
-                let state = self.accounts.entry(account.id.clone()).or_default();
-                let logged_in = state.logged_in == Some(true);
-                theme::card().show(ui, |ui| {
-                    // One right-to-left row: the right edge is filled
-                    // first (status, buttons), the text block last — it
-                    // gets the remaining width and ellipsizes instead
-                    // of running under the buttons.
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if logged_in {
-                            theme::status(ui, theme.success, "Angemeldet");
-                        } else {
-                            theme::status(ui, theme.text_dim, "Nicht angemeldet");
-                        }
-                        ui.add_space(6.0);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if state.spaces_pending {
-                                ui.label(
-                                    egui::RichText::new("Lade Spaces…")
-                                        .small()
-                                        .color(theme.text_dim),
-                                );
-                            } else if theme::quiet(ui, "Spaces & Quota").clicked() {
-                                state.spaces_pending = true;
-                                state.spaces = None;
-                                self.backend.send(UiCommand::ListSpaces {
-                                    account_id: account.id.clone(),
-                                });
-                            }
-                            if state.logout_pending {
-                                ui.label(
-                                    egui::RichText::new("Abmeldung…")
-                                        .small()
-                                        .color(theme.text_dim),
-                                );
-                            } else if logged_in && theme::danger(ui, "Abmelden").clicked() {
-                                state.logout_pending = true;
-                                self.backend.send(UiCommand::Logout {
-                                    account_id: account.id.clone(),
-                                });
-                            }
-                            if state.login_pending {
-                                ui.label(
-                                    egui::RichText::new("Login läuft — im Browser anmelden…")
-                                        .small()
-                                        .color(theme.accent),
-                                );
-                            } else if !logged_in && theme::primary(ui, "Anmelden").clicked() {
-                                state.login_pending = true;
-                                self.backend.send(UiCommand::Login {
-                                    account_id: account.id.clone(),
-                                });
-                            }
-                        });
-                        theme::avatar(ui, &initial_of(&account.username), theme.accent);
-                        ui.vertical(|ui| {
-                            theme::ellipsis(
-                                ui,
-                                egui::RichText::new(&account.id)
-                                    .strong()
-                                    .size(15.0)
-                                    .color(theme.text),
-                            );
-                            theme::ellipsis(
-                                ui,
-                                egui::RichText::new(format!(
-                                    "{} · {}",
-                                    account.server_url, account.username
-                                ))
-                                .small()
-                                .color(theme.text_dim),
-                            );
-                        });
-                    });
-                    if let Some(spaces) = &state.spaces {
-                        ui.add_space(8.0);
-                        match spaces {
-                            Ok(spaces) if spaces.is_empty() => {
-                                ui.label(
-                                    egui::RichText::new("Keine Spaces.")
-                                        .small()
-                                        .color(theme.text_dim),
-                                );
-                            }
-                            Ok(spaces) => {
-                                for space in spaces {
-                                    ui.horizontal(|ui| {
-                                        theme::status(
-                                            ui,
-                                            theme.accent,
-                                            egui::RichText::new(space.name.clone()).strong(),
-                                        );
-                                        theme::chip(theme.card_stroke).show(ui, |ui| {
-                                            ui.label(
-                                                egui::RichText::new(&space.drive_type)
-                                                    .small()
-                                                    .color(theme.text_dim),
-                                            );
-                                        });
-                                        if let Some(quota) = &space.quota {
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{} von {} belegt",
-                                                    format_bytes(quota.used.unwrap_or(0)),
-                                                    quota
-                                                        .total
-                                                        .map(format_bytes)
-                                                        .unwrap_or_else(|| "?".into())
-                                                ))
-                                                .small()
-                                                .color(theme.text_dim),
-                                            );
-                                        }
-                                    });
-                                }
-                            }
-                            Err(error) => {
-                                ui.label(egui::RichText::new(error).small().color(theme.error));
-                            }
-                        }
-                    }
-                });
-                ui.add_space(8.0);
-            }
-
-            theme::card().show(ui, |ui| {
-                theme::heading(ui, "Konto hinzufügen");
+            theme::content_column(ui, |ui| {
                 ui.add_space(4.0);
-                Grid::new("new-account").num_columns(2).show(ui, |ui| {
-                    ui.label("Konto-ID");
-                    ui.text_edit_singleline(&mut self.new_account.id);
-                    ui.end_row();
-                    ui.label("Server-URL");
-                    ui.text_edit_singleline(&mut self.new_account.server_url);
-                    ui.end_row();
-                    ui.label("Benutzername");
-                    ui.text_edit_singleline(&mut self.new_account.username);
-                    ui.end_row();
-                    ui.label("");
-                    if theme::primary(ui, "Hinzufügen").clicked() {
-                        self.add_account();
-                    }
-                    if let Some(error) = &self.new_account.error {
-                        ui.end_row();
-                        ui.label("");
-                        ui.label(egui::RichText::new(error).small().color(theme.error));
-                    }
-                });
-            });
-
-            ui.add_space(8.0);
-            theme::card().show(ui, |ui| {
-                theme::heading(ui, "Einstellungen");
+                for account in &accounts {
+                    self.show_account_card(ui, account);
+                    ui.add_space(8.0);
+                }
+                if self.show_new_account {
+                    self.show_new_account_form(ui);
+                } else if theme::quiet(ui, "+ Konto hinzufügen").clicked() {
+                    self.show_new_account = true;
+                }
                 ui.add_space(4.0);
-                Grid::new("settings").num_columns(2).show(ui, |ui| {
-                    ui.label("Sync-Intervall (Sekunden)");
-                    ui.add(
-                        DragValue::new(&mut self.settings_edit.sync_interval_secs).range(1..=86400),
-                    );
-                    ui.end_row();
-                    ui.label("Parallele Transfers");
-                    ui.add(
-                        DragValue::new(&mut self.settings_edit.max_parallel_transfers)
-                            .range(1..=32),
-                    );
-                    ui.end_row();
-                    ui.label("Konflikt-Richtlinie");
-                    ComboBox::from_id_salt("conflict-policy")
-                        .selected_text(conflict_policy_label(self.settings_edit.conflict_policy))
-                        .show_ui(ui, |ui| {
-                            for policy in [
-                                ConflictPolicy::Ask,
-                                ConflictPolicy::KeepServer,
-                                ConflictPolicy::KeepLocal,
-                                ConflictPolicy::ConflictCopy,
-                            ] {
-                                ui.selectable_value(
-                                    &mut self.settings_edit.conflict_policy,
-                                    policy,
-                                    conflict_policy_label(policy),
-                                );
-                            }
-                        });
-                    ui.end_row();
-                    ui.label("Log-Level");
-                    ComboBox::from_id_salt("log-level")
-                        .selected_text(log_level_label(self.settings_edit.log_level))
-                        .show_ui(ui, |ui| {
-                            for level in [
-                                LogLevel::Error,
-                                LogLevel::Warn,
-                                LogLevel::Info,
-                                LogLevel::Debug,
-                                LogLevel::Trace,
-                            ] {
-                                ui.selectable_value(
-                                    &mut self.settings_edit.log_level,
-                                    level,
-                                    log_level_label(level),
-                                );
-                            }
-                        });
-                    ui.end_row();
-                    ui.label("Bei Anmeldung starten");
-                    let mut autostart = self.settings_edit.autostart;
-                    ui.horizontal(|ui| {
-                        if ui.checkbox(&mut autostart, "").changed() {
-                            let result = if autostart {
-                                crate::gui::autostart::enable()
-                            } else {
-                                crate::gui::autostart::disable()
-                            };
-                            match result {
-                                Ok(()) => {
-                                    self.settings_edit.autostart = autostart;
-                                    self.autostart_active = autostart;
-                                    self.notify(if autostart {
-                                        "Autostart aktiviert"
-                                    } else {
-                                        "Autostart deaktiviert"
-                                    });
-                                }
-                                Err(error) => self.notify(format!("Autostart: {error}")),
-                            }
-                        }
-                        ui.weak(if self.autostart_active {
-                            "(im Betriebssystem aktiv)"
-                        } else {
-                            "(im Betriebssystem inaktiv)"
-                        });
-                    });
-                    ui.end_row();
-                    ui.label("");
-                    if theme::primary(ui, "Einstellungen speichern").clicked() {
-                        self.save_settings();
-                    }
-                });
             });
-            ui.add_space(4.0);
         });
     }
 
-    /// Adds the account from the form to `config.json`.
-    fn add_account(&mut self) {
+    /// One account card: avatar, name and server on the left, login state
+    /// and actions on the right; the loaded spaces with quota bars below.
+    fn show_account_card(&mut self, ui: &mut egui::Ui, account: &Account) {
+        let theme = theme::palette();
+        let state = self.accounts.entry(account.id.clone()).or_default();
+        let logged_in = state.logged_in == Some(true);
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                theme::avatar(ui, &initial_of(&account.username), theme.accent, 34.0);
+                // Right side first (fixed width), the text block takes
+                // what is left and ellipsizes.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if state.spaces_pending {
+                        ui.spinner();
+                    } else if logged_in
+                        && theme::icon_button(ui, "\u{21bb}", "Spaces & Quota aktualisieren")
+                            .clicked()
+                    {
+                        state.spaces_pending = true;
+                        self.backend.send(UiCommand::ListSpaces {
+                            account_id: account.id.clone(),
+                        });
+                    }
+                    if state.login_pending {
+                        ui.label(
+                            egui::RichText::new("Im Browser anmelden…")
+                                .small()
+                                .color(theme.accent),
+                        );
+                    } else if state.logout_pending {
+                        ui.label(
+                            egui::RichText::new("Abmeldung…")
+                                .small()
+                                .color(theme.text_dim),
+                        );
+                    } else if logged_in {
+                        if theme::danger(ui, "Abmelden").clicked() {
+                            state.logout_pending = true;
+                            self.backend.send(UiCommand::Logout {
+                                account_id: account.id.clone(),
+                            });
+                        }
+                    } else if theme::primary(ui, "Anmelden").clicked() {
+                        state.login_pending = true;
+                        self.backend.send(UiCommand::Login {
+                            account_id: account.id.clone(),
+                        });
+                    }
+                    if logged_in {
+                        theme::pill(ui, theme.success, "Angemeldet");
+                    } else {
+                        theme::pill(ui, theme.text_dim, "Nicht angemeldet");
+                    }
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        theme::ellipsis(
+                            ui,
+                            egui::RichText::new(&account.id)
+                                .strong()
+                                .size(15.0)
+                                .color(theme.text),
+                        );
+                        theme::ellipsis(
+                            ui,
+                            egui::RichText::new(format!(
+                                "{} · {}",
+                                account.server_url, account.username
+                            ))
+                            .small()
+                            .color(theme.text_dim),
+                        );
+                    });
+                });
+            });
+            let Some(spaces) = &state.spaces else {
+                return;
+            };
+            theme::divider(ui);
+            theme::section_label(ui, "Spaces");
+            ui.add_space(2.0);
+            match spaces {
+                Ok(spaces) if spaces.is_empty() => {
+                    ui.label(
+                        egui::RichText::new("Keine Spaces.")
+                            .small()
+                            .color(theme.text_dim),
+                    );
+                }
+                Ok(spaces) => {
+                    Grid::new(("spaces", &account.id))
+                        .num_columns(3)
+                        .spacing(egui::Vec2::new(14.0, 6.0))
+                        .show(ui, |ui| {
+                            for space in spaces {
+                                space_row(ui, space);
+                                ui.end_row();
+                            }
+                        });
+                }
+                Err(error) => {
+                    ui.label(egui::RichText::new(error).small().color(theme.error));
+                }
+            }
+        });
+    }
+
+    /// The expanded add-account form (card with the three fields).
+    fn show_new_account_form(&mut self, ui: &mut egui::Ui) {
+        let theme = theme::palette();
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::heading(ui, "Konto hinzufügen");
+            ui.add_space(6.0);
+            Grid::new("new-account")
+                .num_columns(2)
+                .spacing(egui::Vec2::new(14.0, 8.0))
+                .show(ui, |ui| {
+                    ui.label("Konto-ID");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_account.id)
+                            .hint_text("z. B. arbeit")
+                            .desired_width(320.0),
+                    );
+                    ui.end_row();
+                    ui.label("Server-URL");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_account.server_url)
+                            .hint_text("https://cloud.example.org")
+                            .desired_width(320.0),
+                    );
+                    ui.end_row();
+                    ui.label("Benutzername");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_account.username)
+                            .desired_width(320.0),
+                    );
+                    ui.end_row();
+                });
+            if let Some(error) = &self.new_account.error {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(error).small().color(theme.error));
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if theme::primary(ui, "Hinzufügen").clicked() && self.add_account() {
+                    self.show_new_account = false;
+                }
+                if theme::quiet(ui, "Abbrechen").clicked() {
+                    self.new_account = NewAccountForm::default();
+                    self.show_new_account = false;
+                }
+            });
+        });
+    }
+
+    /// The "Einstellungen" tab: sync behavior and program options.
+    fn show_settings(&mut self, ui: &mut egui::Ui) {
+        let theme = theme::palette();
+        ScrollArea::vertical().show(ui, |ui| {
+            theme::content_column(ui, |ui| {
+                ui.add_space(4.0);
+                theme::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    theme::heading(ui, "Synchronisation");
+                    ui.add_space(6.0);
+                    Grid::new("settings-sync")
+                        .num_columns(2)
+                        .spacing(egui::Vec2::new(24.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.label("Sync-Intervall");
+                            ui.add(
+                                DragValue::new(&mut self.settings_edit.sync_interval_secs)
+                                    .range(1..=86400)
+                                    .suffix(" s"),
+                            );
+                            ui.end_row();
+                            ui.label("Parallele Transfers");
+                            ui.add(
+                                DragValue::new(&mut self.settings_edit.max_parallel_transfers)
+                                    .range(1..=32),
+                            );
+                            ui.end_row();
+                            ui.label("Bei Konflikten");
+                            ComboBox::from_id_salt("conflict-policy")
+                                .selected_text(conflict_policy_label(
+                                    self.settings_edit.conflict_policy,
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for policy in [
+                                        ConflictPolicy::Ask,
+                                        ConflictPolicy::KeepServer,
+                                        ConflictPolicy::KeepLocal,
+                                        ConflictPolicy::ConflictCopy,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut self.settings_edit.conflict_policy,
+                                            policy,
+                                            conflict_policy_label(policy),
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+                        });
+                });
+                ui.add_space(8.0);
+                theme::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    theme::heading(ui, "Programm");
+                    ui.add_space(6.0);
+                    Grid::new("settings-app")
+                        .num_columns(2)
+                        .spacing(egui::Vec2::new(24.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.label("Bei Anmeldung starten");
+                            let mut autostart = self.settings_edit.autostart;
+                            ui.horizontal(|ui| {
+                                if ui.checkbox(&mut autostart, "").changed() {
+                                    self.toggle_autostart(autostart);
+                                }
+                                ui.label(
+                                    egui::RichText::new(if self.autostart_active {
+                                        "im Betriebssystem aktiv"
+                                    } else {
+                                        "im Betriebssystem inaktiv"
+                                    })
+                                    .small()
+                                    .color(theme.text_dim),
+                                );
+                            });
+                            ui.end_row();
+                            ui.label("Log-Level");
+                            ComboBox::from_id_salt("log-level")
+                                .selected_text(log_level_label(self.settings_edit.log_level))
+                                .show_ui(ui, |ui| {
+                                    for level in [
+                                        LogLevel::Error,
+                                        LogLevel::Warn,
+                                        LogLevel::Info,
+                                        LogLevel::Debug,
+                                        LogLevel::Trace,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut self.settings_edit.log_level,
+                                            level,
+                                            log_level_label(level),
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+                        });
+                });
+                ui.add_space(12.0);
+                let dirty = self.settings_edit != self.config.settings;
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(dirty, |ui| {
+                        if theme::primary(ui, "Einstellungen speichern").clicked() {
+                            self.save_settings();
+                        }
+                    });
+                    if dirty {
+                        if theme::quiet(ui, "Verwerfen").clicked() {
+                            self.settings_edit = self.config.settings.clone();
+                        }
+                        ui.label(
+                            egui::RichText::new("Ungespeicherte Änderungen")
+                                .small()
+                                .color(theme.warning),
+                        );
+                    }
+                });
+                ui.add_space(4.0);
+            });
+        });
+    }
+
+    /// Enables/disables the OS autostart entry and reports the outcome.
+    fn toggle_autostart(&mut self, autostart: bool) {
+        let result = if autostart {
+            crate::gui::autostart::enable()
+        } else {
+            crate::gui::autostart::disable()
+        };
+        match result {
+            Ok(()) => {
+                self.settings_edit.autostart = autostart;
+                self.autostart_active = autostart;
+                self.notify(if autostart {
+                    "Autostart aktiviert"
+                } else {
+                    "Autostart deaktiviert"
+                });
+            }
+            Err(error) => self.notify(format!("Autostart: {error}")),
+        }
+    }
+
+    /// Adds the account from the form to `config.json`; returns whether
+    /// it was added (false: validation error shown in the form).
+    fn add_account(&mut self) -> bool {
         let account = Account {
             id: self.new_account.id.trim().to_owned(),
             server_url: self.new_account.server_url.trim().to_owned(),
@@ -881,11 +993,11 @@ impl SyncApp {
         };
         if let Err(error) = account.validate() {
             self.new_account.error = Some(error.to_string());
-            return;
+            return false;
         }
         if self.config.accounts.iter().any(|a| a.id == account.id) {
             self.new_account.error = Some(format!("Konto '{}' existiert bereits", account.id));
-            return;
+            return false;
         }
         self.new_account.error = None;
         self.accounts.insert(
@@ -898,6 +1010,7 @@ impl SyncApp {
         self.config.accounts.push(account);
         self.persist_config();
         self.new_account = NewAccountForm::default();
+        true
     }
 
     /// Persists the GUI's config copy.
@@ -957,13 +1070,15 @@ impl SyncApp {
             return;
         }
         ScrollArea::vertical().show(ui, |ui| {
-            ui.add_space(4.0);
-            for job in self.jobs.jobs.clone() {
-                self.show_job_row(ui, &job);
-                ui.add_space(8.0);
-            }
-            self.show_error_log(ui);
-            ui.add_space(4.0);
+            theme::content_column(ui, |ui| {
+                ui.add_space(4.0);
+                for job in self.jobs.jobs.clone() {
+                    self.show_job_row(ui, &job);
+                    ui.add_space(8.0);
+                }
+                self.show_error_log(ui);
+                ui.add_space(4.0);
+            });
         });
     }
 
@@ -975,6 +1090,7 @@ impl SyncApp {
         let theme = theme::palette();
         let count = self.errors.len();
         theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.collapsing(
                 egui::RichText::new(format!("Fehlerliste ({count})"))
                     .small()
@@ -1042,7 +1158,9 @@ impl SyncApp {
         }
     }
 
-    /// One row of the job table with its actions.
+    /// One job card: identity and the main actions in the header (status
+    /// pill, sync now, pause, overflow menu), details and live progress
+    /// below.
     fn show_job_row(&mut self, ui: &mut egui::Ui, job: &SyncJob) {
         let theme = theme::palette();
         let space = self.display_space_name(job);
@@ -1050,7 +1168,7 @@ impl SyncApp {
         let (status_color, status_label) = if state.running {
             (theme.accent, "Synchronisiert…".to_string())
         } else if state.offline {
-            (theme.error, "Server nicht erreichbar".to_string())
+            (theme.error, "Offline".to_string())
         } else if state.paused {
             (theme.warning, "Pausiert".to_string())
         } else if let Some(stats) = state.stats {
@@ -1059,171 +1177,200 @@ impl SyncApp {
             } else if stats.errors > 0 {
                 (theme.error, format!("{} Fehler", stats.errors))
             } else if stats.transfers > 0 {
-                (theme.text_dim, format!("{} Transfer(s)", stats.transfers))
+                (theme.text_dim, format!("{} ausstehend", stats.transfers))
             } else {
                 (theme.success, "Aktuell".to_string())
             }
         } else {
             (theme.text_dim, "Noch nie synchronisiert".to_string())
         };
-        let last_sync = state
-            .stats
-            .and_then(|stats| stats.last_sync)
-            .map(format_unix)
-            .unwrap_or_else(|| "—".into());
-        let files = state
-            .stats
-            .map(|stats| format!("{} Dateien · {} Ordner", stats.files, stats.dirs))
-            .unwrap_or_else(|| "—".into());
+        let mut details = Vec::new();
+        if let Some(stats) = state.stats {
+            if let Some(last_sync) = stats.last_sync {
+                details.push(format!("Letzter Sync {}", format_unix(last_sync)));
+            }
+            details.push(format!("{} Dateien · {} Ordner", stats.files, stats.dirs));
+        }
+        if !job.include.is_empty() {
+            details.push(format!("{} ausgewählte Ordner", job.include.len()));
+        }
+        let mut open_folder = false;
+        let mut edit_folders = false;
+        let mut remove = false;
 
         theme::card().show(ui, |ui| {
-            // One right-to-left row: the right edge is filled first
-            // (status, buttons), the text block last — it gets the
-            // remaining width and ellipsizes instead of running under
-            // the buttons.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                theme::status(ui, status_color, status_label);
-                ui.add_space(8.0);
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                theme::avatar(ui, &initial_of(&space), theme.accent, 38.0);
+                // Right side first (fixed width), the text block takes
+                // what is left and ellipsizes.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::danger(ui, "Entfernen…").clicked() {
-                        self.confirm_remove = Some(job.id.clone());
-                    }
-                    if theme::quiet(ui, "Ordner…").clicked() {
-                        self.wizard = Some(Wizard::edit_folders(job));
-                    }
-                    if theme::quiet(ui, "Öffnen").clicked() {
-                        open_in_file_manager(&job.local_path);
-                    }
+                    ui.menu_button(
+                        egui::RichText::new("\u{2630}").size(15.0).color(theme.text),
+                        |ui| {
+                            if ui.button("Ordner im Dateimanager öffnen").clicked() {
+                                open_folder = true;
+                                ui.close();
+                            }
+                            if ui.button("Ordnerauswahl bearbeiten…").clicked() {
+                                edit_folders = true;
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui
+                                .button(egui::RichText::new("Job entfernen…").color(theme.error))
+                                .clicked()
+                            {
+                                remove = true;
+                                ui.close();
+                            }
+                        },
+                    )
+                    .response
+                    .on_hover_text("Weitere Aktionen");
                     if state.paused {
-                        if theme::quiet(ui, "Fortsetzen").clicked() {
+                        if theme::icon_button(ui, "\u{25b6}", "Fortsetzen").clicked() {
                             state.paused = false;
                             self.backend.send(UiCommand::JobCmd {
                                 job_id: job.id.clone(),
                                 command: JobCommand::Resume,
                             });
                         }
-                    } else if theme::quiet(ui, "Pausieren").clicked() {
+                    } else if theme::icon_button(ui, "\u{23f8}", "Pausieren").clicked() {
                         state.paused = true;
                         self.backend.send(UiCommand::JobCmd {
                             job_id: job.id.clone(),
                             command: JobCommand::Pause,
                         });
                     }
-                    if theme::primary(ui, "Jetzt synchronisieren").clicked() {
+                    let sync_now = ui.add_enabled_ui(!state.running, |ui| {
+                        theme::primary(ui, "Jetzt synchronisieren")
+                    });
+                    if sync_now.inner.clicked() {
                         state.paused = false;
                         self.backend.send(UiCommand::JobCmd {
                             job_id: job.id.clone(),
                             command: JobCommand::SyncNow,
                         });
                     }
-                });
-                theme::avatar(ui, &initial_of(&space), theme.accent);
-                ui.vertical(|ui| {
-                    theme::ellipsis(
-                        ui,
-                        egui::RichText::new(&space)
-                            .strong()
-                            .size(15.0)
-                            .color(theme.text),
-                    );
-                    theme::ellipsis(
-                        ui,
-                        egui::RichText::new(job.local_path.display().to_string())
-                            .small()
-                            .color(theme.text_dim),
-                    );
-                    ui.add_space(2.0);
-                    theme::ellipsis(
-                        ui,
-                        egui::RichText::new(format!("Letzter Sync: {last_sync}  ·  {files}"))
-                            .small()
-                            .color(theme.text_dim),
-                    );
-                    if state.running {
-                        if let Some(progress) = state.progress.filter(|p| p.transfers_total > 0) {
-                            let remaining =
-                                progress.bytes_total.saturating_sub(progress.bytes_done);
-                            let speed = state.speed_bps;
-                            let eta = (speed >= 1.0)
-                                .then(|| Duration::from_secs((remaining as f64 / speed) as u64));
-                            let label = format!(
-                                "{} von {} Dateien · {} / {}",
-                                progress.transfers_done,
-                                progress.transfers_total,
-                                format_bytes(progress.bytes_done),
-                                format_bytes(progress.bytes_total),
-                            );
-                            let label = if speed >= 1.0 {
-                                match eta {
-                                    Some(eta) => format!(
-                                        "{label} · {}/s · noch {}",
-                                        format_bytes(speed as u64),
-                                        format_eta(eta)
-                                    ),
-                                    None => format!("{label} · {}/s", format_bytes(speed as u64)),
-                                }
-                            } else {
-                                label
-                            };
-                            ui.add_space(4.0);
-                            ui.add(
-                                egui::ProgressBar::new(progress.fraction())
-                                    .desired_width(f32::INFINITY)
-                                    .text(egui::RichText::new(label).small().color(theme.text)),
-                            );
-                        }
-                    }
-                    if !state.transfers.is_empty() {
+                    theme::pill(ui, status_color, status_label);
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                         theme::ellipsis(
                             ui,
-                            egui::RichText::new(format!("Aktuell: {}", state.transfers.join(", ")))
+                            egui::RichText::new(&space)
+                                .strong()
+                                .size(15.0)
+                                .color(theme.text),
+                        );
+                        theme::ellipsis(
+                            ui,
+                            egui::RichText::new(job.local_path.display().to_string())
                                 .small()
-                                .color(theme.accent),
-                        );
-                    }
-                    if let Some(summary) = &state.last_summary {
-                        theme::ellipsis(
-                            ui,
-                            egui::RichText::new(format!(
-                                "Letzter Lauf: {summary}{}",
-                                if summary.remote_scan_skipped {
-                                    " (Remote-Scan übersprungen)"
-                                } else {
-                                    ""
-                                }
-                            ))
-                            .small()
-                            .color(theme.text_dim),
-                        );
-                    }
+                                .color(theme.text_dim),
+                        )
+                        .on_hover_text(job.local_path.display().to_string());
+                    });
                 });
             });
+
+            if state.running {
+                if let Some(progress) = state.progress.filter(|p| p.transfers_total > 0) {
+                    let remaining = progress.bytes_total.saturating_sub(progress.bytes_done);
+                    let speed = state.speed_bps;
+                    let label = format!(
+                        "{} von {} Dateien · {} / {}",
+                        progress.transfers_done,
+                        progress.transfers_total,
+                        format_bytes(progress.bytes_done),
+                        format_bytes(progress.bytes_total),
+                    );
+                    let label = if speed >= 1.0 {
+                        let eta = Duration::from_secs((remaining as f64 / speed) as u64);
+                        format!(
+                            "{label} · {}/s · noch {}",
+                            format_bytes(speed as u64),
+                            format_eta(eta)
+                        )
+                    } else {
+                        label
+                    };
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::ProgressBar::new(progress.fraction())
+                            .desired_width(f32::INFINITY)
+                            .desired_height(18.0)
+                            .corner_radius(egui::CornerRadius::same(5))
+                            .text(egui::RichText::new(label).small().color(theme.text)),
+                    );
+                }
+                if !state.transfers.is_empty() {
+                    theme::ellipsis(
+                        ui,
+                        egui::RichText::new(format!("Aktuell: {}", state.transfers.join(", ")))
+                            .small()
+                            .color(theme.accent),
+                    );
+                }
+            }
+
+            if !details.is_empty() || state.last_summary.is_some() {
+                theme::divider(ui);
+                if !details.is_empty() {
+                    theme::ellipsis(
+                        ui,
+                        egui::RichText::new(details.join("  ·  "))
+                            .small()
+                            .color(theme.text_dim),
+                    );
+                }
+                if let Some(summary) = &state.last_summary {
+                    theme::ellipsis(
+                        ui,
+                        egui::RichText::new(format!(
+                            "Letzter Lauf: {summary}{}",
+                            if summary.remote_scan_skipped {
+                                " (Remote-Scan übersprungen)"
+                            } else {
+                                ""
+                            }
+                        ))
+                        .small()
+                        .color(theme.text_dim),
+                    );
+                }
+            }
         });
+
+        if open_folder {
+            open_in_file_manager(&job.local_path);
+        }
+        if edit_folders {
+            self.wizard = Some(Wizard::edit_folders(job));
+        }
+        if remove {
+            self.confirm_remove = Some(job.id.clone());
+        }
     }
 
     /// The "Konflikte" tab: all pending conflicts with both sides' state
     /// and the resolution buttons (see `PLAN.md`, Phase 6/7).
     fn show_conflicts(&mut self, ui: &mut egui::Ui) {
         let theme = theme::palette();
-        let conflicts: Vec<(String, Vec<Conflict>)> = self
-            .jobs
-            .jobs
-            .iter()
-            .map(|job| {
-                let state = self.job_states.entry(job.id.clone()).or_default();
-                (job.id.clone(), state.conflicts.clone())
-            })
-            .collect();
-        let total: usize = conflicts.iter().map(|(_, list)| list.len()).sum();
+        let mut conflicts: Vec<(String, String, Vec<Conflict>)> = Vec::new();
+        for job in self.jobs.jobs.clone() {
+            let title = self.display_space_name(&job);
+            let state = self.job_states.entry(job.id.clone()).or_default();
+            conflicts.push((job.id, title, state.conflicts.clone()));
+        }
+        let total: usize = conflicts.iter().map(|(_, _, list)| list.len()).sum();
         if total == 0 {
             ui.vertical_centered(|ui| {
                 ui.add_space(70.0);
-                theme::status(
-                    ui,
-                    theme.success,
+                ui.label(
                     egui::RichText::new("Keine offenen Konflikte")
-                        .size(18.0)
-                        .strong(),
+                        .size(20.0)
+                        .strong()
+                        .color(theme.success),
                 );
                 ui.add_space(6.0);
                 ui.label(
@@ -1234,72 +1381,89 @@ impl SyncApp {
             return;
         }
         ScrollArea::vertical().show(ui, |ui| {
-            ui.add_space(4.0);
-            for (job_id, list) in conflicts {
-                ui.horizontal(|ui| {
-                    theme::heading(ui, format!("Job '{job_id}'"));
-                    ui.add_space(10.0);
-                    if !list.is_empty() {
-                        if theme::quiet(ui, "Alle: Server übernehmen").clicked() {
-                            for conflict in &list {
-                                self.backend.send(UiCommand::ResolveConflict {
-                                    job_id: job_id.clone(),
-                                    conflict_id: conflict.id,
-                                    resolution: ConflictResolution::Server,
-                                });
-                            }
-                        }
-                        if theme::quiet(ui, "Alle: Client behalten").clicked() {
-                            for conflict in &list {
-                                self.backend.send(UiCommand::ResolveConflict {
-                                    job_id: job_id.clone(),
-                                    conflict_id: conflict.id,
-                                    resolution: ConflictResolution::Local,
-                                });
-                            }
-                        }
+            theme::content_column(ui, |ui| {
+                ui.add_space(4.0);
+                for (job_id, title, list) in conflicts {
+                    if list.is_empty() {
+                        continue;
                     }
-                });
-                for conflict in list {
-                    ui.add_space(6.0);
-                    theme::card().show(ui, |ui| {
-                        // One right-to-left row: the resolution buttons
-                        // come first (right edge), the path block last —
-                        // it gets the remaining width and ellipsizes.
+                    ui.horizontal(|ui| {
+                        theme::heading(ui, &title);
+                        theme::badge(ui, list.len() as u64, theme.error);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::primary(ui, "Client behalten").clicked() {
-                                self.backend.send(UiCommand::ResolveConflict {
-                                    job_id: job_id.clone(),
-                                    conflict_id: conflict.id,
-                                    resolution: ConflictResolution::Local,
-                                });
+                            if theme::quiet(ui, "Alle: Client behalten").clicked() {
+                                for conflict in &list {
+                                    self.backend.send(UiCommand::ResolveConflict {
+                                        job_id: job_id.clone(),
+                                        conflict_id: conflict.id,
+                                        resolution: ConflictResolution::Local,
+                                    });
+                                }
                             }
-                            if theme::quiet(ui, "Server übernehmen").clicked() {
-                                self.backend.send(UiCommand::ResolveConflict {
-                                    job_id: job_id.clone(),
-                                    conflict_id: conflict.id,
-                                    resolution: ConflictResolution::Server,
-                                });
+                            if theme::quiet(ui, "Alle: Server übernehmen").clicked() {
+                                for conflict in &list {
+                                    self.backend.send(UiCommand::ResolveConflict {
+                                        job_id: job_id.clone(),
+                                        conflict_id: conflict.id,
+                                        resolution: ConflictResolution::Server,
+                                    });
+                                }
                             }
-                            ui.vertical(|ui| {
-                                theme::ellipsis(
-                                    ui,
-                                    egui::RichText::new(&conflict.path)
-                                        .strong()
-                                        .size(15.0)
-                                        .color(theme.text),
+                        });
+                    });
+                    ui.add_space(4.0);
+                    for conflict in list {
+                        theme::card().show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                // Buttons first (right edge), the path block
+                                // takes the remaining width and ellipsizes.
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if theme::primary(ui, "Client behalten").clicked() {
+                                            self.backend.send(UiCommand::ResolveConflict {
+                                                job_id: job_id.clone(),
+                                                conflict_id: conflict.id,
+                                                resolution: ConflictResolution::Local,
+                                            });
+                                        }
+                                        if theme::quiet(ui, "Server übernehmen").clicked() {
+                                            self.backend.send(UiCommand::ResolveConflict {
+                                                job_id: job_id.clone(),
+                                                conflict_id: conflict.id,
+                                                resolution: ConflictResolution::Server,
+                                            });
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::top_down(egui::Align::Min),
+                                            |ui| {
+                                                theme::ellipsis(
+                                                    ui,
+                                                    egui::RichText::new(&conflict.path)
+                                                        .strong()
+                                                        .size(15.0)
+                                                        .color(theme.text),
+                                                )
+                                                .on_hover_text(&conflict.path);
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "Erkannt {}",
+                                                        format_unix(conflict.detected_at)
+                                                    ))
+                                                    .small()
+                                                    .color(theme.text_dim),
+                                                );
+                                            },
+                                        );
+                                    },
                                 );
-                                ui.add_space(2.0);
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Erkannt: {}",
-                                        format_unix(conflict.detected_at)
-                                    ))
-                                    .small()
-                                    .color(theme.text_dim),
-                                );
-                                ui.add_space(6.0);
-                                ui.horizontal(|ui| {
+                            });
+                            theme::divider(ui);
+                            Grid::new(("conflict", &job_id, conflict.id))
+                                .num_columns(2)
+                                .spacing(egui::Vec2::new(16.0, 4.0))
+                                .show(ui, |ui| {
                                     ui.label(
                                         egui::RichText::new("Lokal")
                                             .strong()
@@ -1314,8 +1478,7 @@ impl SyncApp {
                                         .small()
                                         .color(theme.text),
                                     );
-                                });
-                                ui.horizontal(|ui| {
+                                    ui.end_row();
                                     ui.label(
                                         egui::RichText::new("Server")
                                             .strong()
@@ -1330,13 +1493,14 @@ impl SyncApp {
                                         .small()
                                         .color(theme.text),
                                     );
+                                    ui.end_row();
                                 });
-                            });
                         });
-                    });
+                        ui.add_space(6.0);
+                    }
+                    ui.add_space(10.0);
                 }
-                ui.add_space(8.0);
-            }
+            });
         });
     }
 
@@ -1359,86 +1523,92 @@ impl SyncApp {
             )
             .show(ctx, |ui| {
                 ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_space(4.0);
-                    let title = match &wizard.mode {
-                        Mode::New => "Neuen Sync-Job anlegen",
-                        Mode::EditFolders { .. } => "Ordnerauswahl bearbeiten",
-                    };
-                    ui.label(
-                        egui::RichText::new(title)
-                            .size(20.0)
-                            .strong()
-                            .color(theme.text),
-                    );
-                    ui.add_space(10.0);
-                    if is_new {
-                        theme::card().show(ui, |ui| {
-                            theme::step(ui, 1, "Konto");
-                            self.show_wizard_account(ui, &mut wizard);
-                        });
-                    }
-                    if let Some(account_id) = wizard.account_id.clone() {
+                    theme::content_column(ui, |ui| {
+                        ui.add_space(4.0);
+                        let title = match &wizard.mode {
+                            Mode::New => "Neuen Sync-Job anlegen",
+                            Mode::EditFolders { .. } => "Ordnerauswahl bearbeiten",
+                        };
+                        ui.label(
+                            egui::RichText::new(title)
+                                .size(20.0)
+                                .strong()
+                                .color(theme.text),
+                        );
+                        ui.add_space(10.0);
                         if is_new {
-                            ui.add_space(8.0);
                             theme::card().show(ui, |ui| {
-                                theme::step(ui, 2, "Space");
-                                self.show_wizard_space(ui, &mut wizard, &account_id);
+                                ui.set_width(ui.available_width());
+                                theme::step(ui, 1, "Konto");
+                                self.show_wizard_account(ui, &mut wizard);
                             });
                         }
-                        if let Some(space_id) = wizard.space_id.clone() {
+                        if let Some(account_id) = wizard.account_id.clone() {
                             if is_new {
                                 ui.add_space(8.0);
                                 theme::card().show(ui, |ui| {
-                                    theme::step(ui, 3, "Lokales Verzeichnis");
-                                    self.show_wizard_local(ui, &mut wizard);
+                                    ui.set_width(ui.available_width());
+                                    theme::step(ui, 2, "Space");
+                                    self.show_wizard_space(ui, &mut wizard, &account_id);
                                 });
                             }
-                            ui.add_space(8.0);
-                            theme::card().show(ui, |ui| {
-                                theme::step(ui, 4, "Ordnerauswahl");
-                                self.show_wizard_tree(ui, &mut wizard, &account_id, &space_id);
-                            });
-                            ui.add_space(12.0);
-                            let mut finish = false;
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if wizard.can_finish() {
-                                        let label = match &wizard.mode {
-                                            Mode::New => "Job anlegen",
-                                            Mode::EditFolders { .. } => "Auswahl speichern",
-                                        };
-                                        if theme::primary(ui, label).clicked() {
-                                            finish = true;
-                                        }
-                                    } else {
-                                        ui.label(
-                                            egui::RichText::new(
-                                                "Konto, Space und lokales Verzeichnis \
+                            if let Some(space_id) = wizard.space_id.clone() {
+                                if is_new {
+                                    ui.add_space(8.0);
+                                    theme::card().show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        theme::step(ui, 3, "Lokales Verzeichnis");
+                                        self.show_wizard_local(ui, &mut wizard);
+                                    });
+                                }
+                                ui.add_space(8.0);
+                                theme::card().show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    theme::step(ui, 4, "Ordnerauswahl");
+                                    self.show_wizard_tree(ui, &mut wizard, &account_id, &space_id);
+                                });
+                                ui.add_space(12.0);
+                                let mut finish = false;
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if wizard.can_finish() {
+                                            let label = match &wizard.mode {
+                                                Mode::New => "Job anlegen",
+                                                Mode::EditFolders { .. } => "Auswahl speichern",
+                                            };
+                                            if theme::primary(ui, label).clicked() {
+                                                finish = true;
+                                            }
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "Konto, Space und lokales Verzeichnis \
                                                  auswählen…",
-                                            )
-                                            .small()
-                                            .color(theme.text_dim),
-                                        );
-                                    }
-                                    if theme::quiet(ui, "Abbrechen").clicked() {
-                                        close = true;
-                                    }
-                                },
-                            );
-                            if finish {
-                                finished = self.finish_wizard(&mut wizard);
+                                                )
+                                                .small()
+                                                .color(theme.text_dim),
+                                            );
+                                        }
+                                        if theme::quiet(ui, "Abbrechen").clicked() {
+                                            close = true;
+                                        }
+                                    },
+                                );
+                                if finish {
+                                    finished = self.finish_wizard(&mut wizard);
+                                }
+                            } else if theme::quiet(ui, "Abbrechen").clicked() {
+                                close = true;
                             }
                         } else if theme::quiet(ui, "Abbrechen").clicked() {
                             close = true;
                         }
-                    } else if theme::quiet(ui, "Abbrechen").clicked() {
-                        close = true;
-                    }
-                    if let Some(status) = &wizard.status {
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new(status).small().color(theme.error));
-                    }
+                        if let Some(status) = &wizard.status {
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(status).small().color(theme.error));
+                        }
+                    });
                 });
             });
         if !close && !finished {
@@ -1484,63 +1654,98 @@ impl SyncApp {
         }
         if accounts.is_empty() {
             ui.label(
-                egui::RichText::new("Keine Konten — zuerst im Tab 'Konten & Server' anlegen.")
+                egui::RichText::new("Keine Konten — zuerst im Tab „Konten“ anlegen.")
                     .small()
                     .color(theme.warning),
             );
         }
     }
 
-    /// Wizard step 2: the space (spaces list from the Graph API).
+    /// Wizard step 2: the space. The list comes from the account's
+    /// already loaded spaces when available, otherwise it is requested
+    /// automatically (Graph API) — no extra click needed.
     fn show_wizard_space(&mut self, ui: &mut egui::Ui, wizard: &mut Wizard, account_id: &str) {
         let theme = theme::palette();
-        if wizard.spaces.list.is_none() && !wizard.spaces.loading {
-            if theme::primary(ui, "Spaces laden").clicked() {
-                wizard.spaces.loading = true;
-                self.backend.send(UiCommand::ListSpaces {
-                    account_id: account_id.to_owned(),
-                });
-            }
+        let account = self.accounts.get(account_id);
+        let logged_in = account.and_then(|state| state.logged_in) == Some(true);
+        if !logged_in {
+            ui.label(
+                egui::RichText::new(
+                    "Das Konto ist nicht angemeldet — zuerst im Tab „Konten“ anmelden.",
+                )
+                .small()
+                .color(theme.warning),
+            );
             return;
         }
+        if wizard.spaces.list.is_none() && !wizard.spaces.loading {
+            match account.and_then(|state| state.spaces.as_ref()) {
+                Some(Ok(list)) => wizard.spaces.list = Some(list.clone()),
+                _ => {
+                    wizard.spaces.loading = true;
+                    self.backend.send(UiCommand::ListSpaces {
+                        account_id: account_id.to_owned(),
+                    });
+                }
+            }
+        }
         if wizard.spaces.loading {
-            ui.label(
-                egui::RichText::new("Lade Spaces…")
-                    .small()
-                    .color(theme.text_dim),
-            );
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new("Lade Spaces…")
+                        .small()
+                        .color(theme.text_dim),
+                );
+            });
             return;
         }
         let Some(spaces) = wizard.spaces.list.clone() else {
             return;
         };
+        if spaces.is_empty() {
+            ui.label(
+                egui::RichText::new("Keine Spaces verfügbar.")
+                    .small()
+                    .color(theme.text_dim),
+            );
+            return;
+        }
         let selected_id = wizard.space_id.clone();
         let mut selected = selected_id.clone();
-        for space in &spaces {
-            let quota = space
-                .quota
-                .as_ref()
-                .and_then(|quota| {
-                    quota.used.map(|used| {
-                        format!(
-                            " · {} von {}",
-                            format_bytes(used),
-                            quota.total.map(format_bytes).unwrap_or_else(|| "?".into())
-                        )
-                    })
-                })
-                .unwrap_or_default();
-            let label = format!("{}   ·   [{}]{}", space.name, space.drive_type, quota);
-            if ui
-                .add(egui::Button::selectable(
-                    selected.as_deref() == Some(space.id.as_str()),
-                    egui::RichText::new(label),
-                ))
-                .clicked()
-            {
-                selected = Some(space.id.clone());
-            }
-        }
+        Grid::new("wizard-spaces")
+            .num_columns(3)
+            .spacing(egui::Vec2::new(14.0, 6.0))
+            .show(ui, |ui| {
+                for space in &spaces {
+                    let is_selected = selected.as_deref() == Some(space.id.as_str());
+                    if ui
+                        .add(egui::Button::selectable(
+                            is_selected,
+                            egui::RichText::new(&space.name).strong(),
+                        ))
+                        .clicked()
+                    {
+                        selected = Some(space.id.clone());
+                    }
+                    theme::chip(theme.card_stroke).show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(&space.drive_type)
+                                .small()
+                                .color(theme.text_dim),
+                        );
+                    });
+                    match &space.quota {
+                        Some(quota) => {
+                            theme::quota_bar(ui, quota.used.unwrap_or(0), quota.total, format_bytes)
+                        }
+                        None => {
+                            ui.label("");
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
         if selected != selected_id {
             let space = spaces
                 .iter()
@@ -1838,6 +2043,7 @@ impl App for SyncApp {
                     Tab::Accounts => self.show_accounts(ui),
                     Tab::Jobs => self.show_jobs(ui),
                     Tab::Conflicts => self.show_conflicts(ui),
+                    Tab::Settings => self.show_settings(ui),
                 });
         }
         self.show_confirm_remove(ctx);
@@ -1858,7 +2064,7 @@ pub fn run(config_dir: Option<&Path>) -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1040.0, 720.0])
-            .with_min_inner_size([880.0, 560.0])
+            .with_min_inner_size([760.0, 520.0])
             .with_icon(std::sync::Arc::new(egui::IconData {
                 rgba: crate::assets::icon::ICON_RGBA.to_vec(),
                 width: crate::assets::icon::ICON_WIDTH,
@@ -1987,6 +2193,27 @@ fn tab_button(ui: &mut egui::Ui, selected: bool, label: &str) -> bool {
             .rect_filled(underline, egui::CornerRadius::same(1), theme.accent);
     }
     response.clicked()
+}
+
+/// One space as three grid cells: name, type chip, quota bar (empty
+/// cell when the server reports no quota, e.g. for the virtual shares
+/// space).
+fn space_row(ui: &mut egui::Ui, space: &Space) {
+    let theme = theme::palette();
+    ui.label(egui::RichText::new(&space.name).strong().color(theme.text));
+    theme::chip(theme.card_stroke).show(ui, |ui| {
+        ui.label(
+            egui::RichText::new(&space.drive_type)
+                .small()
+                .color(theme.text_dim),
+        );
+    });
+    match &space.quota {
+        Some(quota) => theme::quota_bar(ui, quota.used.unwrap_or(0), quota.total, format_bytes),
+        None => {
+            ui.label("");
+        }
+    }
 }
 
 /// The first upper-case character of a name (avatar initials).

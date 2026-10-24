@@ -51,7 +51,7 @@ impl RemoteNode {
 }
 
 /// The remote tree snapshot plus the root ETag (change-detection shortcut).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct RemoteSnapshot {
     /// All covered resources, keyed by space-relative path.
     pub entries: HashMap<String, RemoteNode>,
@@ -63,6 +63,10 @@ pub struct RemoteSnapshot {
     pub server_names: HashMap<String, String>,
     /// Server SHA1 checksums of files (lowercase hex), where reported.
     pub checksums: HashMap<String, String>,
+    /// Folders whose listing failed with a server error (5xx), with the
+    /// error. Their state is unknown: the engine freezes them (and
+    /// everything below) for the pass and keeps syncing the rest.
+    pub unreadable: Vec<(String, SyncError)>,
 }
 
 /// Maps normalized (NFC) paths — the keys of scans, diff, and database —
@@ -226,6 +230,9 @@ pub fn remove_part_files(root: &Path) -> Result<(), SyncError> {
 /// from an already-fetched root listing. Traversal stops at folders
 /// outside the filter. `pause` is slept between two folder listings —
 /// the configurable server-load throttle (`propfind_pause_ms`).
+/// Folders whose listing fails with a server error (5xx) are recorded
+/// in [`RemoteSnapshot::unreadable`] instead of aborting the scan;
+/// everything else (network, auth, protocol) is fatal as before.
 pub async fn scan_remote_from_root<P: TokenProvider>(
     dav: &WebDavClient<P>,
     filter: &Filter,
@@ -238,12 +245,13 @@ pub async fn scan_remote_from_root<P: TokenProvider>(
             .and_then(|resource| resource.etag.clone()),
         ..RemoteSnapshot::default()
     };
-    // Folders to list, by their server path (see `ServerNames`).
-    let mut pending: VecDeque<String> = VecDeque::new();
+    // Folders to list, by their server path (for the request) and their
+    // normalized path (for reporting), see `ServerNames`.
+    let mut pending: VecDeque<(String, String)> = VecDeque::new();
     for resource in root_listing.iter().skip(1) {
         add_remote_child(resource, filter, &mut snapshot, &mut pending);
     }
-    while let Some(dir) = pending.pop_front() {
+    while let Some((dir, path)) = pending.pop_front() {
         if !pause.is_zero() {
             tokio::time::sleep(pause).await;
         }
@@ -252,6 +260,15 @@ pub async fn scan_remote_from_root<P: TokenProvider>(
             // The folder vanished between the parent listing and this
             // request: its contents are gone; keep syncing the rest.
             Err(oc_api::ApiError::NotFound) => continue,
+            // The server failed to produce this listing (e.g. a 500 for
+            // a folder with more entries than the server's internal
+            // gRPC message limit). The folder's contents are unknown:
+            // record it so the engine can freeze the subtree instead of
+            // aborting the whole pass.
+            Err(source @ oc_api::ApiError::Server { .. }) => {
+                snapshot.unreadable.push((path, SyncError::Api(source)));
+                continue;
+            }
             Err(source) => return Err(source.into()),
         };
         for resource in children.iter().skip(1) {
@@ -267,7 +284,7 @@ fn add_remote_child(
     resource: &DavResource,
     filter: &Filter,
     snapshot: &mut RemoteSnapshot,
-    pending: &mut VecDeque<String>,
+    pending: &mut VecDeque<(String, String)>,
 ) {
     if resource.path.is_empty() || !filter.covers(&resource.path) {
         return;
@@ -279,7 +296,7 @@ fn add_remote_child(
     }
     let node = RemoteNode::from_resource(resource);
     if node.is_dir {
-        pending.push_back(resource.server_path.clone());
+        pending.push_back((resource.server_path.clone(), resource.path.clone()));
     } else if let Some(sha1) = resource.sha1() {
         snapshot.checksums.insert(resource.path.clone(), sha1);
     }

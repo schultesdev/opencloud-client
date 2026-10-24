@@ -14,6 +14,17 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Serverfehler beim Auflisten eines Ordners friert nur diesen Ordner ein**:
+  Scheitert das `PROPFIND Depth: 1` eines Unterordners mit einem 5xx-Fehler
+  (z. B. `ResourceExhausted`, wenn ein Verzeichnis mehr Einträge hat als das
+  gRPC-Nachrichtenlimit des Servers erlaubt), bricht der Sync-Lauf nicht mehr
+  komplett ab. Der betroffene Ordner wird als Fehler gemeldet und zusammen mit
+  seinem Unterbaum für den Lauf eingefroren; der Rest des Spaces wird normal
+  synchronisiert und beim nächsten Lauf erneut versucht. Netzwerk-, Auth- und
+  Protokollfehler brechen den Lauf weiterhin ab.
+
 ### Changed
 
 - **GitHub-Projekt hinterlegt**: `repository` ist nun im Manifest gesetzt

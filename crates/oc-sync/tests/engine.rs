@@ -558,6 +558,78 @@ async fn remote_deletion_removes_the_local_file() {
     engine.stop().await;
 }
 
+// --- Remote scan failures ---------------------------------------------------
+
+#[tokio::test]
+async fn server_error_on_folder_listing_freezes_it_and_syncs_the_rest() {
+    let f = fixture(&[], &[]).await;
+
+    // A synced file below the folder whose listing will fail; without
+    // the freeze it would look remotely deleted and be removed.
+    std::fs::create_dir_all(f.root.join("big")).expect("mkdir");
+    std::fs::write(f.root.join("big/x.txt"), "x").expect("write");
+    {
+        let db = open_db(&f.db_path);
+        db.upsert_entry(&NewEntry::new("big", true, EntryState::Synced))
+            .expect("seed dir");
+        db.upsert_entry(&seeded_file_entry("big/x.txt", "\"e-x\"", 1, 1))
+            .expect("seed file");
+    }
+
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    mount_propfind(
+        &f.server,
+        "",
+        "1",
+        &[
+            ("", true, Some("\"root-1\""), None),
+            ("a.txt", false, Some("\"e-a\""), Some(3)),
+            ("big", true, Some("\"e-big\""), None),
+        ],
+    )
+    .await;
+    // The listing of `big` fails server-side (e.g. a directory with
+    // more entries than the server's internal gRPC message limit).
+    Mock::given(method("PROPFIND"))
+        .and(path("/dav/spaces/sid/big"))
+        .and(header("Depth", "1"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&f.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("aaa"))
+        .mount(&f.server)
+        .await;
+
+    // Immediate retries keep the run fast despite the failing listing.
+    let dav = WebDavClient::new(&f.server.uri(), "sid", StaticToken::new("tok"))
+        .expect("client")
+        .with_retry(RetryConfig::immediate());
+    let db = StatusDb::open(&f.db_path).expect("db");
+    let job = Job::new("job-1", &f.root, &f.include, &f.exclude, dav, db).expect("job");
+    let mut engine = Engine::start(vec![job], test_options()).expect("engine");
+
+    let (summary, events) = next_run(&mut engine).await;
+    // The rest of the space syncs.
+    assert_eq!(summary.downloads, 1);
+    assert_eq!(summary.deletes, 0);
+    // The failed folder is reported and its subtree stays untouched.
+    assert_eq!(summary.errors, 1);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::Failed { path, error, .. }
+            if path == "big" && error.contains("server error (500)")
+    )));
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("big/x.txt")).unwrap(),
+        "x"
+    );
+    let db = open_db(&f.db_path);
+    assert!(db.get_entry("big/x.txt").expect("db query").is_some());
+    engine.stop().await;
+}
+
 // --- Folder rename (delete + re-create) ------------------------------------
 
 #[tokio::test]

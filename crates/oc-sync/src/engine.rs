@@ -677,10 +677,15 @@ async fn run_once<P: TokenProvider + 'static>(
     let skip_remote =
         options.root_etag_shortcut && stored_etag.is_some() && stored_etag == root_etag;
 
-    let (remote, names, checksums) = if skip_remote {
+    let (remote, names, checksums, remote_unreadable) = if skip_remote {
         summary.remote_scan_skipped = true;
         let names = db_lock(&job.db).server_names().unwrap_or_default();
-        (remote_from_db(&db_entries), names, HashMap::new())
+        (
+            remote_from_db(&db_entries),
+            names,
+            HashMap::new(),
+            Vec::new(),
+        )
     } else {
         let listing = match job.dav.propfind("", Depth::One).await {
             Ok(listing) => listing,
@@ -702,7 +707,12 @@ async fn run_once<P: TokenProvider + 'static>(
                 if let Err(error) = db_lock(&job.db).replace_server_names(&snapshot.server_names) {
                     fail(&mut summary, "", &SyncError::from(error));
                 }
-                (snapshot.entries, snapshot.server_names, snapshot.checksums)
+                (
+                    snapshot.entries,
+                    snapshot.server_names,
+                    snapshot.checksums,
+                    snapshot.unreadable,
+                )
             }
             Err(error) => {
                 abort(&mut summary, &mut aborted, error);
@@ -732,6 +742,14 @@ async fn run_once<P: TokenProvider + 'static>(
     // Locally unreadable paths are in an unknown state: freeze them for
     // this pass (a folder that cannot be listed must not look deleted).
     for (path, error) in unreadable {
+        fail(&mut summary, &path, &error);
+        frozen.insert(path);
+    }
+    // The same applies to remote folders whose listing failed with a
+    // server error (e.g. a 500 for a directory with more entries than
+    // the server's internal message limit): their state is unknown, so
+    // freeze the subtree and keep syncing the rest of the space.
+    for (path, error) in remote_unreadable {
         fail(&mut summary, &path, &error);
         frozen.insert(path);
     }

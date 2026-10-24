@@ -11,6 +11,7 @@ const AUTOSTART_ID: &str = "opencloud-sync";
 
 /// The path of the autostart entry, for messages and existence checks
 /// (the registry value name on Windows).
+#[cfg_attr(windows, allow(dead_code))]
 fn autostart_path() -> Result<std::path::PathBuf, String> {
     #[cfg(target_os = "macos")]
     {
@@ -94,7 +95,6 @@ pub fn enable() -> Result<(), String> {
     let exe = entry_reference(&current_exe()?);
     #[cfg(windows)]
     {
-        use winreg::RegKey;
         use winreg::enums::HKEY_CURRENT_USER;
         let key = winreg::RegKey::predef(HKEY_CURRENT_USER)
             .open_subkey_with_flags(
@@ -146,7 +146,6 @@ pub fn enable() -> Result<(), String> {
 pub fn disable() -> Result<(), String> {
     #[cfg(windows)]
     {
-        use winreg::RegKey;
         use winreg::enums::HKEY_CURRENT_USER;
         let key = winreg::RegKey::predef(HKEY_CURRENT_USER)
             .open_subkey_with_flags(

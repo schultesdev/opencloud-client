@@ -215,7 +215,7 @@ mod tests {
             account_id: "konto-1".into(),
             space_id: "storage-users-1$abc".into(),
             space_name: None,
-            local_path: PathBuf::from("/tmp/sync"),
+            local_path: std::env::temp_dir().join("sync"),
             enabled: false,
             include: vec![],
             exclude: vec![],

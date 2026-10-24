@@ -19,7 +19,7 @@ jobs:
     # 22.04 keeps the glibc baseline low; the gtk3 of 22.04 is fine.
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - name: Install GUI system libraries
@@ -71,7 +71,7 @@ jobs:
             --plugin gtk --output appimage
           mv "OpenCloud-Sync-${VERSION}-x86_64.AppImage" dist/
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: linux-packages
           path: |
@@ -80,7 +80,7 @@ jobs:
           if-no-files-found: error
       - name: Upload AppImage
         if: steps.appimage.outcome == 'success'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: linux-appimage
           path: dist/*.AppImage
@@ -94,7 +94,7 @@ jobs:
     env:
       SIGNING_ENABLED: ${{ secrets.MACOS_SIGNING_IDENTITY != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - name: Add both architectures
@@ -163,7 +163,7 @@ jobs:
             --team-id "$APPLE_TEAM_ID" --wait
           xcrun stapler staple "$DMG"
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: macos-dmg
           path: dist/*.dmg
@@ -173,7 +173,7 @@ jobs:
     name: Windows (NSIS installer, portable)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
@@ -199,7 +199,7 @@ jobs:
           Compress-Archive -Path "dist/portable/*" `
             -DestinationPath "dist/OpenCloud-Sync-$version-windows-portable.zip"
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: windows-packages
           path: dist/OpenCloud-Sync-*
@@ -210,9 +210,9 @@ jobs:
     needs: [linux, macos, windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true

@@ -154,11 +154,18 @@ impl Setup {
     }
 
     /// Starts the engine with a client pointing at `server_url` instead
-    /// of the fixture's wiremock server (offline tests).
+    /// of the fixture's wiremock server (offline tests). One attempt per
+    /// request: on Windows a refused loopback connect takes ~1–2 s (the
+    /// stack retransmits the SYN before accepting the RST), so every
+    /// retried attempt of a failing offline probe stretches the test's
+    /// timing budgets several-fold.
     fn engine_at(&self, server_url: &str, options: EngineOptions) -> Engine {
         let dav = WebDavClient::new(server_url, "sid", StaticToken::new("tok"))
             .expect("client")
-            .with_retry(RetryConfig::immediate());
+            .with_retry(RetryConfig {
+                max_attempts: 1,
+                ..RetryConfig::immediate()
+            });
         let db = StatusDb::open(&self.db_path).expect("db");
         let job =
             Job::new("job-1", &self.root, &self.include, &self.exclude, dav, db).expect("job");
@@ -1856,9 +1863,11 @@ async fn serve_minimal_dav(port: u16) {
     });
 }
 
-/// Collects the next `count` Offline events (their retry delays).
+/// Collects the next `count` Offline events (their retry delays). The
+/// budget must cover several failing runs against the dead port: on
+/// Windows every refused loopback connect costs ~1–2 s.
 async fn offline_retries(engine: &mut Engine, count: usize) -> Vec<Duration> {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         let mut retries = Vec::new();
         loop {
             match engine.events_mut().recv().await {

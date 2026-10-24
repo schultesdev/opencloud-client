@@ -444,6 +444,7 @@ fn etag_of(response: &reqwest::Response) -> Option<String> {
 /// Clears the read-only flag if set: on Unix by setting the owner write
 /// bit (only that bit, so the file does not become world-writable), on
 /// Windows/macOS via the read-only attribute.
+#[allow(clippy::permissions_set_readonly_false)]
 pub(crate) fn make_writable(path: &Path) -> Result<(), SyncError> {
     #[cfg(unix)]
     {

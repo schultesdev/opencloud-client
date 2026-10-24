@@ -89,6 +89,10 @@ jobs:
   macos:
     name: macOS (universal .dmg)
     runs-on: macos-latest
+    # The secrets context is unavailable in `if:` conditionals, so the
+    # check is hoisted into the job env, which is visible to step `if:`.
+    env:
+      SIGNING_ENABLED: ${{ secrets.MACOS_SIGNING_IDENTITY != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -117,7 +121,7 @@ jobs:
       # credentials). Without them the build stays ad-hoc signed and macOS
       # asks the user to confirm the first launch.
       - name: Import signing certificate
-        if: ${{ secrets.MACOS_SIGNING_IDENTITY != '' }}
+        if: env.SIGNING_ENABLED == 'true'
         env:
           CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -132,7 +136,7 @@ jobs:
             -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security list-keychain -d user -s "$KEYCHAIN_PATH"
       - name: Sign app bundle
-        if: ${{ secrets.MACOS_SIGNING_IDENTITY != '' }}
+        if: env.SIGNING_ENABLED == 'true'
         env:
           IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
@@ -147,7 +151,7 @@ jobs:
             -srcfolder "dist/OpenCloud Sync.app" -ov -format UDZO \
             "dist/OpenCloud-Sync-${VERSION}-macOS.dmg"
       - name: Notarize .dmg
-        if: ${{ secrets.MACOS_SIGNING_IDENTITY != '' }}
+        if: env.SIGNING_ENABLED == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}

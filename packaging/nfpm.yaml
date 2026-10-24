@@ -31,8 +31,10 @@ deb:
   depends:
     - libgtk-3-0
     - libsecret-1-0
+    - libxdo3
 
 rpm:
   depends:
     - gtk3
     - libsecret
+    - xdotool

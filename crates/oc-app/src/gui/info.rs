@@ -122,6 +122,92 @@ impl SyncApp {
                 ui.add_space(8.0);
                 theme::card().show(ui, |ui| {
                     ui.set_width(ui.available_width());
+                    theme::heading(ui, "Update");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if self.update_pending {
+                            ui.label(
+                                egui::RichText::new("Suche nach neuerer Version …")
+                                    .color(theme.text_dim),
+                            );
+                        } else {
+                            match self.update.as_ref() {
+                                Some(Ok(crate::updates::UpdateCheck::Available {
+                                    version,
+                                    url,
+                                })) => {
+                                    theme::pill(ui, theme.accent, "Neue Version");
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        egui::RichText::new(format!("{version} verfügbar"))
+                                            .strong()
+                                            .color(theme.text),
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.hyperlink_to("Release öffnen", url).on_hover_text(url);
+                                }
+                                Some(Ok(crate::updates::UpdateCheck::UpToDate)) => {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Kein Update verfügbar — Version {VERSION} ist aktuell"
+                                        ))
+                                        .color(theme.text_dim),
+                                    );
+                                }
+                                Some(Ok(crate::updates::UpdateCheck::NotConfigured)) => {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Update-Prüfung folgt mit der ersten Veröffentlichung",
+                                        )
+                                        .color(theme.text_dim),
+                                    );
+                                }
+                                Some(Err(error)) => {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Update-Prüfung fehlgeschlagen: {error}"
+                                        ))
+                                        .small()
+                                        .color(theme.text_dim),
+                                    );
+                                }
+                                None => {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Automatische Prüfung ist deaktiviert \
+                                             (siehe Einstellungen)",
+                                        )
+                                        .color(theme.text_dim),
+                                    );
+                                }
+                            }
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    !self.update_pending,
+                                    egui::Button::new("Jetzt prüfen"),
+                                )
+                                .clicked()
+                            {
+                                self.update_pending = true;
+                                self.backend.send(super::UiCommand::CheckUpdates);
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Es wird nur benachrichtigt — das Programm aktualisiert sich \
+                             nicht selbst.",
+                        )
+                        .small()
+                        .color(theme.text_dim),
+                    );
+                });
+                ui.add_space(8.0);
+                theme::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     theme::heading(ui, "System");
                     ui.add_space(6.0);
                     let log_dir = self.config_dir.join("logs");

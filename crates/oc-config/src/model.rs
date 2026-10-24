@@ -26,6 +26,10 @@ fn default_log_level() -> LogLevel {
     LogLevel::Info
 }
 
+fn default_check_updates() -> bool {
+    true
+}
+
 /// An OpenCloud account (one server + user).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
@@ -123,6 +127,10 @@ pub struct Settings {
     /// Start the app automatically at login (per-OS mechanism).
     #[serde(default)]
     pub autostart: bool,
+    /// Check for a newer release at startup (notification only; there is
+    /// no auto-update).
+    #[serde(default = "default_check_updates")]
+    pub check_updates: bool,
 }
 
 impl Default for Settings {
@@ -134,6 +142,7 @@ impl Default for Settings {
             conflict_policy: ConflictPolicy::Ask,
             log_level: LogLevel::Info,
             autostart: false,
+            check_updates: true,
         }
     }
 }

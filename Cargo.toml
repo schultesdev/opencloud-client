@@ -45,6 +45,7 @@ unicode-normalization = "0.1"
 futures-util = "0.3"
 bytes = "1"
 notify = "8"
+semver = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"

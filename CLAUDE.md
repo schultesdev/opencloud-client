@@ -4,11 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Cross-platform (Windows/macOS/Linux) sync client for [OpenCloud](https://opencloud.eu), written in Rust: JSON configuration, one SQLite status DB per sync job, egui GUI with tray, conflict resolution. `PLAN.md` is the authoritative design document and phase plan (German); phases 0–8 are done, Phase 9 (packaging/distribution) is open. `CHANGELOG.md` gets an entry under `[Unreleased]` for each phase/feature.
+Cross-platform (Windows/macOS/Linux) sync client for [OpenCloud](https://opencloud.eu), written in Rust: JSON configuration, one SQLite status DB per sync job, egui GUI with tray, conflict resolution. `PLAN.md` is the authoritative design document and phase plan (German); all phases (0–9) are implemented. `CHANGELOG.md` gets an entry under `[Unreleased]` for each phase/feature.
 
 ## Commands
 
-CI (`.github/workflows/ci.yml`) runs these on Linux/Windows/macOS and fails on any warning:
+CI (`.github/workflows/ci.yml`) runs these on Linux/Windows/macOS and fails on any warning.
+Release packages (Windows NSIS/portable, macOS universal .dmg, Linux .deb/.rpm/AppImage) are built by
+`.github/workflows/release.yml` on tags `vX.Y.Z`; their assets live in `packaging/` (icons regenerate from
+`oc-app/assets/icon.rs` with `packaging/icons/generate.py`):
 
 ```sh
 cargo fmt --all -- --check

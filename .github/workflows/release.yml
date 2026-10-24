@@ -1,0 +1,222 @@
+name: Release
+
+# Phase 9: release builds, attached to version tags (vX.Y.Z). Every job
+# builds its platform's packages and uploads them as artifacts; the
+# release job attaches everything to the GitHub release for the tag.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux (deb, rpm, AppImage)
+    # 22.04 keeps the glibc baseline low; the gtk3 of 22.04 is fine.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GUI system libraries
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libfuse2
+      - name: Build release binary
+        run: cargo build --release -p oc-app --locked
+      - name: Install nfpm
+        run: |
+          curl -sSfL https://github.com/goreleaser/nfpm/releases/download/v2.40.0/nfpm_2.40.0_Linux_x86_64.tar.gz \
+            | tar -xz -C /tmp nfpm
+          /tmp/nfpm --version
+      - name: Build .deb and .rpm
+        run: |
+          export VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          /tmp/nfpm package -f packaging/nfpm.yaml -p deb -t "dist/OpenCloud-Sync-${VERSION}-linux-amd64.deb"
+          /tmp/nfpm package -f packaging/nfpm.yaml -p rpm -t "dist/OpenCloud-Sync-${VERSION}-linux-amd64.rpm"
+      # The AppImage bundles GTK via linuxdeploy's gtk plugin. It is the
+      # most fragile leg of packaging; a failure must not keep the other
+      # artifacts from releasing, so it may skip without failing the job.
+      - name: Build AppImage
+        id: appimage
+        continue-on-error: true
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          wget -q -O linuxdeploy.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha.20240127/linuxdeploy-x86_64.AppImage
+          wget -q -O linuxdeploy-plugin-gtk.sh \
+            https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
+          chmod +x linuxdeploy.AppImage linuxdeploy-plugin-gtk.sh
+          APPDIR=dist/AppDir
+          mkdir -p "$APPDIR/usr/bin" \
+            "$APPDIR/usr/share/applications" \
+            "$APPDIR/usr/share/icons/hicolor/64x64/apps" \
+            "$APPDIR/usr/share/icons/hicolor/128x128/apps" \
+            "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+          cp target/release/opencloud-sync "$APPDIR/usr/bin/"
+          cp packaging/linux/opencloud-sync.desktop "$APPDIR/usr/share/applications/"
+          cp packaging/icons/opencloud-sync-64.png \
+            "$APPDIR/usr/share/icons/hicolor/64x64/apps/opencloud-sync.png"
+          cp packaging/icons/opencloud-sync-128.png \
+            "$APPDIR/usr/share/icons/hicolor/128x128/apps/opencloud-sync.png"
+          cp packaging/icons/opencloud-sync-256.png \
+            "$APPDIR/usr/share/icons/hicolor/256x256/apps/opencloud-sync.png"
+          export DEPLOY_GTK_VERSION=3 OUTPUT="OpenCloud-Sync-${VERSION}-x86_64.AppImage"
+          ./linuxdeploy.AppImage --appdir "$APPDIR" \
+            --desktop-file "$APPDIR/usr/share/applications/opencloud-sync.desktop" \
+            --icon-file "$APPDIR/usr/share/icons/hicolor/256x256/apps/opencloud-sync.png" \
+            --plugin gtk --output appimage
+          mv "OpenCloud-Sync-${VERSION}-x86_64.AppImage" dist/
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: error
+      - name: Upload AppImage
+        if: steps.appimage.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: dist/*.AppImage
+          if-no-files-found: error
+
+  macos:
+    name: macOS (universal .dmg)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Add both architectures
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Build release binaries
+        run: |
+          cargo build --release -p oc-app --locked --target aarch64-apple-darwin
+          cargo build --release -p oc-app --locked --target x86_64-apple-darwin
+      - name: Assemble app bundle
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP="dist/OpenCloud Sync.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          lipo -create \
+            target/aarch64-apple-darwin/release/opencloud-sync \
+            target/x86_64-apple-darwin/release/opencloud-sync \
+            -output "$APP/Contents/MacOS/opencloud-sync"
+          sed "s/\$(MARKETING_VERSION)/$VERSION/g" \
+            packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+          cp packaging/icons/OpenCloudSync.icns "$APP/Contents/Resources/AppIcon.icns"
+          codesign --force --sign - "$APP"
+      # Signing and notarization only run when the repository secrets are
+      # configured (Developer ID application certificate + notarytool
+      # credentials). Without them the build stays ad-hoc signed and macOS
+      # asks the user to confirm the first launch.
+      - name: Import signing certificate
+        if: ${{ secrets.MACOS_SIGNING_IDENTITY != '' }}
+        env:
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          echo -n "$CERTIFICATE" | base64 --decode -o "$CERTIFICATE_PATH"
+          security create-keychain -p "" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" \
+            -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+      - name: Sign app bundle
+        if: ${{ secrets.MACOS_SIGNING_IDENTITY != '' }}
+        env:
+          IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          security unlock-keychain -p "" "$RUNNER_TEMP/signing.keychain-db"
+          codesign --force --options runtime --timestamp \
+            --sign "$IDENTITY" "dist/OpenCloud Sync.app"
+          codesign --verify --deep --strict "dist/OpenCloud Sync.app"
+      - name: Create .dmg
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          hdiutil create -volname "OpenCloud Sync" \
+            -srcfolder "dist/OpenCloud Sync.app" -ov -format UDZO \
+            "dist/OpenCloud-Sync-${VERSION}-macOS.dmg"
+      - name: Notarize .dmg
+        if: ${{ secrets.MACOS_SIGNING_IDENTITY != '' }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          DMG=$(ls dist/*.dmg)
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$DMG"
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  windows:
+    name: Windows (NSIS installer, portable)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release -p oc-app --locked
+      - name: Install NSIS
+        run: |
+          choco install nsis --yes
+          Add-Content $env:GITHUB_PATH "C:\Program Files (x86)\NSIS"
+      - name: Build installer
+        run: |
+          $version = "${env:GITHUB_REF_NAME}" -replace '^v', ''
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $source = (Resolve-Path "target/release").Path
+          makensis /DVERSION="$version" /DSOURCE="$source" `
+            /DOUTFILE="dist/OpenCloud-Sync-$version-setup.exe" `
+            "packaging/windows/installer.nsi"
+      - name: Build portable archive
+        run: |
+          $version = "${env:GITHUB_REF_NAME}" -replace '^v', ''
+          New-Item -ItemType Directory -Force -Path "dist/portable" | Out-Null
+          Copy-Item "target/release/opencloud-sync.exe" "dist/portable/"
+          Copy-Item "LICENSE" "dist/portable/"
+          Compress-Archive -Path "dist/portable/*" `
+            -DestinationPath "dist/OpenCloud-Sync-$version-windows-portable.zip"
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packages
+          path: dist/OpenCloud-Sync-*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List packages
+        run: ls -la dist
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: dist/*

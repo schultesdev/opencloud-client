@@ -41,6 +41,7 @@ fn sample_config() -> Config {
             conflict_policy: ConflictPolicy::KeepLocal,
             log_level: LogLevel::Debug,
             autostart: false,
+            check_updates: false,
         },
     }
 }

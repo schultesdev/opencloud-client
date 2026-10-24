@@ -1,0 +1,38 @@
+name: opencloud-sync
+arch: amd64
+platform: linux
+version: "${VERSION}"
+section: net
+priority: optional
+maintainer: Gregor Schulte <mail@schultes.dev>
+description: |
+  Cross-platform sync client for OpenCloud: synchronize any number of
+  folders with OpenCloud spaces, with a GUI, tray icon, conflict
+  resolution, and selective sync.
+vendor: Gregor Schulte
+homepage: https://www.schultes.dev
+license: Apache-2.0
+
+contents:
+  - src: target/release/opencloud-sync
+    dst: /usr/bin/opencloud-sync
+    file_info:
+      mode: 0755
+  - src: packaging/linux/opencloud-sync.desktop
+    dst: /usr/share/applications/opencloud-sync.desktop
+  - src: packaging/icons/opencloud-sync-64.png
+    dst: /usr/share/icons/hicolor/64x64/apps/opencloud-sync.png
+  - src: packaging/icons/opencloud-sync-128.png
+    dst: /usr/share/icons/hicolor/128x128/apps/opencloud-sync.png
+  - src: packaging/icons/opencloud-sync-256.png
+    dst: /usr/share/icons/hicolor/256x256/apps/opencloud-sync.png
+
+deb:
+  depends:
+    - libgtk-3-0
+    - libsecret-1-0
+
+rpm:
+  depends:
+    - gtk3
+    - libsecret

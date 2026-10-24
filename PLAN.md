@@ -348,14 +348,29 @@ Remote geändert? = ETag != DB-Werte
 
 ### Phase 9 — Packaging & Distribution (ca. 3–5 Tage)
 
-- [ ] Release-Builds über CI:
-  - Windows: NSIS/MSI-Installer, Codesigning optional
-  - macOS: Universal-Binary (aarch64+x86_64), `.dmg`, Notarisierung
-  - Linux: `.deb`, `.rpm`, AppImage
-- [ ] Update-Benachrichtigung (Versionscheck gegen Releases-Feed), kein
-  Auto-Update in v1.
-- [ ] Handbuch/README: Installation, erste Schritte, Konfliktlösung,
-  Konfigurationsreferenz.
+- [x] **Release-Builds über CI** (`.github/workflows/release.yml`, an Tags
+  `vX.Y.Z`): Windows NSIS-Installer plus portables ZIP (EXE-Icon via
+  `winresource` in `build.rs`; Codesigning optional), macOS
+  Universal-Binary (aarch64+x86_64 per `lipo`) als `.app`-Bundle mit ICNS
+  und `.dmg` (Codesigning + Notarisierung nur, wenn Repo-Secrets
+  konfiguriert; sonst ad-hoc signiert), Linux `.deb` und `.rpm` (nfpm,
+  `packaging/nfpm.yaml`) und AppImage (linuxdeploy mit GTK-Plugin; dieser
+  Schritt darf ausfallen, ohne die anderen Artefakte aufzuhalten). Icons
+  stammen aus dem eingebetteten Anwendungsicon (`packaging/icons/generate.py`
+  erzeugt PNG/ICO/ICNS daraus). Der Release-Job hängt alles als
+  Draft-Release an.
+- [x] **Update-Benachrichtigung** (`oc-app/src/updates.rs`): Versionscheck
+  gegen den GitHub-Releases-Feed des Projekts beim Start (Einstellung
+  `check_updates`, Standard an) und per „Jetzt prüfen“ im Info-Tab —
+  Benachrichtigung mit Link zur Release-Seite, **kein Auto-Update**. Der
+  Feed wird aus `repository` in `[workspace.package]` abgeleitet; solange
+  das Projekt unveröffentlicht ist, meldet die Prüfung „folgt mit der
+  ersten Veröffentlichung“ ohne Netzwerkzugriff.
+- [x] **Handbuch/README** (`README.md`): Installation (alle Pakete, Bauen
+  aus dem Source), erste Schritte, Konfliktlösung (GUI/CLI/Policies),
+  CLI-Referenz, vollständige Konfigurationsreferenz
+  (`config.json`/`jobs.json` mit Feldern und Grenzen), Protokolle,
+  Grenzen und Entwicklungshinweise.
 
 ---
 

@@ -12,6 +12,7 @@
 mod assets;
 mod gui;
 mod logging;
+mod updates;
 
 use std::collections::HashMap;
 use std::error::Error;

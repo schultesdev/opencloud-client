@@ -7,6 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 homepage.workspace = true
+build = "build.rs"
 
 [dependencies]
 oc-api.workspace = true
@@ -22,6 +23,13 @@ tracing-appender.workspace = true
 eframe = "0.32.3"
 rfd = "0.17.2"
 tray-icon = "0.24.2"
+reqwest.workspace = true
+semver.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+serde_json.workspace = true
 
 [[bin]]
 name = "opencloud-sync"
@@ -32,6 +40,10 @@ workspace = true
 
 [target."cfg(windows)".dependencies]
 winreg = "0.56.0"
+
+# Embeds the application icon into the executable (build.rs).
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 # tray-icon needs a gtk main loop on Linux (see gui/tray.rs); the same
 # gtk version is already pulled in by tray-icon/muda and rfd.

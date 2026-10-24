@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=OpenCloud Sync
+GenericName=File Synchronizer
+Comment=Synchronize folders between this computer and OpenCloud spaces
+Exec=opencloud-sync
+Icon=opencloud-sync
+Terminal=false
+Categories=Network;FileTools;
+Keywords=sync;opencloud;cloud;files;webdav;
+StartupNotify=true
+SingleMainWindow=true
+X-GNOME-UsesNotifications=true

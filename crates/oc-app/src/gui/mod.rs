@@ -189,6 +189,10 @@ struct SyncApp {
     resolving: HashSet<(String, i64)>,
     /// Whether the OS autostart entry is currently present.
     autostart_active: bool,
+    /// The release check from the settings is in flight.
+    update_pending: bool,
+    /// The last update check's outcome (notification only, no auto-update).
+    update: Option<Result<crate::updates::UpdateCheck, String>>,
     /// Whether the theme has been applied to the context (once).
     styled: bool,
     /// The header icon (loaded from the embedded asset once).
@@ -240,6 +244,8 @@ impl SyncApp {
             quitting: false,
             resolving: HashSet::new(),
             autostart_active: crate::gui::autostart::is_enabled(),
+            update_pending: false,
+            update: None,
             styled: false,
             icon: None,
             last_refresh: Instant::now() - Duration::from_secs(10),
@@ -332,6 +338,13 @@ impl SyncApp {
             }
             BackendEvent::Message { message } => self.notify(message),
             BackendEvent::Snapshots(snapshots) => self.apply_snapshots(snapshots),
+            BackendEvent::UpdateChecked { result } => {
+                self.update_pending = false;
+                if let Ok(crate::updates::UpdateCheck::Available { version, .. }) = &result {
+                    self.notify(format!("Neue Version {version} verfügbar (siehe Info-Tab)"));
+                }
+                self.update = Some(result);
+            }
         }
     }
 
@@ -666,6 +679,14 @@ impl SyncApp {
             });
     }
 
+    /// Starts the update check the settings ask for (once, at startup).
+    fn check_updates_at_start(&mut self) {
+        if self.config.settings.check_updates {
+            self.update_pending = true;
+            self.backend.send(UiCommand::CheckUpdates);
+        }
+    }
+
     /// Saves `config` and, only on success, makes it the GUI's copy — a
     /// failed save must not leave the GUI showing state that is not on
     /// disk (and that a later save would write after all).
@@ -771,6 +792,7 @@ pub fn run(config_dir: Option<&Path>) -> Result<(), String> {
     let (backend, events) = crate::gui::backend::spawn(config_dir.clone())?;
     let mut app = SyncApp::new(config_dir, backend, events)?;
     app.bootstrap_space_names();
+    app.check_updates_at_start();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1040.0, 720.0])

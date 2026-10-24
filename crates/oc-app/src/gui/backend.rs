@@ -91,6 +91,9 @@ pub enum UiCommand {
         /// The jobs to read.
         job_ids: Vec<String>,
     },
+    /// Check the releases feed for a newer version (notification only);
+    /// the answer arrives as [`BackendEvent::UpdateChecked`].
+    CheckUpdates,
 }
 
 /// What the GUI shows of one job's status database.
@@ -158,6 +161,12 @@ pub enum BackendEvent {
     },
     /// Database snapshots of the requested jobs.
     Snapshots(Vec<JobSnapshot>),
+    /// The update check finished (see `crate::updates`).
+    UpdateChecked {
+        /// The outcome: up to date, a newer release, not configured, or
+        /// an error message.
+        result: Result<crate::updates::UpdateCheck, String>,
+    },
 }
 
 /// The GUI end of the event channel: sends an event and wakes the GUI,
@@ -387,6 +396,13 @@ async fn backend_task(
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     run_resolve(&backend, &job_id, &conflict_ids, resolution).await;
+                });
+            }
+            UiCommand::CheckUpdates => {
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    let result = crate::updates::check_latest().await;
+                    backend.report(BackendEvent::UpdateChecked { result });
                 });
             }
         }

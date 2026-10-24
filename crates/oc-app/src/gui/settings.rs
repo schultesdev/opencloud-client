@@ -99,6 +99,13 @@ impl SyncApp {
                                     }
                                 });
                             ui.end_row();
+                            ui.label("Nach Updates suchen");
+                            ui.checkbox(&mut self.settings_edit.check_updates, "")
+                                .on_hover_text(
+                                    "Beim Start gegen den Releases-Feed des Projekts prüfen \
+                                     und im Info-Tab benachrichtigen; kein Auto-Update.",
+                                );
+                            ui.end_row();
                         });
                 });
                 ui.add_space(12.0);

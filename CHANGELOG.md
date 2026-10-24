@@ -14,6 +14,48 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (Phase 9 — Packaging & Distribution)
+
+- **Release-Builds über CI** (`.github/workflows/release.yml`, getriggert
+  an Tags `vX.Y.Z`): der Release-Job stellt alle Pakete als Draft-Release
+  bereit —
+  - Windows: NSIS-Installer (Startmenü/Desktop-Verknüpfung, Deinstallation
+    mit Eintrag in „Apps & Features“) und portables ZIP; das
+    Anwendungssymbol ist per `winresource` in der EXE eingebettet
+    (`build.rs`).
+  - macOS: Universal-Binary (aarch64+x86_64) als `OpenCloud Sync.app`
+    mit ICNS, verpackt als `.dmg`; Codesigning und Notarisierung laufen
+    automatisch, sobald die Secrets konfiguriert sind
+    (`MACOS_SIGNING_IDENTITY`, Zertifikat, notarytool-Zugang), sonst
+    bleibt das Bundle ad-hoc signiert.
+  - Linux: `.deb` und `.rpm` via nfpm (`packaging/nfpm.yaml`, Binary,
+    Desktop-Datei, Hicolor-Icons; Abhängigkeiten `gtk3`/`libsecret`)
+    und AppImage via linuxdeploy mit GTK-Plugin — der AppImage-Schritt
+    darf ausfallen, ohne die anderen Artefakte aufzuhalten.
+  - Alle Paket-Icons werden aus dem eingebetteten Anwendungsicon
+    erzeugt: `packaging/icons/generate.py` liest
+    `oc-app/assets/icon.rs` und schreibt PNG (64/128/256), ICO
+    (16–256) und ICNS (32–512) — eine Quelle, kein Auseinanderdriften.
+- **Update-Benachrichtigung** (`oc-app/src/updates.rs`): beim Start und
+  per „Jetzt prüfen“ im Info-Tab wird die neueste Release-Version gegen
+  die laufende Version geprüft (SemVer, auch mit `v`-Präfix und
+  Vorabversionen); bei einer neueren Version zeigt der Info-Tab Badge,
+  Link zur Release-Seite und einen Hinweis in der Statuszeile —
+  **kein Auto-Update**. Der Feed ist die GitHub-Releases-API des in
+  `[workspace.package] repository` eingetragenen Projekts; solange
+  `repository` (noch) nicht gesetzt ist, meldet die Prüfung „folgt mit
+  der ersten Veröffentlichung“, ohne das Netz zu bemühen — dieselbe
+  Platzhalter-Logik wie die Projekt-Links im Info-Tab. Neue Einstellung
+  `settings.check_updates` (Standard: an) schaltet die Prüfung beim
+  Start ab. Prüfung läuft als eigener Task im Backend
+  (`UiCommand::CheckUpdates`/`BackendEvent::UpdateChecked`), Tests mit
+  Mock-Feed decken neueren/aktuellen/Fehler-Fall ab.
+- **README.md**: Handbuch mit Installation (alle Pakete, Bauen aus dem
+  Source), ersten Schritten, Konfliktlösung (GUI, CLI, Policies),
+  CLI-Referenz und vollständiger Konfigurationsreferenz zu
+  `config.json`/`jobs.json` inklusive Feldgrenzen, Ordnerorten je OS
+  und Protokolldateien.
+
 ### Added (Phase 0 — Projekt-Setup)
 
 - Cargo-Workspace mit den sechs Crates `oc-config`, `oc-auth`, `oc-api`,

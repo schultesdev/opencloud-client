@@ -16,10 +16,7 @@ license = "Apache-2.0"
 rust-version = "1.85"
 authors = ["Gregor Schulte"]
 homepage = "https://www.schultes.dev"
-# Placeholder: once the GitHub project exists, set its URL here and add
-# `repository.workspace = true` to crates/oc-app/Cargo.toml; the info tab
-# then links the project and its issue tracker automatically.
-# repository = "https://github.com/<owner>/<repo>"
+repository = "https://github.com/schultesdev/opencloud-client"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

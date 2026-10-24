@@ -14,6 +14,13 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **GitHub-Projekt hinterlegt**: `repository` ist nun im Manifest gesetzt
+  (`https://github.com/schultesdev/opencloud-client`). Der Info-Tab verlinkt
+  Quellcode und Issue-Tracker statt der Platzhalter, und die Update-Prüfung
+  nutzt den Releases-Feed des Repositories.
+
 ### Added (Phase 9 — Packaging & Distribution)
 
 - **Release-Builds über CI** (`.github/workflows/release.yml`, getriggert

@@ -3,10 +3,10 @@
 //! notification only — there is no auto-update (see `PLAN.md`, Phase 9).
 //!
 //! The feed is the GitHub releases API of the repository configured in
-//! `[workspace.package] repository`. While that is unset (the project is
-//! not published yet), the check reports [`UpdateCheck::NotConfigured`]
-//! without touching the network, mirroring the placeholder links in the
-//! Info tab; setting `repository` activates both.
+//! `[workspace.package] repository`. While that is unset, the check
+//! reports [`UpdateCheck::NotConfigured`] without touching the network,
+//! mirroring the placeholder links in the Info tab; setting `repository`
+//! activates both.
 
 use std::time::Duration;
 
@@ -15,7 +15,7 @@ use serde::Deserialize;
 /// The running version, from the workspace manifest.
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The source repository; empty while unpublished.
+/// The source repository.
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 
 /// How long the update check may take before giving up.

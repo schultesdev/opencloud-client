@@ -16,8 +16,8 @@ const HOMEPAGE: &str = env!("CARGO_PKG_HOMEPAGE");
 const LICENSE: &str = env!("CARGO_PKG_LICENSE");
 /// The full license text for [`LICENSE`].
 const LICENSE_URL: &str = "https://www.apache.org/licenses/LICENSE-2.0";
-/// The source repository; empty until `repository` is set in the
-/// manifest, in which case the tab shows a placeholder instead of links.
+/// The source repository; empty if `repository` is not set in the manifest,
+/// in which case the tab shows a placeholder instead of links.
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 /// The OpenCloud project this client talks to.
 const OPENCLOUD_URL: &str = "https://opencloud.eu";
@@ -290,5 +290,9 @@ mod tests {
         assert!(!AUTHORS.is_empty());
         assert!(HOMEPAGE.starts_with("https://"));
         assert_eq!(LICENSE, "Apache-2.0");
+        assert_eq!(
+            REPOSITORY,
+            "https://github.com/schultesdev/opencloud-client"
+        );
     }
 }

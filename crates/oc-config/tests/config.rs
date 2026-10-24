@@ -262,14 +262,19 @@ fn legacy_version_0_is_migrated_to_1() {
     assert_eq!(config.settings, Settings::default());
 
     // jobs.json v0: version-less job list.
+    let local_path = if cfg!(windows) {
+        "C:/Users/max/x"
+    } else {
+        "/home/max/x"
+    };
     std::fs::write(
         dir.path().join("jobs.json"),
-        r#"{
-            "jobs": [
-                {"id": "job-1", "account_id": "konto-1", "space_id": "s1",
-                 "local_path": "/home/max/x"}
-            ]
-        }"#,
+        format!(
+            r#"{{"jobs": [
+                {{"id": "job-1", "account_id": "konto-1", "space_id": "s1",
+                 "local_path": "{local_path}"}}
+            ]}}"#
+        ),
     )
     .unwrap();
 

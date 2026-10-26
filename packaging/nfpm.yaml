@@ -27,14 +27,14 @@ contents:
   - src: packaging/icons/opencloud-sync-256.png
     dst: /usr/share/icons/hicolor/256x256/apps/opencloud-sync.png
 
-deb:
-  depends:
-    - libgtk-3-0
-    - libsecret-1-0
-    - libxdo3
-
-rpm:
-  depends:
-    - gtk3
-    - libsecret
-    - xdotool
+overrides:
+  deb:
+    depends:
+      - libgtk-3-0
+      - libsecret-1-0
+      - libxdo3
+  rpm:
+    depends:
+      - gtk3
+      - libsecret
+      - xdotool

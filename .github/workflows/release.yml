@@ -187,9 +187,11 @@ jobs:
           $version = "${env:GITHUB_REF_NAME}" -replace '^v', ''
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $source = (Resolve-Path "target/release").Path
+          $nsi = (Resolve-Path "packaging/windows/installer.nsi").Path
+          $outfile = Join-Path (Resolve-Path "dist").Path "OpenCloud-Sync-$version-setup.exe"
           makensis /DVERSION="$version" /DSOURCE="$source" `
-            /DOUTFILE="dist/OpenCloud-Sync-$version-setup.exe" `
-            "packaging/windows/installer.nsi"
+            /DOUTFILE="$outfile" `
+            "$nsi"
       - name: Build portable archive
         run: |
           $version = "${env:GITHUB_REF_NAME}" -replace '^v', ''

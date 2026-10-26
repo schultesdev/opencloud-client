@@ -30,8 +30,8 @@ RequestExecutionLevel admin
 !define APP_URL "https://www.schultes.dev"
 
 !define MUI_ABORTWARNING
-!define MUI_ICON "${__FILEDIR__}\icons\opencloud-sync.ico"
-!define MUI_UNICON "${__FILEDIR__}\icons\opencloud-sync.ico"
+!define MUI_ICON "${__FILEDIR__}\..\icons\opencloud-sync.ico"
+!define MUI_UNICON "${__FILEDIR__}\..\icons\opencloud-sync.ico"
 !insertmacro MUI_PAGE_LICENSE "${__FILEDIR__}\..\..\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
@@ -44,7 +44,7 @@ Section "OpenCloud Sync (required)" SecCore
   SectionIn RO
   SetOutPath "$INSTDIR"
   File "${SOURCE}\opencloud-sync.exe"
-  File "${__FILEDIR__}\icons\opencloud-sync.ico"
+  File "${__FILEDIR__}\..\icons\opencloud-sync.ico"
   WriteRegStr HKLM "Software\OpenCloud Sync" "InstallDir" "$INSTDIR"
   WriteRegStr HKLM "${REG_UNINSTALL}" "DisplayName" "OpenCloud Sync"
   WriteRegStr HKLM "${REG_UNINSTALL}" "DisplayVersion" "${VERSION}"

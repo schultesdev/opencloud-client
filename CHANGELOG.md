@@ -28,6 +28,12 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **GUI — Ordnerauswahl im Job-Wizard**: Jede Zeile des Ordnerbaums nahm
+  die gesamte verbleibende Höhe ein und streckte das Fenster „Ordner &
+  Ausschlüsse bearbeiten“; die Zeilen sind jetzt einzeilig, große Bäume
+  scrollen innerhalb der Karte (max. 320 px). Beim Bearbeiten sind die
+  Schritte als 1/2 statt 4/5 nummeriert.
+
 - **Serverfehler beim Auflisten eines Ordners friert nur diesen Ordner ein**:
   Scheitert das `PROPFIND Depth: 1` eines Unterordners mit einem 5xx-Fehler
   (z. B. `ResourceExhausted`, wenn ein Verzeichnis mehr Einträge hat als das

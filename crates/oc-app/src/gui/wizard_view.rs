@@ -14,6 +14,8 @@ impl SyncApp {
         };
         let theme = theme::palette();
         let is_new = matches!(wizard.mode, Mode::New);
+        // Editing skips account, space and local folder (steps 1–3).
+        let step_offset = if is_new { 3 } else { 0 };
         let mut close = false;
         let mut finished = false;
         CentralPanel::default()
@@ -65,13 +67,13 @@ impl SyncApp {
                                 ui.add_space(8.0);
                                 theme::card().show(ui, |ui| {
                                     ui.set_width(ui.available_width());
-                                    theme::step(ui, 4, "Ordnerauswahl");
+                                    theme::step(ui, step_offset + 1, "Ordnerauswahl");
                                     self.show_wizard_tree(ui, &mut wizard, &account_id, &space_id);
                                 });
                                 ui.add_space(8.0);
                                 theme::card().show(ui, |ui| {
                                     ui.set_width(ui.available_width());
-                                    theme::step(ui, 5, "Ausschlüsse");
+                                    theme::step(ui, step_offset + 2, "Ausschlüsse");
                                     ui.label(
                                         egui::RichText::new(
                                             "Dateien und Ordner, die dieser Job nie \
@@ -363,9 +365,16 @@ impl SyncApp {
             }
         }
         let children = wizard.tree.children.get("").cloned().unwrap_or_default();
-        for child in children.iter() {
-            self.show_tree_node(ui, wizard, child, 0, account_id, space_id);
-        }
+        // Large trees scroll inside the card instead of stretching the page.
+        ScrollArea::vertical()
+            .id_salt("wizard-tree")
+            .max_height(320.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for child in children.iter() {
+                    self.show_tree_node(ui, wizard, child, 0, account_id, space_id);
+                }
+            });
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(format!(
@@ -402,66 +411,70 @@ impl SyncApp {
         let server_path = resource.server_path.clone();
         let name = resource.name.clone();
         // Right-to-left: the expand toggle is allocated first (rightmost
-        // edge), so long folder names clip instead of running under it.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let expanded = wizard.tree.expanded.contains(&path);
-            let loaded = wizard.tree.children.contains_key(&path);
-            let failed = wizard.tree.failed.contains_key(&path);
-            let toggle = if wizard.tree.loading.contains_key(&path) {
-                "…"
-            } else if failed {
-                "!"
-            } else if expanded {
-                "▾"
-            } else {
-                "▸"
-            };
-            let button = ui.small_button(toggle);
-            let button = match wizard.tree.failed.get(&path) {
-                Some(error) => {
-                    button.on_hover_text(format!("Fehler: {error} — klicken zum Wiederholen"))
-                }
-                None => button,
-            };
-            if button.clicked() {
-                if failed {
-                    wizard.tree.retry(&path);
-                }
-                if !loaded {
-                    wizard
-                        .tree
-                        .fetch(account_id, space_id, &path, &server_path, |command| {
-                            backend.send(command)
-                        });
+        // edge), so long folder names clip instead of running under it. The
+        // `horizontal` wrapper keeps the row one line high; a bare
+        // `with_layout` would take all remaining height.
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let expanded = wizard.tree.expanded.contains(&path);
+                let loaded = wizard.tree.children.contains_key(&path);
+                let failed = wizard.tree.failed.contains_key(&path);
+                let toggle = if wizard.tree.loading.contains_key(&path) {
+                    "…"
+                } else if failed {
+                    "!"
                 } else if expanded {
-                    wizard.tree.expanded.remove(&path);
+                    "▾"
                 } else {
-                    wizard.tree.expanded.insert(path.clone());
+                    "▸"
+                };
+                let button = ui.small_button(toggle);
+                let button = match wizard.tree.failed.get(&path) {
+                    Some(error) => {
+                        button.on_hover_text(format!("Fehler: {error} — klicken zum Wiederholen"))
+                    }
+                    None => button,
+                };
+                if button.clicked() {
+                    if failed {
+                        wizard.tree.retry(&path);
+                    }
+                    if !loaded {
+                        wizard
+                            .tree
+                            .fetch(account_id, space_id, &path, &server_path, |command| {
+                                backend.send(command)
+                            });
+                    } else if expanded {
+                        wizard.tree.expanded.remove(&path);
+                    } else {
+                        wizard.tree.expanded.insert(path.clone());
+                    }
                 }
-            }
-            if wizard.tree.descendant_selected(&path) {
-                ui.weak("(teilweise)");
-            }
-            let mut checked = wizard.tree.selected.contains(&path);
-            if ui.checkbox(&mut checked, &name).changed() {
-                let prefix = format!("{path}/");
-                let descendants: Vec<String> = wizard
-                    .tree
-                    .selected
-                    .iter()
-                    .filter(|selected| selected.starts_with(&prefix))
-                    .cloned()
-                    .collect();
-                for descendant in descendants {
-                    wizard.tree.selected.remove(&descendant);
+                if wizard.tree.descendant_selected(&path) {
+                    ui.weak("(teilweise)");
                 }
-                if checked {
-                    wizard.tree.selected.insert(path.clone());
-                } else {
-                    wizard.tree.selected.remove(&path);
+                let mut checked = wizard.tree.selected.contains(&path);
+                if ui.checkbox(&mut checked, &name).changed() {
+                    let prefix = format!("{path}/");
+                    let descendants: Vec<String> = wizard
+                        .tree
+                        .selected
+                        .iter()
+                        .filter(|selected| selected.starts_with(&prefix))
+                        .cloned()
+                        .collect();
+                    for descendant in descendants {
+                        wizard.tree.selected.remove(&descendant);
+                    }
+                    if checked {
+                        wizard.tree.selected.insert(path.clone());
+                    } else {
+                        wizard.tree.selected.remove(&path);
+                    }
                 }
-            }
-            ui.add_space(depth as f32 * 16.0);
+                ui.add_space(depth as f32 * 16.0);
+            });
         });
         if wizard.tree.expanded.contains(&path) {
             let children = wizard.tree.children.get(&path).cloned().unwrap_or_default();

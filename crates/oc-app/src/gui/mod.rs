@@ -159,6 +159,8 @@ struct SyncApp {
     jobs: Jobs,
     /// Editable settings (Konten tab).
     settings_edit: Settings,
+    /// Text field of the global exclude pattern editor (Einstellungen).
+    global_exclude_input: String,
     /// Per-account UI state.
     accounts: HashMap<String, AccountUi>,
     /// Per-job UI state.
@@ -226,6 +228,7 @@ impl SyncApp {
             backend,
             events,
             settings_edit: config.settings.clone(),
+            global_exclude_input: String::new(),
             config_dir,
             config,
             jobs,
@@ -877,6 +880,76 @@ fn tab_button(ui: &mut egui::Ui, selected: bool, label: &str) -> bool {
             .rect_filled(underline, egui::CornerRadius::same(1), theme.accent);
     }
     response.clicked()
+}
+
+/// Editor for a list of exclude patterns: one row per entry with a
+/// remove button, plus a text field with as-you-type validation and an
+/// "Hinzufügen" button. Invalid input is explained inline; only valid
+/// patterns can be added, so a later save cannot fail on them.
+fn pattern_editor(ui: &mut egui::Ui, patterns: &mut Vec<String>, input: &mut String) {
+    let theme = theme::palette();
+    if patterns.is_empty() {
+        ui.label(
+            egui::RichText::new("Noch keine Ausschlüsse — alles wird synchronisiert.")
+                .small()
+                .color(theme.text_dim),
+        );
+    } else {
+        let mut remove = None;
+        for (index, pattern) in patterns.iter().enumerate() {
+            ui.horizontal(|ui| {
+                theme::ellipsis(ui, egui::RichText::new(pattern).small().color(theme.text))
+                    .on_hover_text(pattern);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::icon_button(ui, "\u{d7}", "Entfernen").clicked() {
+                        remove = Some(index);
+                    }
+                });
+            });
+        }
+        if let Some(index) = remove {
+            patterns.remove(index);
+        }
+    }
+    let mut added = false;
+    ui.horizontal(|ui| {
+        let candidate = input.trim().to_owned();
+        let field = ui.add(
+            egui::TextEdit::singleline(input)
+                .hint_text("z. B. *.tmp, .git, build/out")
+                .desired_width(280.0),
+        );
+        let valid = !candidate.is_empty() && oc_config::validate_pattern(&candidate).is_ok();
+        let add = ui.add_enabled(valid, egui::Button::new("Hinzufügen"));
+        if add.clicked()
+            || (valid && field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+        {
+            patterns.push(candidate);
+            added = true;
+        }
+    });
+    if added {
+        input.clear();
+    }
+    let candidate = input.trim().to_owned();
+    if !candidate.is_empty() {
+        if let Err(error) = oc_config::validate_pattern(&candidate) {
+            ui.label(
+                egui::RichText::new(error.to_string())
+                    .small()
+                    .color(theme.error),
+            );
+        }
+    } else {
+        ui.label(
+            egui::RichText::new(
+                "Muster ohne / gelten für jeden Ordner- oder Dateinamen (z. B. *.tmp, .git), \
+                 Muster mit / für ganze Pfade (z. B. build/out). * und ? sind Platzhalter.",
+            )
+            .small()
+            .color(theme.text_dim),
+        );
+    }
 }
 
 /// One space as three grid cells: name, type chip, quota bar (empty

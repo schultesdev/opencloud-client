@@ -87,31 +87,11 @@ impl SyncJob {
     }
 }
 
-/// Checks a single `include`/`exclude` pattern.
+/// Checks a single `include`/`exclude` pattern of a job; the shared
+/// check is prefixed with the job's id for context.
 fn validate_pattern(job_id: &str, pattern: &str) -> Result<(), ConfigError> {
-    if pattern.trim().is_empty() {
-        return Err(ConfigError::invalid(format!(
-            "job '{job_id}': filter patterns must not be empty"
-        )));
-    }
-    if pattern.starts_with('/') || pattern.starts_with('\\') {
-        return Err(ConfigError::invalid(format!(
-            "job '{job_id}': filter pattern '{pattern}' must be relative"
-        )));
-    }
-    if pattern.contains('\0') {
-        return Err(ConfigError::invalid(format!(
-            "job '{job_id}': filter pattern '{pattern}' contains a NUL byte"
-        )));
-    }
-    for segment in pattern.split(['/', '\\']) {
-        if matches!(segment, "." | "..") {
-            return Err(ConfigError::invalid(format!(
-                "job '{job_id}': filter pattern '{pattern}' must not contain '.' or '..' segments"
-            )));
-        }
-    }
-    Ok(())
+    crate::validate_pattern(pattern)
+        .map_err(|error| ConfigError::invalid(format!("job '{job_id}': {error}")))
 }
 
 /// Root of `jobs.json`: schema version and the job list.

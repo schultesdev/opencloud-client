@@ -14,6 +14,18 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Ausschlüsse nach Mustern, pro Job und global**: Sync-Jobs können
+  Dateien und Ordner per Glob-Muster (`*`, `?`) vom Sync ausschließen —
+  Muster ohne `/` treffen jeden Ordner- oder Dateinamen (`*.tmp`, `.git`),
+  Muster mit `/` ganze Pfade (`build/out`). Neu ist ein Editor dafür im
+  Job-Wizard (Schritt „Ausschlüsse“, auch beim Bearbeiten bestehender
+  Jobs) und — neu `settings.global_exclude` — eine globale Liste in den
+  Einstellungen, die für alle Jobs zusätzlich zu den Job-Mustern gilt.
+  Die Engine mischt die globalen Muster beim Start in jeden Job-Filter;
+  GUI und Headless/CLI werten sie gleichermaßen aus.
+
 ### Fixed
 
 - **Serverfehler beim Auflisten eines Ordners friert nur diesen Ordner ein**:

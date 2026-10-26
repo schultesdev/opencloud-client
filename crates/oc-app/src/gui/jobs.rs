@@ -146,6 +146,9 @@ impl SyncApp {
         if !job.include.is_empty() {
             details.push(format!("{} ausgewählte Ordner", job.include.len()));
         }
+        if !job.exclude.is_empty() {
+            details.push(format!("{} Ausschluss-Muster", job.exclude.len()));
+        }
         let mut open_folder = false;
         let mut edit_folders = false;
         let mut remove = false;
@@ -164,7 +167,7 @@ impl SyncApp {
                                 open_folder = true;
                                 ui.close();
                             }
-                            if ui.button("Ordnerauswahl bearbeiten…").clicked() {
+                            if ui.button("Ordner & Ausschlüsse bearbeiten…").clicked() {
                                 edit_folders = true;
                                 ui.close();
                             }

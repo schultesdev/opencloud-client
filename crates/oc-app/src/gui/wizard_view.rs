@@ -28,7 +28,7 @@ impl SyncApp {
                         ui.add_space(4.0);
                         let title = match &wizard.mode {
                             Mode::New => "Neuen Sync-Job anlegen",
-                            Mode::EditFolders { .. } => "Ordnerauswahl bearbeiten",
+                            Mode::EditFolders { .. } => "Ordner & Ausschlüsse bearbeiten",
                         };
                         ui.label(
                             egui::RichText::new(title)
@@ -67,6 +67,25 @@ impl SyncApp {
                                     ui.set_width(ui.available_width());
                                     theme::step(ui, 4, "Ordnerauswahl");
                                     self.show_wizard_tree(ui, &mut wizard, &account_id, &space_id);
+                                });
+                                ui.add_space(8.0);
+                                theme::card().show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    theme::step(ui, 5, "Ausschlüsse");
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Dateien und Ordner, die dieser Job nie \
+                                             synchronisieren soll.",
+                                        )
+                                        .small()
+                                        .color(theme.text_dim),
+                                    );
+                                    ui.add_space(6.0);
+                                    pattern_editor(
+                                        ui,
+                                        &mut wizard.exclude,
+                                        &mut wizard.exclude_input,
+                                    );
                                 });
                                 ui.add_space(12.0);
                                 let mut finish = false;
@@ -490,7 +509,7 @@ impl SyncApp {
                     local_path,
                     enabled: true,
                     include,
-                    exclude: Vec::new(),
+                    exclude: wizard.exclude.clone(),
                 });
                 if let Err(error) = self.save_jobs(jobs, true) {
                     wizard.status = Some(error);
@@ -504,11 +523,14 @@ impl SyncApp {
                     return false;
                 };
                 job.include = include;
+                job.exclude = wizard.exclude.clone();
                 if let Err(error) = self.save_jobs(jobs, true) {
                     wizard.status = Some(error);
                     return false;
                 }
-                self.notify(format!("Ordnerauswahl von '{job_id}' gespeichert"));
+                self.notify(format!(
+                    "Ordnerauswahl und Ausschlüsse von '{job_id}' gespeichert"
+                ));
             }
         }
         true

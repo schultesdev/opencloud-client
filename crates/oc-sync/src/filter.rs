@@ -11,6 +11,9 @@
 //!   segment (so `tmp` excludes any folder named `tmp` and `*.tmp` any
 //!   file with that suffix, at any depth); a pattern with `/` is matched
 //!   against the full relative path and every folder prefix of it.
+//! - Global exclude patterns (the settings' `global_exclude`) are merged
+//!   into every job's `exclude` list on engine start (see
+//!   [`Filter::add_global_excludes`]).
 
 use crate::error::SyncError;
 
@@ -41,6 +44,18 @@ impl Filter {
     /// A filter that covers the entire tree (no include/exclude).
     pub fn everything() -> Self {
         Self::default()
+    }
+
+    /// Adds patterns that apply on top of the job's own `exclude` list:
+    /// the global excludes of the settings, merged into every job by
+    /// [`crate::Engine::start`]. Each pattern is validated; the first
+    /// invalid one aborts with an error (the filter stays unchanged).
+    pub fn add_global_excludes(&mut self, patterns: &[String]) -> Result<(), SyncError> {
+        for pattern in patterns {
+            validate_pattern(pattern)?;
+        }
+        self.exclude.extend_from_slice(patterns);
+        Ok(())
     }
 
     /// Whether the whitelist is empty (everything is synced).
@@ -216,5 +231,22 @@ mod tests {
         assert!(Filter::new(&empty, &dotdot).is_err());
         let blank: Vec<String> = vec!["  ".into()];
         assert!(Filter::new(&blank, &empty).is_err());
+    }
+
+    #[test]
+    fn global_excludes_merge_into_the_job_filter() {
+        let mut filter = filter(&[], &["*.tmp"]);
+        let global: Vec<String> = vec![".git".into(), "node_modules".into()];
+        filter.add_global_excludes(&global).expect("merge");
+        assert!(!filter.covers("work/.git/config"));
+        assert!(!filter.covers("node_modules/pkg"));
+        assert!(!filter.covers("work/data.tmp"));
+        assert!(filter.covers("work/data.txt"));
+
+        // Invalid patterns abort and leave the filter untouched.
+        let before = filter.clone();
+        let bad: Vec<String> = vec!["../escape".into()];
+        assert!(filter.add_global_excludes(&bad).is_err());
+        assert_eq!(filter, before);
     }
 }

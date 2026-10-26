@@ -1,7 +1,8 @@
 //! The new-job wizard (Phase 7): pick an account, pick a space from the
-//! Graph API, pick a local directory, and select the folders to sync
-//! (selective sync) from the space's remote tree (PROPFIND). Saving
-//! writes the job to `jobs.json` and restarts the engine.
+//! Graph API, pick a local directory, select the folders to sync
+//! (selective sync) from the space's remote tree (PROPFIND), and set
+//! exclude patterns. Saving writes the job to `jobs.json` and restarts
+//! the engine.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -13,14 +14,13 @@ use oc_config::SyncJob;
 
 use super::backend::UiCommand;
 
-/// What the wizard edits: a new job or the folder selection of an
-/// existing one.
+/// What the wizard edits: a new job or the filters of an existing one.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Mode {
     /// Create a job (all steps).
     #[default]
     New,
-    /// Re-select the folders of an existing job.
+    /// Re-select the folders and exclude patterns of an existing job.
     EditFolders {
         /// The job's id.
         job_id: String,
@@ -173,6 +173,10 @@ pub struct Wizard {
     pub local_path: String,
     /// The remote folder tree.
     pub tree: FolderTree,
+    /// Exclude patterns of the job (step 5).
+    pub exclude: Vec<String>,
+    /// Text field of the exclude pattern editor.
+    pub exclude_input: String,
     /// Status/error line below the wizard.
     pub status: Option<String>,
 }
@@ -184,7 +188,7 @@ impl Wizard {
     }
 
     /// A wizard that re-selects the folders of an existing job; account,
-    /// space, and local path are prefilled.
+    /// space, local path, and excludes are prefilled.
     pub fn edit_folders(job: &SyncJob) -> Self {
         let mut tree = FolderTree::default();
         for folder in &job.include {
@@ -200,6 +204,8 @@ impl Wizard {
             space_name: job.space_name.clone(),
             local_path: job.local_path.display().to_string(),
             tree,
+            exclude: job.exclude.clone(),
+            exclude_input: String::new(),
             status: None,
         }
     }
@@ -320,7 +326,7 @@ mod tests {
             local_path: PathBuf::from("/tmp/sync"),
             enabled: true,
             include: vec!["Dokumente".into()],
-            exclude: vec![],
+            exclude: vec!["*.tmp".into()],
         };
         let wizard = Wizard::edit_folders(&job);
         assert_eq!(
@@ -331,6 +337,7 @@ mod tests {
         );
         assert_eq!(wizard.account_id.as_deref(), Some("konto-1"));
         assert_eq!(wizard.tree.selected, set(&["Dokumente"]));
+        assert_eq!(wizard.exclude, ["*.tmp"]);
         assert!(wizard.can_finish());
     }
 }

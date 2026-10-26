@@ -561,6 +561,7 @@ async fn run_headless(
         max_parallel_transfers: config.settings.max_parallel_transfers as usize,
         propfind_pause: Duration::from_millis(config.settings.propfind_pause_ms),
         conflict_policy: config.settings.conflict_policy,
+        global_exclude: config.settings.global_exclude.clone(),
         ..oc_sync::EngineOptions::default()
     };
     let mut engine = oc_sync::Engine::start(engine_jobs, options)?;

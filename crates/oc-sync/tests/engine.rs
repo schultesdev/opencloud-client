@@ -108,6 +108,7 @@ fn test_options() -> EngineOptions {
         // Every progress report becomes an event, so tests can assert on
         // in-flight snapshots deterministically.
         progress_interval: Duration::ZERO,
+        global_exclude: Vec::new(),
     }
 }
 
@@ -741,6 +742,42 @@ async fn exclude_filter_keeps_paths_out_of_the_sync() {
     std::fs::write(f.root.join("skip.txt"), "nope").expect("write");
     std::fs::write(f.root.join("keep.txt"), "yes").expect("write");
     let mut engine = f.engine(test_options());
+    let (summary, _) = next_run(&mut engine).await;
+    assert_eq!(summary.uploads, 1);
+    assert_eq!(summary.errors, 0);
+
+    let db = open_db(&f.db_path);
+    assert!(db.get_entry("skip.txt").expect("db query").is_none());
+    assert!(db.get_entry("keep.txt").expect("db query").is_some());
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn global_exclude_applies_to_jobs_without_own_excludes() {
+    // The job itself has no exclude patterns; the engine options carry
+    // the global ones, which must be merged in on start.
+    let f = fixture(&[], &[]).await;
+
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    mount_propfind(&f.server, "", "1", &[("", true, Some("\"root-1\""), None)]).await;
+    Mock::given(method("PUT"))
+        .and(path("/dav/spaces/sid/keep.txt"))
+        .and(header("If-None-Match", "*"))
+        .respond_with(ResponseTemplate::new(201).append_header("ETag", "\"k1\""))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/dav/spaces/sid/skip.txt"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&f.server)
+        .await;
+
+    std::fs::write(f.root.join("skip.txt"), "nope").expect("write");
+    std::fs::write(f.root.join("keep.txt"), "yes").expect("write");
+    let mut options = test_options();
+    options.global_exclude = vec!["skip*".into()];
+    let mut engine = f.engine(options);
     let (summary, _) = next_run(&mut engine).await;
     assert_eq!(summary.uploads, 1);
     assert_eq!(summary.errors, 0);

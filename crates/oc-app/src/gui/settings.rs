@@ -55,6 +55,26 @@ impl SyncApp {
                 ui.add_space(8.0);
                 theme::card().show(ui, |ui| {
                     ui.set_width(ui.available_width());
+                    theme::heading(ui, "Globale Ausschlüsse");
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Diese Muster gelten für alle Sync-Jobs, zusätzlich zu den \
+                             Ausschlüssen der einzelnen Jobs.",
+                        )
+                        .small()
+                        .color(theme.text_dim),
+                    );
+                    ui.add_space(6.0);
+                    pattern_editor(
+                        ui,
+                        &mut self.settings_edit.global_exclude,
+                        &mut self.global_exclude_input,
+                    );
+                });
+                ui.add_space(8.0);
+                theme::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     theme::heading(ui, "Programm");
                     ui.add_space(6.0);
                     Grid::new("settings-app")

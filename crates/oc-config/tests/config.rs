@@ -42,6 +42,7 @@ fn sample_config() -> Config {
             log_level: LogLevel::Debug,
             autostart: false,
             check_updates: false,
+            global_exclude: Vec::new(),
         },
     }
 }

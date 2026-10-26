@@ -107,6 +107,9 @@ pub struct EngineOptions {
     /// Minimum time between two live progress events of a running pass
     /// (the throttle of [`EngineEvent::Progress`] while bodies stream).
     pub progress_interval: Duration,
+    /// Global exclude patterns applied to every job on top of its own
+    /// `exclude` list (the settings' `global_exclude`).
+    pub global_exclude: Vec<String>,
 }
 
 impl Default for EngineOptions {
@@ -123,6 +126,7 @@ impl Default for EngineOptions {
             offline_backoff_base: Duration::from_secs(10),
             offline_backoff_cap: Duration::from_secs(60),
             progress_interval: Duration::from_millis(200),
+            global_exclude: Vec::new(),
         }
     }
 }
@@ -361,6 +365,12 @@ impl Engine {
         jobs: Vec<Job<P>>,
         options: EngineOptions,
     ) -> Result<Self, SyncError> {
+        // The global excludes are merged into every job up front, so an
+        // invalid pattern fails the start instead of a single job later.
+        let mut jobs = jobs;
+        for job in &mut jobs {
+            job.filter.add_global_excludes(&options.global_exclude)?;
+        }
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let mut commands = HashMap::new();
         let mut handles = Vec::new();

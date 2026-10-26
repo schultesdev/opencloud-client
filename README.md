@@ -14,7 +14,8 @@ Ein unabhängiges Projekt, kein offizielles Produkt des OpenCloud-Projekts.
 - **Konfiguration als JSON**: `config.json` (Konten, Einstellungen) und
   `jobs.json` (Jobs) im Konfigurationsordner des Betriebssystems.
 - **Selective Sync**: pro Space wählbar, welche Ordner synchronisiert
-  werden (`include`-Whitelist), zusätzlich `exclude`-Muster.
+  werden (`include`-Whitelist), zusätzlich `exclude`-Muster — pro Job und
+  global für alle Jobs (`settings.global_exclude`).
 - **Konfliktlösung**: beidseitig geänderte Dateien werden erkannt und
   angehalten, bis sie in der GUI (oder per CLI) entschieden sind —
   Server- oder Client-Version übernehmen, oder automatisch per Policy.
@@ -81,8 +82,9 @@ cargo test --workspace --locked
    OS-Schlüsselbund — nicht in einer Datei. Abmelden widerruft es.
 3. **Job anlegen**: „+ Neuer Job“ → Space auswählen → lokalen Ordner
    wählen → optional Ordner per Checkbox auswählen (Selective Sync,
-   schreibt die `include`-Liste) → speichern. Der erste Lauf baut die
-   lokale Kopie und die Statusdatenbank auf.
+   schreibt die `include`-Liste) und Ausschluss-Muster festlegen →
+   speichern. Der erste Lauf baut die lokale Kopie und die
+   Statusdatenbank auf.
 4. **Fertig**: Der Job läuft im Takt des Sync-Intervalls, reagiert auf
    lokale Dateiänderungen (Datei-Watcher) und auf Server-Änderungen
    (PROPFIND-Polling mit ETag-Shortcut). Fenster schließen minimiert
@@ -168,7 +170,8 @@ migrationssicher; die GUI bearbeitet sie, Handbearbeitung ist aber möglich
     "conflict_policy": "ask",
     "log_level": "info",
     "autostart": false,
-    "check_updates": true
+    "check_updates": true,
+    "global_exclude": ["*.tmp", ".git", "node_modules"]
   }
 }
 ```
@@ -185,6 +188,7 @@ migrationssicher; die GUI bearbeitet sie, Handbearbeitung ist aber möglich
 | `settings.log_level` | `error` \| `warn` \| `info` \| `debug` \| `trace` | Standard `info`; `RUST_LOG` überschreibt |
 | `settings.autostart` | Programm bei Anmeldung starten (Eintrag je OS) | Standard `false` |
 | `settings.check_updates` | beim Start gegen den Releases-Feed prüfen | Standard `true` |
+| `settings.global_exclude` | Ausschluss-Muster für **alle** Jobs (Glob wie `exclude`), werden mit den Job-Mustern kombiniert | Standard leer |
 
 ### `jobs.json`
 
@@ -213,7 +217,7 @@ migrationssicher; die GUI bearbeitet sie, Handbearbeitung ist aber möglich
 | `local_path` | lokaler Ordner; wird angelegt, falls er fehlt. Ordner zweier Jobs dürfen sich nicht überlappen |
 | `enabled` | `false` = Job wird übersprungen |
 | `include` | Ordner-Whitelist (Selective Sync): leer = alles. Pfade relativ zur Space-Wurzel |
-| `exclude` | Glob-Muster je Ordnersegment oder Pfad, z. B. `*.tmp`, `.git`, `Bilder/2025` |
+| `exclude` | Glob-Muster je Ordnersegment oder Pfad, z. B. `*.tmp`, `.git`, `Bilder/2025`; zusätzlich zu `settings.global_exclude` |
 
 ## Updates
 

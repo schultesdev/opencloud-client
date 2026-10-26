@@ -26,6 +26,34 @@ pub use paths::{
 };
 pub use store::{load_config, load_jobs, save_config, save_jobs, validate_references};
 
+/// Checks one `include`/`exclude` filter pattern: it must be non-empty,
+/// relative (no leading `/` or `\`), free of NUL bytes, and must not
+/// contain `.` or `..` segments. Used for job patterns and the global
+/// `exclude` list of the settings alike.
+pub fn validate_pattern(pattern: &str) -> Result<(), ConfigError> {
+    if pattern.trim().is_empty() {
+        return Err(ConfigError::invalid("filter patterns must not be empty"));
+    }
+    if pattern.starts_with('/') || pattern.starts_with('\\') {
+        return Err(ConfigError::invalid(format!(
+            "filter pattern '{pattern}' must be relative"
+        )));
+    }
+    if pattern.contains('\0') {
+        return Err(ConfigError::invalid(format!(
+            "filter pattern '{pattern}' contains a NUL byte"
+        )));
+    }
+    for segment in pattern.split(['/', '\\']) {
+        if matches!(segment, "." | "..") {
+            return Err(ConfigError::invalid(format!(
+                "filter pattern '{pattern}' must not contain '.' or '..' segments"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Name of the crate (used in messages and default keyring entries).
 pub const CRATE_NAME: &str = "opencloud-sync";
 

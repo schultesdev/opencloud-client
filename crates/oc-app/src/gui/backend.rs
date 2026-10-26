@@ -545,6 +545,7 @@ fn engine_options(config: &Config) -> EngineOptions {
         max_parallel_transfers: config.settings.max_parallel_transfers as usize,
         propfind_pause: Duration::from_millis(config.settings.propfind_pause_ms),
         conflict_policy: config.settings.conflict_policy,
+        global_exclude: config.settings.global_exclude.clone(),
         ..EngineOptions::default()
     }
 }

@@ -131,6 +131,10 @@ pub struct Settings {
     /// no auto-update).
     #[serde(default = "default_check_updates")]
     pub check_updates: bool,
+    /// Global exclude patterns (glob-style) applied to every sync job
+    /// in addition to the job's own `exclude` list, e.g. `*.tmp`, `.git`.
+    #[serde(default)]
+    pub global_exclude: Vec<String>,
 }
 
 impl Default for Settings {
@@ -143,6 +147,7 @@ impl Default for Settings {
             log_level: LogLevel::Info,
             autostart: false,
             check_updates: true,
+            global_exclude: Vec::new(),
         }
     }
 }
@@ -173,6 +178,9 @@ impl Settings {
             return Err(ConfigError::invalid(format!(
                 "settings.propfind_pause_ms must be at most {MAX_PROPFIND_PAUSE_MS}"
             )));
+        }
+        for pattern in &self.global_exclude {
+            crate::validate_pattern(pattern)?;
         }
         Ok(())
     }
@@ -217,5 +225,46 @@ impl Config {
         }
         self.settings.validate()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_exclude_defaults_to_empty() {
+        let json = r#"{"sync_interval_secs": 30, "max_parallel_transfers": 4}"#;
+        let settings: Settings = serde_json::from_str(json).expect("settings");
+        assert!(settings.global_exclude.is_empty());
+        settings.validate().expect("valid");
+    }
+
+    #[test]
+    fn global_exclude_accepts_valid_patterns() {
+        let settings = Settings {
+            global_exclude: vec!["*.tmp".into(), ".git".into(), "build/out".into()],
+            ..Settings::default()
+        };
+        settings.validate().expect("valid");
+    }
+
+    #[test]
+    fn global_exclude_rejects_invalid_patterns() {
+        let settings = Settings {
+            global_exclude: vec!["/abs".into()],
+            ..Settings::default()
+        };
+        assert!(settings.validate().is_err());
+        let settings = Settings {
+            global_exclude: vec!["  ".into()],
+            ..Settings::default()
+        };
+        assert!(settings.validate().is_err());
+        let settings = Settings {
+            global_exclude: vec!["../x".into()],
+            ..Settings::default()
+        };
+        assert!(settings.validate().is_err());
     }
 }

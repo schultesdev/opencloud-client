@@ -71,7 +71,7 @@ jobs:
             --plugin gtk --output appimage
           mv "OpenCloud-Sync-${VERSION}-x86_64.AppImage" dist/
       - name: Upload artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: linux-packages
           path: |
@@ -80,7 +80,7 @@ jobs:
           if-no-files-found: error
       - name: Upload AppImage
         if: steps.appimage.outcome == 'success'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: linux-appimage
           path: dist/*.AppImage
@@ -163,7 +163,7 @@ jobs:
             --team-id "$APPLE_TEAM_ID" --wait
           xcrun stapler staple "$DMG"
       - name: Upload artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: macos-dmg
           path: dist/*.dmg
@@ -201,7 +201,7 @@ jobs:
           Compress-Archive -Path "dist/portable/*" `
             -DestinationPath "dist/OpenCloud-Sync-$version-windows-portable.zip"
       - name: Upload artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: windows-packages
           path: dist/OpenCloud-Sync-*

@@ -1,0 +1,11 @@
+{
+    "sqltools.useNodeRuntime": true,
+    "sqltools.connections": [
+        {
+            "previewLimit": 50,
+            "driver": "SQLite",
+            "name": "opencloud-sync",
+            "database": "/home/gregor/.config/opencloud-sync/db/job-1.sqlite"
+        }
+    ]
+}

@@ -61,3 +61,10 @@ missing_docs = "warn"
 [workspace.lints.clippy]
 unwrap_used = "warn"
 expect_used = "warn"
+
+# Local backport of egui 0.32.3 with the hit-test NaN fix from
+# https://github.com/emilk/egui/pull/8479 (released upstream in 0.36.2).
+# Fixes the panic in hit_test.rs:365 when a widget rect contains a NaN,
+# e.g. while the window is hidden to tray and the GTK surface is gone.
+[patch.crates-io]
+egui = { path = "vendor/egui" }

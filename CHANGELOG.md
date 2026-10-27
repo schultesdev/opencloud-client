@@ -78,6 +78,16 @@ versioning follows [Semantic Versioning](https://semver.org/).
   verifiziert zudem per `PROPFIND`, bevor es aufgrund fehlender
   Remote-Metadaten lokale Daten als „remote gelöscht“ entfernt.
 
+- **GUI — Absturz beim Hit-Test (NaN-Widget-Rects)**: egui 0.32.3 stürzte
+  mit `called Option::unwrap() on a None value` (`hit_test.rs:365`) ab,
+  wenn ein Widget-Rect eine NaN-Koordinate enthielt — z. B. während das
+  Fenster in den Tray versteckt war und die GTK-Oberfläche bereits
+  abgebaut war. Behoben durch einen lokalen Backport des Upstream-Fixes
+  ([emilk/egui#8479](https://github.com/emilk/egui/pull/8479), upstream
+  ab 0.36.2): egui wird per `[patch.crates-io]` aus `vendor/egui`
+  eingebunden; der Hit-Test verwirft Widgets mit NaN-Rects und vergleicht
+  Treffer nach Id statt nach Wert.
+
 - **GUI — Ordnerauswahl im Job-Wizard**: Jede Zeile des Ordnerbaums nahm
   die gesamte verbleibende Höhe ein und streckte das Fenster „Ordner &
   Ausschlüsse bearbeiten“; die Zeilen sind jetzt einzeilig, große Bäume

@@ -171,9 +171,6 @@ pub fn scan_local(root: &Path, filter: &Filter) -> Result<LocalScan, SyncError> 
             } else {
                 format!("{rel_dir}/{name}")
             };
-            if !filter.covers(&rel_path) {
-                continue;
-            }
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(source) => {
@@ -183,6 +180,11 @@ pub fn scan_local(root: &Path, filter: &Filter) -> Result<LocalScan, SyncError> 
                 }
             };
             if metadata.file_type().is_symlink() {
+                continue;
+            }
+            // The filter needs to know files from folders: the
+            // root-files toggle only ever covers root-level files.
+            if !filter.covers(&rel_path, metadata.is_dir()) {
                 continue;
             }
             let node = LocalNode {
@@ -286,7 +288,7 @@ fn add_remote_child(
     snapshot: &mut RemoteSnapshot,
     pending: &mut VecDeque<(String, String)>,
 ) {
-    if resource.path.is_empty() || !filter.covers(&resource.path) {
+    if resource.path.is_empty() || !filter.covers(&resource.path, resource.is_dir) {
         return;
     }
     if resource.server_path != resource.path {
@@ -482,11 +484,31 @@ mod tests {
         std::fs::write(root.join("skip/b.txt"), "b").expect("write");
 
         let include: Vec<String> = vec!["keep".into()];
-        let filter = Filter::new(&include, &[]).expect("filter");
+        let filter = Filter::new(&include, &[], false).expect("filter");
         let entries = scan_local(&root, &filter).expect("scan").entries;
         assert!(entries.contains_key("keep/a.txt"));
         assert!(!entries.contains_key("skip"));
         assert!(!entries.contains_key("skip/b.txt"));
+    }
+
+    #[test]
+    fn root_files_follow_the_toggle_with_a_whitelist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("keep")).expect("mkdir");
+        std::fs::write(root.join("keep/a.txt"), "a").expect("write");
+        std::fs::write(root.join("root.txt"), "r").expect("write");
+        let include: Vec<String> = vec!["keep".into()];
+
+        let filter = Filter::new(&include, &[], true).expect("filter");
+        let entries = scan_local(&root, &filter).expect("scan").entries;
+        assert!(entries.contains_key("root.txt"));
+        assert!(entries.contains_key("keep/a.txt"));
+
+        let filter = Filter::new(&include, &[], false).expect("filter");
+        let entries = scan_local(&root, &filter).expect("scan").entries;
+        assert!(!entries.contains_key("root.txt"));
+        assert!(entries.contains_key("keep/a.txt"));
     }
 
     #[cfg(unix)]

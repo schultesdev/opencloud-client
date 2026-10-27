@@ -29,9 +29,19 @@ pub struct SyncJob {
     /// Exclude patterns (glob-style), e.g. `tmp`, `*.tmp`, `.git`.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Whether files directly in the space root are synced while the
+    /// `include` whitelist is set. Folders at the root are only synced
+    /// when on the whitelist; the list empty means "sync everything"
+    /// anyway, so the toggle only matters for file-only whitelists.
+    #[serde(default = "default_true")]
+    pub sync_root_files: bool,
 }
 
 fn default_enabled() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -199,6 +209,7 @@ mod tests {
             enabled: false,
             include: vec![],
             exclude: vec![],
+            sync_root_files: true,
         }
     }
 

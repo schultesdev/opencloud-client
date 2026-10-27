@@ -68,6 +68,28 @@ impl SyncApp {
                                 theme::card().show(ui, |ui| {
                                     ui.set_width(ui.available_width());
                                     theme::step(ui, step_offset + 1, "Ordnerauswahl");
+                                    if let Mode::EditFolders { .. } = wizard.mode {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Abgewählte Ordner werden beim nächsten Sync \
+                                                 lokal gelöscht — in der Cloud bleiben sie \
+                                                 erhalten. Neue oder geänderte lokale Dateien \
+                                                 darin werden nicht gelöscht.",
+                                            )
+                                            .small()
+                                            .color(theme.text_dim),
+                                        );
+                                        ui.add_space(6.0);
+                                    }
+                                    // Only meaningful with a selection: an
+                                    // empty one syncs everything anyway.
+                                    if !wizard.tree.selected.is_empty() {
+                                        ui.checkbox(
+                                            &mut wizard.root_files,
+                                            "Dateien direkt im Hauptordner synchronisieren",
+                                        );
+                                        ui.add_space(6.0);
+                                    }
                                     self.show_wizard_tree(ui, &mut wizard, &account_id, &space_id);
                                 });
                                 ui.add_space(8.0);
@@ -525,6 +547,7 @@ impl SyncApp {
                     enabled: true,
                     include,
                     exclude: wizard.exclude.clone(),
+                    sync_root_files: wizard.root_files,
                 });
                 if let Err(error) = self.save_jobs(jobs, true) {
                     wizard.status = Some(error);
@@ -539,6 +562,7 @@ impl SyncApp {
                 };
                 job.include = include;
                 job.exclude = wizard.exclude.clone();
+                job.sync_root_files = wizard.root_files;
                 if let Err(error) = self.save_jobs(jobs, true) {
                     wizard.status = Some(error);
                     return false;

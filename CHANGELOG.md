@@ -16,6 +16,18 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Schalter „Dateien im Hauptordner“**: Sync-Jobs mit Ordnerauswahl
+  (Include-Liste) können jetzt getrennt steuern, ob Dateien direkt im
+  Hauptordner des Spaces synchronisiert werden (`sync_root_files` in
+  `jobs.json`, Standard: an). Vorher fielen Hauptordner-Dateien bei
+  gesetzter Ordnerauswahl aus dem Sync heraus — und wurden durch das neue
+  Aufräumverhalten lokal gelöscht, ohne sie je wieder einsyncen zu
+  können. Der Schalter steht im Job-Wizard (Schritt „Ordnerauswahl“,
+  erscheint sobald Ordner ausgewählt sind, auch beim Bearbeiten) und
+  wird in der Job-Liste angezeigt. Ist der Schalter aus, werden
+  synchronisierte Hauptordner-Dateien beim nächsten Sync lokal gelöscht —
+  in der Cloud bleiben sie erhalten.
+
 - **Ausschlüsse nach Mustern, pro Job und global**: Sync-Jobs können
   Dateien und Ordner per Glob-Muster (`*`, `?`) vom Sync ausschließen —
   Muster ohne `/` treffen jeden Ordner- oder Dateinamen (`*.tmp`, `.git`),
@@ -25,6 +37,18 @@ versioning follows [Semantic Versioning](https://semver.org/).
   Einstellungen, die für alle Jobs zusätzlich zu den Job-Mustern gilt.
   Die Engine mischt die globalen Muster beim Start in jeden Job-Filter;
   GUI und Headless/CLI werten sie gleichermaßen aus.
+
+### Changed
+
+- **Abgewählte Ordner lokal löschen, Cloud behält sie**: Wird ein zuvor
+  synchronisierter Ordner abgewählt (Include-Liste oder Ausschlussmuster),
+  entfernt die Engine beim nächsten Sync die lokalen Kopien — auf dem
+  Server bleibt alles erhalten. Gelöscht wird nur, was nachweislich
+  synchronisiert war (lokale Datei stimmt noch mit der letzten gesicherten
+  Baseline überein); neue oder lokal geänderte Dateien im abgewählten
+  Ordner bleiben liegen, ebenso Ordner, die danach nicht leer sind
+  (gleiche Sicherheitsregel wie bei Lösch-Propagation). Der Assistent
+  „Ordner & Ausschlüsse bearbeiten“ weist auf das Verhalten hin.
 
 ### Fixed
 

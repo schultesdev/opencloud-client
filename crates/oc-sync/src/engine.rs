@@ -56,19 +56,21 @@ pub struct Job<P: TokenProvider> {
 
 impl<P: TokenProvider> Job<P> {
     /// Assembles a job from its config parts; the filter is built from
-    /// the job's `include`/`exclude` patterns.
+    /// the job's `include`/`exclude` patterns and the root-files toggle.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: impl Into<String>,
         local_root: impl Into<PathBuf>,
         include: &[String],
         exclude: &[String],
+        sync_root_files: bool,
         dav: WebDavClient<P>,
         db: StatusDb,
     ) -> Result<Self, SyncError> {
         Ok(Self {
             id: id.into(),
             local_root: local_root.into(),
-            filter: Filter::new(include, exclude)?,
+            filter: Filter::new(include, exclude, sync_root_files)?,
             dav: Arc::new(dav),
             db,
         })
@@ -719,10 +721,14 @@ async fn run_once<P: TokenProvider + 'static>(
 
     // The recorded state, read once per pass. A changed filter
     // (include/exclude) first removes paths that no longer belong to the
-    // synced set; local files stay (the GUI asks before cleaning them up,
-    // see PLAN.md Phase 5/7).
-    let db_entries = match load_covered_entries(&job.db, &job.filter) {
-        Ok(entries) => entries,
+    // synced set: their local copies are deleted (the cloud keeps them),
+    // except for new or changed local content (see
+    // `load_covered_entries`).
+    let db_entries = match load_covered_entries(&job.db, &job.local_root, &job.filter) {
+        Ok((entries, removed)) => {
+            summary.deletes += removed;
+            entries
+        }
         Err(error) => {
             abort_pass(&mut failures, &mut aborted, error);
             return finish_pass(summary, failures, aborted);
@@ -1304,35 +1310,125 @@ enum DbWrite {
 }
 
 /// Reads all recorded entries and removes the ones the job's filter no
-/// longer covers (selective-sync changes) in one transaction; local files
-/// are left in place. Returns the remaining entries by path.
+/// longer covers (selective-sync changes) in one transaction. Their
+/// local copies are deleted as well — the cloud keeps everything.
+/// Only paths whose recorded baseline still matches the local state go
+/// (the diff's own "unchanged" test), so new or changed local files
+/// below a deselected folder stay, and so does every folder that is not
+/// empty afterwards — the same safety rule as
+/// `keep_folders_with_content` for deletions. Returns the remaining
+/// entries by path and the number of removed local files/folders.
 fn load_covered_entries(
     db: &std::sync::Mutex<StatusDb>,
+    root: &std::path::Path,
     filter: &Filter,
-) -> Result<HashMap<String, NewEntry>, SyncError> {
-    let db = db_lock(db);
-    let mut entries: HashMap<String, NewEntry> = db
-        .all_entries()?
-        .into_iter()
-        .map(|entry| (entry.entry.path.clone(), entry.entry))
-        .collect();
-    let uncovered: Vec<String> = entries
-        .keys()
-        .filter(|path| !filter.covers(path))
-        .cloned()
-        .collect();
-    if !uncovered.is_empty() {
-        db.transaction(|db| {
-            for path in &uncovered {
-                db.delete_entry(path)?;
-            }
-            Ok(())
-        })?;
+) -> Result<(HashMap<String, NewEntry>, usize), SyncError> {
+    let (mut entries, uncovered): (HashMap<String, NewEntry>, Vec<String>) = {
+        let db = db_lock(db);
+        let entries: HashMap<String, NewEntry> = db
+            .all_entries()?
+            .into_iter()
+            .map(|entry| (entry.entry.path.clone(), entry.entry))
+            .collect();
+        let uncovered = entries
+            .keys()
+            .filter(|path| {
+                let is_dir = entries.get(*path).is_some_and(|entry| entry.is_dir);
+                !filter.covers(path, is_dir)
+            })
+            .cloned()
+            .collect();
+        (entries, uncovered)
+    };
+    if uncovered.is_empty() {
+        return Ok((entries, 0));
+    }
+    let removed = remove_uncovered_local(root, &entries, &uncovered);
+    db_lock(db).transaction(|db| {
         for path in &uncovered {
-            entries.remove(path);
+            db.delete_entry(path)?;
+        }
+        Ok(())
+    })?;
+    for path in &uncovered {
+        entries.remove(path);
+    }
+    Ok((entries, removed))
+}
+
+/// Deletes the local copies of paths the filter no longer covers. Files
+/// go first, folders afterwards deepest-first and only once they are
+/// empty; returns how many paths were removed.
+fn remove_uncovered_local(
+    root: &std::path::Path,
+    entries: &HashMap<String, NewEntry>,
+    uncovered: &[String],
+) -> usize {
+    let mut removed = 0usize;
+    let mut dirs: Vec<&str> = Vec::new();
+    for path in uncovered {
+        match entries.get(path) {
+            Some(entry) if entry.is_dir => dirs.push(path),
+            Some(entry)
+                if local_baseline_matches(root, path, entry) && remove_local_file(root, path) =>
+            {
+                removed += 1;
+            }
+            _ => {}
         }
     }
-    Ok(entries)
+    // Children sort before their parents, so a folder only disappears
+    // once everything below it is gone.
+    dirs.sort_unstable_by(|a, b| b.cmp(a));
+    for dir in dirs {
+        if remove_empty_local_dir(root, dir) {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Whether the local file still looks exactly as recorded at the last
+/// sync — the same test the diff uses to detect local changes. A path
+/// that cannot be read counts as changed: it is never deleted blindly.
+fn local_baseline_matches(root: &std::path::Path, rel: &str, entry: &NewEntry) -> bool {
+    match local_node_at(root, rel) {
+        Ok(Some(node)) => {
+            diff::mtime_matches(node.mtime, entry.local_mtime) && node.size == entry.local_size
+        }
+        _ => false,
+    }
+}
+
+/// Removes one deselected local file (read-only attributes are cleared
+/// first). Errors keep the file: it only stays behind as an untracked
+/// leftover, like a path the filter never covered.
+fn remove_local_file(root: &std::path::Path, rel: &str) -> bool {
+    let Ok(target) = scan::abs_local_path(root, rel) else {
+        return false;
+    };
+    match transfer::make_writable(&target) {
+        Ok(()) => {}
+        Err(SyncError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
+            return true;
+        }
+        Err(_) => return false,
+    }
+    std::fs::remove_file(&target).is_ok()
+}
+
+/// Removes a deselected folder, but never recursively and only once it
+/// is empty — any content the sync cannot account for keeps the folder
+/// alive.
+fn remove_empty_local_dir(root: &std::path::Path, rel: &str) -> bool {
+    let Ok(target) = scan::abs_local_path(root, rel) else {
+        return false;
+    };
+    let Ok(children) = std::fs::read_dir(&target) else {
+        return false;
+    };
+    let empty = children.filter_map(Result::ok).next().is_none();
+    empty && std::fs::remove_dir(&target).is_ok()
 }
 
 /// Builds a remote snapshot from the recorded database state — used when

@@ -546,6 +546,7 @@ async fn run_headless(
             job.local_path.clone(),
             &job.include,
             &job.exclude,
+            job.sync_root_files,
             dav,
             db,
         )?);

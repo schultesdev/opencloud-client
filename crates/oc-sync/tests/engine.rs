@@ -125,6 +125,7 @@ struct Setup {
     db_path: PathBuf,
     include: Vec<String>,
     exclude: Vec<String>,
+    root_files: bool,
 }
 
 async fn fixture(include: &[&str], exclude: &[&str]) -> Setup {
@@ -140,6 +141,7 @@ async fn fixture(include: &[&str], exclude: &[&str]) -> Setup {
         db_path,
         include: include.iter().map(|pattern| pattern.to_string()).collect(),
         exclude: exclude.iter().map(|pattern| pattern.to_string()).collect(),
+        root_files: true,
     }
 }
 
@@ -149,8 +151,16 @@ impl Setup {
         let dav =
             WebDavClient::new(&self.server.uri(), "sid", StaticToken::new("tok")).expect("client");
         let db = StatusDb::open(&self.db_path).expect("db");
-        let job =
-            Job::new("job-1", &self.root, &self.include, &self.exclude, dav, db).expect("job");
+        let job = Job::new(
+            "job-1",
+            &self.root,
+            &self.include,
+            &self.exclude,
+            self.root_files,
+            dav,
+            db,
+        )
+        .expect("job");
         Engine::start(vec![job], options).expect("engine")
     }
 
@@ -168,8 +178,16 @@ impl Setup {
                 ..RetryConfig::immediate()
             });
         let db = StatusDb::open(&self.db_path).expect("db");
-        let job =
-            Job::new("job-1", &self.root, &self.include, &self.exclude, dav, db).expect("job");
+        let job = Job::new(
+            "job-1",
+            &self.root,
+            &self.include,
+            &self.exclude,
+            self.root_files,
+            dav,
+            db,
+        )
+        .expect("job");
         Engine::start(vec![job], options).expect("engine")
     }
 }
@@ -615,7 +633,16 @@ async fn server_error_on_folder_listing_freezes_it_and_syncs_the_rest() {
         .expect("client")
         .with_retry(RetryConfig::immediate());
     let db = StatusDb::open(&f.db_path).expect("db");
-    let job = Job::new("job-1", &f.root, &f.include, &f.exclude, dav, db).expect("job");
+    let job = Job::new(
+        "job-1",
+        &f.root,
+        &f.include,
+        &f.exclude,
+        f.root_files,
+        dav,
+        db,
+    )
+    .expect("job");
     let mut engine = Engine::start(vec![job], test_options()).expect("engine");
 
     let (summary, events) = next_run(&mut engine).await;
@@ -833,16 +860,82 @@ async fn include_whitelist_limits_remote_traversal() {
 }
 
 #[tokio::test]
-async fn filter_change_drops_database_entries_but_keeps_files() {
+async fn filter_change_deletes_synced_local_copies_not_the_cloud() {
     let f = fixture(&["keep"], &[]).await;
+
+    std::fs::create_dir_all(f.root.join("old")).expect("mkdir");
+    std::fs::write(f.root.join("old/x.txt"), "x").expect("write");
+    let mtime = std::fs::metadata(f.root.join("old/x.txt"))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .expect("mtime");
 
     {
         let db = open_db(&f.db_path);
-        db.upsert_entry(&seeded_file_entry("old/x.txt", "\"x1\"", 100, 1))
+        db.upsert_entry(&NewEntry::new("old", true, EntryState::Synced))
+            .expect("seed dir");
+        // Baseline matches the local file: it is confirmed synced, so
+        // deselecting `old` removes the local copy.
+        db.upsert_entry(&seeded_file_entry("old/x.txt", "\"x1\"", mtime, 1))
             .expect("seed");
     }
-    std::fs::create_dir_all(f.root.join("old")).expect("mkdir");
-    std::fs::write(f.root.join("old/x.txt"), "x").expect("write");
+
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    mount_propfind(&f.server, "", "1", &[("", true, Some("\"root-1\""), None)]).await;
+    // The cloud keeps deselected folders: nothing may ever be deleted
+    // on the server for them.
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&f.server)
+        .await;
+
+    let mut engine = f.engine(test_options());
+    let (summary, _) = next_run(&mut engine).await;
+    assert_eq!(summary.errors, 0);
+    assert_eq!(summary.deletes, 2); // file + emptied folder
+    f.server.verify().await;
+
+    let db = open_db(&f.db_path);
+    assert!(db.get_entry("old").expect("db query").is_none());
+    assert!(db.get_entry("old/x.txt").expect("db query").is_none());
+    assert!(!f.root.join("old").exists(), "deselected folder must go");
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn filter_change_keeps_new_and_changed_local_content() {
+    let f = fixture(&["keep"], &[]).await;
+
+    std::fs::create_dir_all(f.root.join("old/empty")).expect("mkdir");
+    std::fs::write(f.root.join("old/x.txt"), "changed").expect("write");
+    // Never uploaded: the sync does not know this file at all.
+    std::fs::write(f.root.join("old/new.txt"), "new").expect("write");
+    let mtime = std::fs::metadata(f.root.join("old/x.txt"))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .expect("mtime");
+
+    {
+        let db = open_db(&f.db_path);
+        db.upsert_entry(&NewEntry::new("old", true, EntryState::Synced))
+            .expect("seed dir");
+        db.upsert_entry(&NewEntry::new("old/empty", true, EntryState::Synced))
+            .expect("seed dir");
+        // Baseline behind the local mtime: the file was changed locally,
+        // so its content only exists here — it must not be deleted.
+        db.upsert_entry(&seeded_file_entry(
+            "old/x.txt",
+            "\"x1\"",
+            mtime - 100_000,
+            3,
+        ))
+        .expect("seed");
+    }
 
     mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
     mount_propfind(&f.server, "", "1", &[("", true, Some("\"root-1\""), None)]).await;
@@ -850,10 +943,98 @@ async fn filter_change_drops_database_entries_but_keeps_files() {
     let mut engine = f.engine(test_options());
     let (summary, _) = next_run(&mut engine).await;
     assert_eq!(summary.errors, 0);
+    // Only the empty folder disappears; everything else stays.
+    assert_eq!(summary.deletes, 1);
 
     let db = open_db(&f.db_path);
-    assert!(db.get_entry("old/x.txt").expect("db query").is_none());
-    assert!(f.root.join("old/x.txt").exists(), "local file must stay");
+    for path in ["old", "old/empty", "old/x.txt"] {
+        assert!(db.get_entry(path).expect("db query").is_none());
+    }
+    assert!(f.root.join("old/x.txt").exists(), "changed file must stay");
+    assert!(
+        f.root.join("old/new.txt").exists(),
+        "untracked file must stay"
+    );
+    assert!(!f.root.join("old/empty").exists(), "empty folder must go");
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn root_files_toggle_off_deletes_synced_root_file_locally() {
+    let mut f = fixture(&["keep"], &[]).await;
+    f.root_files = false;
+
+    std::fs::write(f.root.join("a.txt"), "a").expect("write");
+    let mtime = std::fs::metadata(f.root.join("a.txt"))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .expect("mtime");
+    {
+        let db = open_db(&f.db_path);
+        db.upsert_entry(&seeded_file_entry("a.txt", "\"a1\"", mtime, 1))
+            .expect("seed");
+    }
+
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    mount_propfind(&f.server, "", "1", &[("", true, Some("\"root-1\""), None)]).await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&f.server)
+        .await;
+
+    let mut engine = f.engine(test_options());
+    let (summary, _) = next_run(&mut engine).await;
+    assert_eq!(summary.errors, 0);
+    assert_eq!(summary.deletes, 1);
+    f.server.verify().await;
+
+    let db = open_db(&f.db_path);
+    assert!(db.get_entry("a.txt").expect("db query").is_none());
+    assert!(!f.root.join("a.txt").exists(), "root file must go locally");
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn root_files_toggle_on_syncs_root_files() {
+    let f = fixture(&["keep"], &[]).await;
+
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    mount_propfind(
+        &f.server,
+        "",
+        "1",
+        &[
+            ("", true, Some("\"root-1\""), None),
+            ("a.txt", false, Some("\"a1\""), Some(1)),
+        ],
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("a")
+                .append_header("ETag", "\"a1\""),
+        )
+        .expect(1)
+        .mount(&f.server)
+        .await;
+
+    let mut engine = f.engine(test_options());
+    let (summary, _) = next_run(&mut engine).await;
+    assert_eq!(summary.errors, 0);
+    assert_eq!(summary.downloads, 1);
+    f.server.verify().await;
+    assert_eq!(std::fs::read_to_string(f.root.join("a.txt")).unwrap(), "a");
+    assert!(
+        open_db(&f.db_path)
+            .get_entry("a.txt")
+            .expect("db query")
+            .is_some()
+    );
     engine.stop().await;
 }
 

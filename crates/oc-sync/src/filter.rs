@@ -5,7 +5,10 @@
 //!
 //! - `include` is a folder whitelist of exact, `/`-separated folder paths.
 //!   An empty list syncs everything. Traversal stops below folders that are
-//!   neither on the list nor on the path to a listed folder.
+//!   neither on the list nor on the path to a listed folder. While the list
+//!   is set, files directly in the root are only synced when the job's
+//!   root-files toggle is on (see [`Filter`]); root folders always need a
+//!   whitelist entry.
 //! - `exclude` holds glob patterns (`*` = any run of characters except `/`,
 //!   `?` = one character). A pattern without `/` matches a single path
 //!   segment (so `tmp` excludes any folder named `tmp` and `*.tmp` any
@@ -22,12 +25,21 @@ use crate::error::SyncError;
 pub struct Filter {
     include: Vec<String>,
     exclude: Vec<String>,
+    /// Whether files directly in the space root belong to the synced
+    /// set while the whitelist is non-empty (root folders always need
+    /// an `include` entry).
+    root_files: bool,
 }
 
 impl Filter {
-    /// Creates a filter from the job's `include`/`exclude` lists. Patterns
-    /// must be non-empty and relative (validated like in `oc-config`).
-    pub fn new(include: &[String], exclude: &[String]) -> Result<Self, SyncError> {
+    /// Creates a filter from the job's `include`/`exclude` lists and the
+    /// root-files toggle. Patterns must be non-empty and relative
+    /// (validated like in `oc-config`).
+    pub fn new(
+        include: &[String],
+        exclude: &[String],
+        root_files: bool,
+    ) -> Result<Self, SyncError> {
         for pattern in include.iter().chain(exclude.iter()) {
             validate_pattern(pattern)?;
         }
@@ -38,12 +50,17 @@ impl Filter {
                 .filter(|pattern| !pattern.is_empty())
                 .collect(),
             exclude: exclude.to_vec(),
+            root_files,
         })
     }
 
-    /// A filter that covers the entire tree (no include/exclude).
+    /// A filter that covers the entire tree (no include/exclude, root
+    /// files on).
     pub fn everything() -> Self {
-        Self::default()
+        Self {
+            root_files: true,
+            ..Self::default()
+        }
     }
 
     /// Adds patterns that apply on top of the job's own `exclude` list:
@@ -63,14 +80,20 @@ impl Filter {
         self.include.is_empty()
     }
 
-    /// Whether `path` (relative to the space root; `""` is the root itself)
-    /// belongs to the synced set. The root is always covered — included
-    /// folders may live anywhere in the tree.
-    pub fn covers(&self, path: &str) -> bool {
+    /// Whether `path` (relative to the space root; `""` is the root
+    /// itself) belongs to the synced set. The root is always covered —
+    /// included folders may live anywhere in the tree. With a
+    /// non-empty whitelist, files directly in the root are only
+    /// covered when the root-files toggle is on; root folders always
+    /// need an entry on the path to a listed folder.
+    pub fn covers(&self, path: &str, is_dir: bool) -> bool {
         if self.is_excluded(path) {
             return false;
         }
         if self.include.is_empty() || path.is_empty() {
+            return true;
+        }
+        if !is_dir && !path.contains('/') && self.root_files {
             return true;
         }
         self.include.iter().any(|included| {
@@ -165,15 +188,15 @@ mod tests {
     fn filter(include: &[&str], exclude: &[&str]) -> Filter {
         let include: Vec<String> = include.iter().map(|s| s.to_string()).collect();
         let exclude: Vec<String> = exclude.iter().map(|s| s.to_string()).collect();
-        Filter::new(&include, &exclude).expect("filter")
+        Filter::new(&include, &exclude, true).expect("filter")
     }
 
     #[test]
     fn empty_filter_covers_everything() {
         let filter = Filter::everything();
-        assert!(filter.covers(""));
-        assert!(filter.covers("a.txt"));
-        assert!(filter.covers("a/b/c.txt"));
+        assert!(filter.covers("", true));
+        assert!(filter.covers("a.txt", false));
+        assert!(filter.covers("a/b/c.txt", false));
         assert!(filter.syncs_everything());
     }
 
@@ -183,36 +206,53 @@ mod tests {
         assert!(!filter.syncs_everything());
         // The root and intermediate folders are covered so traversal reaches
         // the included branches.
-        assert!(filter.covers(""));
-        assert!(filter.covers("Bilder"));
-        assert!(filter.covers("Bilder/2026"));
-        assert!(filter.covers("Bilder/2026/foto.jpg"));
-        assert!(filter.covers("Dokumente"));
-        assert!(filter.covers("Dokumente/a.pdf"));
+        assert!(filter.covers("", true));
+        assert!(filter.covers("Bilder", true));
+        assert!(filter.covers("Bilder/2026", true));
+        assert!(filter.covers("Bilder/2026/foto.jpg", false));
+        assert!(filter.covers("Dokumente", true));
+        assert!(filter.covers("Dokumente/a.pdf", false));
         // Outside the whitelist.
-        assert!(!filter.covers("Bilder/2025"));
-        assert!(!filter.covers("Bilder/alt.jpg"));
-        assert!(!filter.covers("Musik/song.mp3"));
+        assert!(!filter.covers("Bilder/2025", false));
+        assert!(!filter.covers("Bilder/alt.jpg", false));
+        assert!(!filter.covers("Musik/song.mp3", false));
+    }
+
+    #[test]
+    fn root_files_toggle_decides_root_level_files_only() {
+        let include: Vec<String> = vec!["Dokumente".into()];
+        let empty: Vec<String> = vec![];
+        let on = Filter::new(&include, &empty, true).expect("filter");
+        let off = Filter::new(&include, &empty, false).expect("filter");
+        // Root-level files follow the toggle…
+        assert!(on.covers("a.txt", false));
+        assert!(!off.covers("a.txt", false));
+        // …root folders do not: they need a whitelist entry either way.
+        assert!(!on.covers("Musik", true));
+        assert!(!off.covers("Musik", true));
+        // Inside whitelisted branches the toggle is irrelevant.
+        assert!(on.covers("Dokumente/a.pdf", false));
+        assert!(off.covers("Dokumente/a.pdf", false));
     }
 
     #[test]
     fn exclude_segment_patterns_match_at_any_depth() {
         let filter = filter(&[], &["tmp", "*.tmp", ".git"]);
-        assert!(!filter.covers("tmp"));
-        assert!(!filter.covers("a/b/tmp/c.txt"));
-        assert!(!filter.covers("work/data.tmp"));
-        assert!(!filter.covers(".git/config"));
-        assert!(filter.covers("tmp2"));
-        assert!(filter.covers("work/data.txt"));
+        assert!(!filter.covers("tmp", true));
+        assert!(!filter.covers("a/b/tmp/c.txt", false));
+        assert!(!filter.covers("work/data.tmp", false));
+        assert!(!filter.covers(".git/config", false));
+        assert!(filter.covers("tmp2", false));
+        assert!(filter.covers("work/data.txt", false));
     }
 
     #[test]
     fn exclude_path_patterns_match_folders_and_their_contents() {
         let filter = filter(&[], &["build/out"]);
-        assert!(!filter.covers("build/out"));
-        assert!(!filter.covers("build/out/x.obj"));
-        assert!(filter.covers("build"));
-        assert!(filter.covers("build/src/main.rs"));
+        assert!(!filter.covers("build/out", true));
+        assert!(!filter.covers("build/out/x.obj", false));
+        assert!(filter.covers("build", true));
+        assert!(filter.covers("build/src/main.rs", false));
     }
 
     #[test]
@@ -226,11 +266,11 @@ mod tests {
     fn invalid_patterns_are_rejected() {
         let empty: Vec<String> = vec![];
         let bad: Vec<String> = vec!["/abs".into()];
-        assert!(Filter::new(&bad, &empty).is_err());
+        assert!(Filter::new(&bad, &empty, true).is_err());
         let dotdot: Vec<String> = vec!["../x".into()];
-        assert!(Filter::new(&empty, &dotdot).is_err());
+        assert!(Filter::new(&empty, &dotdot, true).is_err());
         let blank: Vec<String> = vec!["  ".into()];
-        assert!(Filter::new(&blank, &empty).is_err());
+        assert!(Filter::new(&blank, &empty, true).is_err());
     }
 
     #[test]
@@ -238,10 +278,10 @@ mod tests {
         let mut filter = filter(&[], &["*.tmp"]);
         let global: Vec<String> = vec![".git".into(), "node_modules".into()];
         filter.add_global_excludes(&global).expect("merge");
-        assert!(!filter.covers("work/.git/config"));
-        assert!(!filter.covers("node_modules/pkg"));
-        assert!(!filter.covers("work/data.tmp"));
-        assert!(filter.covers("work/data.txt"));
+        assert!(!filter.covers("work/.git/config", false));
+        assert!(!filter.covers("node_modules/pkg", false));
+        assert!(!filter.covers("work/data.tmp", false));
+        assert!(filter.covers("work/data.txt", false));
 
         // Invalid patterns abort and leave the filter untouched.
         let before = filter.clone();

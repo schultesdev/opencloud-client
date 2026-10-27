@@ -300,7 +300,7 @@ fn file_action(
 /// Entries recorded before schema v3 stored whole seconds (migrated to
 /// `seconds * 1000`): such a value matches any scan within that second,
 /// so an upgrade does not make every file look changed.
-fn mtime_matches(scanned: Option<i64>, recorded: Option<i64>) -> bool {
+pub(crate) fn mtime_matches(scanned: Option<i64>, recorded: Option<i64>) -> bool {
     match (scanned, recorded) {
         (Some(scanned), Some(recorded)) if scanned != recorded => {
             recorded % 1000 == 0 && scanned.div_euclid(1000) == recorded.div_euclid(1000)

@@ -145,6 +145,11 @@ impl SyncApp {
         }
         if !job.include.is_empty() {
             details.push(format!("{} ausgewählte Ordner", job.include.len()));
+            details.push(if job.sync_root_files {
+                "Hauptordner-Dateien an".to_owned()
+            } else {
+                "Hauptordner-Dateien aus".to_owned()
+            });
         }
         if !job.exclude.is_empty() {
             details.push(format!("{} Ausschluss-Muster", job.exclude.len()));

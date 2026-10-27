@@ -157,7 +157,7 @@ pub fn derive_include(selected: &HashSet<String>) -> Vec<String> {
 
 /// The wizard's state, independent of egui (the rendering lives in
 /// `mod.rs`).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Wizard {
     /// New job or folder re-selection of an existing job.
     pub mode: Mode,
@@ -173,12 +173,34 @@ pub struct Wizard {
     pub local_path: String,
     /// The remote folder tree.
     pub tree: FolderTree,
+    /// Whether files directly in the space root are synced; only
+    /// meaningful while the folder selection is non-empty (an empty
+    /// selection syncs everything anyway). Defaults to on.
+    pub root_files: bool,
     /// Exclude patterns of the job (step 5).
     pub exclude: Vec<String>,
     /// Text field of the exclude pattern editor.
     pub exclude_input: String,
     /// Status/error line below the wizard.
     pub status: Option<String>,
+}
+
+impl Default for Wizard {
+    fn default() -> Self {
+        Self {
+            mode: Mode::default(),
+            account_id: None,
+            spaces: SpacesState::default(),
+            space_id: None,
+            space_name: None,
+            local_path: String::new(),
+            tree: FolderTree::default(),
+            root_files: true,
+            exclude: Vec::new(),
+            exclude_input: String::new(),
+            status: None,
+        }
+    }
 }
 
 impl Wizard {
@@ -204,6 +226,7 @@ impl Wizard {
             space_name: job.space_name.clone(),
             local_path: job.local_path.display().to_string(),
             tree,
+            root_files: job.sync_root_files,
             exclude: job.exclude.clone(),
             exclude_input: String::new(),
             status: None,
@@ -347,6 +370,7 @@ mod tests {
             enabled: true,
             include: vec!["Dokumente".into()],
             exclude: vec!["*.tmp".into()],
+            sync_root_files: true,
         };
         let wizard = Wizard::edit_folders(&job);
         assert_eq!(
@@ -358,6 +382,7 @@ mod tests {
         assert_eq!(wizard.account_id.as_deref(), Some("konto-1"));
         assert_eq!(wizard.tree.selected, set(&["Dokumente"]));
         assert_eq!(wizard.exclude, ["*.tmp"]);
+        assert!(wizard.root_files, "root-files toggle must be prefilled");
         assert!(wizard.can_finish());
     }
 }

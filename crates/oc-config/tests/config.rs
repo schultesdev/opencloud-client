@@ -27,6 +27,7 @@ fn job(id: &str, account_id: &str) -> SyncJob {
         enabled: true,
         include: vec!["Dokumente".into(), "Bilder/2026".into()],
         exclude: vec!["tmp".into(), "*.tmp".into(), ".git".into()],
+        sync_root_files: true,
     }
 }
 

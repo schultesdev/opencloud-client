@@ -989,6 +989,7 @@ mod tests {
             enabled: true,
             include: vec![],
             exclude: vec![],
+            sync_root_files: true,
         });
         assert_eq!(unique_job_id(&jobs, "job-1", |_| false), "job-2");
         jobs.jobs[0].id = "job-2".into();

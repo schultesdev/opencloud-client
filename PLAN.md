@@ -253,8 +253,13 @@ Remote geändert? = ETag != DB-Werte
       ressourcenschonender als Depth:infinity), lokaler Scanner, DB aufbauen.
 - [x] **Selective Sync**: Traversal bricht unterhalb nicht-`include`ter Ordner
       ab; `exclude`-Muster beim lokalen Scan und remote-Traversal filtern.
-      Wird der Filter geändert → betroffene Pfade aus DB entfernen und lokale
-      Dateien optional bereinigen (GUI-Nachfrage).
+      Mit gesetzter Include-Liste entscheidet der Job-Schalter
+      `sync_root_files`, ob Dateien direkt im Hauptordner synchronisiert
+      werden (Hauptordner-Ordner brauchen immer einen Include-Eintrag).
+      Wird der Filter geändert → betroffene Pfade aus DB entfernen und die
+      lokalen Kopien löschen (die Cloud behält alles); neue oder lokal
+      geänderte Dateien bleiben erhalten, ebenso Ordner, die danach nicht
+      leer sind (`keep_folders_with_content`-Regel).
 - [x] **Lokale Änderungserkennung**: `notify`-Watcher pro Job + Debouncing;
       zusätzlicher Periodik-Scan (`sync_interval_secs`) als Fallback und für
       remote-Änderungen.

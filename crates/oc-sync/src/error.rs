@@ -90,4 +90,18 @@ impl SyncError {
     pub fn is_connectivity(&self) -> bool {
         matches!(self, Self::Api(error) if error.is_connectivity())
     }
+
+    /// Whether the server is throttling this client (425/429, see
+    /// [`ApiError::is_throttled`]): continuing at full rate only
+    /// prolongs the throttling.
+    pub fn is_throttled(&self) -> bool {
+        matches!(self, Self::Api(error) if error.is_throttled())
+    }
+
+    /// Whether an aborted pass should switch the job to offline
+    /// backoff: an unreachable server, or one that is throttling —
+    /// both call for fewer, later attempts, not the normal interval.
+    pub fn should_back_off(&self) -> bool {
+        matches!(self, Self::Api(error) if error.is_connectivity() || error.is_throttled())
+    }
 }

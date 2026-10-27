@@ -123,13 +123,21 @@ impl ApiError {
         }
     }
 
+    /// Whether the server is limiting this client: rate limiting (429)
+    /// or an early refusal (425 "Too Early" — OpenCloud's signal that
+    /// it is currently over the client's request budget). Continuing
+    /// at full rate only prolongs the throttling.
+    pub fn is_throttled(&self) -> bool {
+        matches!(self, Self::RateLimited { .. } | Self::Status { code: 425 })
+    }
+
     /// Whether another attempt may succeed: transport failures, server
-    /// errors (5xx), rate limiting (429), and request timeouts (408) are
-    /// considered transient.
+    /// errors (5xx), rate limiting (429), throttling (425), and request
+    /// timeouts (408) are considered transient.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Network(_) | Self::Server { .. } | Self::RateLimited { .. } => true,
-            Self::Status { code } => *code == 408,
+            Self::Status { code } => *code == 408 || *code == 425,
             // The token endpoint could not be reached; nothing was sent.
             Self::Auth(AuthError::Http(_)) => true,
             _ => false,
@@ -137,14 +145,17 @@ impl ApiError {
     }
 
     /// Whether the failure proves the request was never processed by the
-    /// server: no connection, rate limited (429), unavailable (503), or a
-    /// token failure before sending. Such requests can be repeated even
-    /// when a repetition of an applied request would fail its
-    /// precondition (conditional PUT, MOVE, COPY).
+    /// server: no connection, rate limited (429), refused early (425),
+    /// unavailable (503), or a token failure before sending. Such
+    /// requests can be repeated even when a repetition of an applied
+    /// request would fail its precondition (conditional PUT, MOVE,
+    /// COPY).
     pub fn is_unprocessed(&self) -> bool {
         match self {
             Self::Network(source) => source.is_connect(),
-            Self::RateLimited { .. } | Self::Server { code: 503 } => true,
+            Self::RateLimited { .. } | Self::Status { code: 425 } | Self::Server { code: 503 } => {
+                true
+            }
             Self::Auth(AuthError::Http(_)) => true,
             _ => false,
         }

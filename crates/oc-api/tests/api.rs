@@ -757,6 +757,30 @@ async fn excessive_retry_after_is_not_waited_for() {
 }
 
 #[tokio::test]
+async fn too_early_responses_are_transient_and_throttling() {
+    let server = MockServer::start().await;
+    // OpenCloud signals an overloaded server with 425 (Too Early): the
+    // request was not processed, and another attempt may succeed.
+    Mock::given(method("PROPFIND"))
+        .and(path("/dav/spaces/sid/"))
+        .respond_with(ResponseTemplate::new(425))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let client = dav_client(&server.uri()).with_retry(oc_api::RetryConfig::immediate());
+    let error = client
+        .propfind("", Depth::Zero)
+        .await
+        .expect_err("must fail");
+    assert!(matches!(error, ApiError::Status { code: 425 }));
+    assert!(error.is_throttled());
+    assert!(error.is_retryable());
+    assert!(error.is_unprocessed());
+    assert!(!error.is_connectivity());
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn put_file_streams_the_file_with_its_length() {
     let server = MockServer::start().await;
     Mock::given(method("PUT"))

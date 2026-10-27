@@ -28,6 +28,32 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Konflikt-Kaskade bei gedrosseltem Server (HTTP 425)**: Antwortet
+  OpenCloud auf die Sync-Flut mit `425 Too Early` (z. B. wenn versehentlich
+  ein Build-Verzeichnis synchronisiert wird), wurde jeder einzelne
+  Request als dauerhafter Fehler verbucht — im Extremfall
+  sechsstellige Fehlerzahlen pro Lauf. Jetzt gilt 425 wie 429 als
+  vorübergehend (HTTP-Retry mit Backoff, Wiederholung bedingter
+  Schreiboperationen), und der erste Drossel-Fehler bricht den Lauf
+  ab: Der Job geht in den Offline-Backoff mit exponentieller
+  Verzögerung, statt im 30-Sekunden-Takt weiterzuhämmern. Halbfertige
+  Läufe können dadurch keine veralteten Baselines mehr hinterlassen,
+  aus denen bei späteren Uploads Schein-Konflikte (412) entstehen.
+
+- **Keine Konflikte mehr mit erfundenem Remote-Zustand**: Schlug nach
+  einem abgewiesenen Upload (`412`) das nachgeschaltete `PROPFIND` fehl
+  (Drosselung, Netzwerk), wurde das als „remote gelöscht“ in den
+  Konflikt geschrieben — es entstanden unauflösbare Konflikte ohne
+  lokale und ohne Remote-Metadaten, deren Auflösung mit „Server
+  übernehmen“ die lokale Datei gelöscht hätte. Jetzt ist ein
+  unbestimmbarer Remote-Zustand ein Fehler (der Pfad wird im nächsten
+  Lauf neu geplant), ein auf beiden Seiten verschwundener Pfad wird
+  gar nicht mehr als Konflikt vermerkt, und die Konflikt-Auflösung
+  bewahrt den aufgezeichneten Remote-Zustand, statt ihn bei
+  fehlgeschlagener Nachfrage zu löschen. „Server übernehmen“
+  verifiziert zudem per `PROPFIND`, bevor es aufgrund fehlender
+  Remote-Metadaten lokale Daten als „remote gelöscht“ entfernt.
+
 - **GUI — Ordnerauswahl im Job-Wizard**: Jede Zeile des Ordnerbaums nahm
   die gesamte verbleibende Höhe ein und streckte das Fenster „Ordner &
   Ausschlüsse bearbeiten“; die Zeilen sind jetzt einzeilig, große Bäume

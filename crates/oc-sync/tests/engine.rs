@@ -1053,6 +1053,79 @@ async fn upload_precondition_failure_becomes_a_conflict() {
     engine.stop().await;
 }
 
+#[tokio::test]
+async fn upload_precondition_failure_with_indeterminate_remote_state_is_not_a_conflict() {
+    let f = fixture(&[], &[]).await;
+
+    std::fs::write(f.root.join("a.txt"), "changed").expect("write");
+    let mtime = std::fs::metadata(f.root.join("a.txt"))
+        .expect("meta")
+        .modified()
+        .unwrap();
+    let mtime = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    {
+        let db = open_db(&f.db_path);
+        db.upsert_entry(&seeded_file_entry("a.txt", "\"e1\"", mtime - 100_000, 3))
+            .expect("seed");
+    }
+
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    mount_propfind(
+        &f.server,
+        "",
+        "1",
+        &[
+            ("", true, Some("\"root-1\""), None),
+            ("a.txt", false, Some("\"e1\""), Some(3)),
+        ],
+    )
+    .await;
+    // Someone else changed the file between scan and PUT: 412.
+    Mock::given(method("PUT"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .and(header("If-Match", "\"e1\""))
+        .respond_with(ResponseTemplate::new(412))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+    // The lookup of the current remote state fails — the server is
+    // throttling. That must not read as "deleted remotely" and freeze
+    // the path behind a conflict: the next pass re-plans it.
+    Mock::given(method("PROPFIND"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .and(header("Depth", "0"))
+        .respond_with(ResponseTemplate::new(425))
+        .expect(3)
+        .mount(&f.server)
+        .await;
+    let mut engine = f.engine(test_options());
+
+    let (summary, events) = next_run(&mut engine).await;
+    assert_eq!(summary.conflicts, 0);
+    assert_eq!(summary.errors, 1);
+    f.server.verify().await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::Failed { path, .. } if path == "a.txt"))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::Conflict { .. }))
+    );
+
+    let db = open_db(&f.db_path);
+    assert!(db.pending_conflicts().expect("conflicts").is_empty());
+    // The entry is back to a clean state; the next pass re-plans it.
+    let entry = db.get_entry("a.txt").expect("entry").expect("present");
+    assert_eq!(entry.entry.state, EntryState::Synced);
+    engine.stop().await;
+}
+
 // --- Root-ETag shortcut ----------------------------------------------------
 
 #[tokio::test]
@@ -1427,6 +1500,14 @@ async fn resolve_server_accepts_a_remote_deletion() {
     std::fs::write(f.root.join("a.txt"), "local edit").unwrap();
     // The conflict says the server side is gone (no ETag).
     let (job, conflict_id) = seeded_conflict(&f, None);
+    // The server confirms the deletion.
+    Mock::given(method("PROPFIND"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .and(header("Depth", "0"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&f.server)
+        .await;
 
     let outcome = resolve(
         &job.dav,
@@ -1447,6 +1528,52 @@ async fn resolve_server_accepts_a_remote_deletion() {
         db.get_conflict(conflict_id).unwrap().unwrap().status,
         ConflictStatus::ResolvedServer
     );
+    f.server.verify().await;
+}
+
+#[tokio::test]
+async fn resolve_server_verifies_the_server_when_the_remote_state_was_never_recorded() {
+    let f = fixture(&[], &[]).await;
+    std::fs::write(f.root.join("a.txt"), "local edit").unwrap();
+    // A stale row: no recorded remote state (a failed lookup used to
+    // erase it), but the file exists on the server. "Server wins" must
+    // download it, not delete the local file as a "remote deletion".
+    let (job, conflict_id) = seeded_conflict(&f, None);
+    mount_propfind(
+        &f.server,
+        "a.txt",
+        "0",
+        &[("a.txt", false, Some("\"e9\""), Some(11))],
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("server edit"))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+
+    let outcome = resolve(
+        &job.dav,
+        &job.db,
+        &f.root,
+        conflict_id,
+        ConflictResolution::Server,
+        1024,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, ResolveOutcome::Resolved);
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("a.txt")).unwrap(),
+        "server edit"
+    );
+    let db = open_db(&f.db_path);
+    assert_eq!(
+        db.get_conflict(conflict_id).unwrap().unwrap().status,
+        ConflictStatus::ResolvedServer
+    );
+    f.server.verify().await;
 }
 
 #[tokio::test]
@@ -1572,6 +1699,55 @@ async fn resolve_local_with_remote_changed_again_stays_pending() {
     assert_eq!(conflict.remote_size, Some(12));
     let entry = db.get_entry("a.txt").unwrap().unwrap();
     assert_eq!(entry.entry.state, EntryState::Conflict);
+}
+
+#[tokio::test]
+async fn resolve_local_keeps_the_recorded_remote_state_when_the_lookup_fails() {
+    let f = fixture(&[], &[]).await;
+    std::fs::write(f.root.join("a.txt"), "local edit").unwrap();
+    let (job, conflict_id) = seeded_conflict(&f, Some("\"e2\""));
+
+    // The guarded upload fails: the server changed again.
+    Mock::given(method("PUT"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .and(header("If-Match", "\"e2\""))
+        .respond_with(ResponseTemplate::new(412))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+    // The lookup of the current remote state fails (throttling): the
+    // recorded state must stand — erasing it would read as "deleted
+    // remotely" and make "server wins" delete the local file.
+    Mock::given(method("PROPFIND"))
+        .and(path("/dav/spaces/sid/a.txt"))
+        .and(header("Depth", "0"))
+        .respond_with(ResponseTemplate::new(425))
+        .expect(3)
+        .mount(&f.server)
+        .await;
+
+    let outcome = resolve(
+        &job.dav,
+        &job.db,
+        &f.root,
+        conflict_id,
+        ConflictResolution::Local,
+        1024,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, ResolveOutcome::RemoteChanged);
+    f.server.verify().await;
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("a.txt")).unwrap(),
+        "local edit"
+    );
+
+    let db = open_db(&f.db_path);
+    let conflict = db.get_conflict(conflict_id).unwrap().unwrap();
+    assert_eq!(conflict.status, ConflictStatus::Pending);
+    assert_eq!(conflict.remote_etag.as_deref(), Some("\"e2\""));
+    assert_eq!(conflict.remote_size, Some(10));
 }
 
 #[tokio::test]
@@ -1954,6 +2130,30 @@ async fn unreachable_server_pauses_with_doubling_backoff() {
         .send("job-1", JobCommand::SyncNow)
         .await
         .expect("sync now");
+    let (summary, _) = next_run(&mut engine).await;
+    assert_eq!(summary.errors, 1);
+    let retries = offline_retries(&mut engine, 1).await;
+    assert_eq!(retries, [Duration::from_millis(100)]);
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn throttling_server_aborts_the_pass_and_backs_off() {
+    let f = fixture(&[], &[]).await;
+    // The server answers everything with 425 (Too Early) — OpenCloud's
+    // overload signal, e.g. while a build directory is being synced.
+    Mock::given(method("PROPFIND"))
+        .and(path("/dav/spaces/sid/"))
+        .respond_with(ResponseTemplate::new(425))
+        .mount(&f.server)
+        .await;
+    let mut options = test_options();
+    options.offline_backoff_base = Duration::from_millis(100);
+    options.offline_backoff_cap = Duration::from_millis(400);
+    let mut engine = f.engine(options);
+
+    // The pass aborts on the throttling instead of hammering through,
+    // and the job pauses with the offline backoff.
     let (summary, _) = next_run(&mut engine).await;
     assert_eq!(summary.errors, 1);
     let retries = offline_retries(&mut engine, 1).await;

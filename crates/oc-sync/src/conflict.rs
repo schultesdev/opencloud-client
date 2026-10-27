@@ -112,18 +112,32 @@ async fn resolve_server<P: TokenProvider>(
     remote_path: &str,
     chunk_size: u64,
 ) -> Result<ResolveOutcome, SyncError> {
-    if !remote_exists(conflict) {
-        // The server side was deleted: accept the deletion locally.
-        remove_local(local_root, &conflict.path)?;
-        db_lock(db).delete_entry(&conflict.path)?;
-        return Ok(ResolveOutcome::Resolved);
-    }
-    let remote = RemoteNode {
-        is_dir: false,
-        etag: conflict.remote_etag.clone(),
-        size: conflict.remote_size,
-    };
+    // The recorded state says the remote side exists; when it does not
+    // (no ETag and no size), verify against the server before deleting
+    // local data: rows whose remote state was never recorded — or was
+    // lost to a failed lookup — must not read as "deleted remotely".
     // The user (or policy) chose the server side: overwrite unconditionally.
+    let remote = if remote_exists(conflict) {
+        RemoteNode {
+            is_dir: false,
+            etag: conflict.remote_etag.clone(),
+            size: conflict.remote_size,
+        }
+    } else {
+        match current_remote(dav, remote_path).await? {
+            Some(node) => RemoteNode {
+                is_dir: false,
+                etag: node.etag,
+                size: node.size,
+            },
+            None => {
+                // The server side was deleted: accept the deletion locally.
+                remove_local(local_root, &conflict.path)?;
+                db_lock(db).delete_entry(&conflict.path)?;
+                return Ok(ResolveOutcome::Resolved);
+            }
+        }
+    };
     let paths = TransferPaths {
         root: local_root,
         path: &conflict.path,
@@ -193,16 +207,19 @@ async fn resolve_local<P: TokenProvider>(
         ))),
         // The server changed again: record its current state on the
         // pending row; the user resolves anew with fresh information.
+        // An undeterminable state (failed lookup) keeps the recorded
+        // one — it must not read as "deleted remotely".
         TransferResult::PreconditionFailed => {
-            let remote = current_remote(dav, remote_path).await;
-            let updated = db_lock(db).update_conflict_remote(
-                conflict.id,
-                remote.as_ref().and_then(|node| node.etag.as_deref()),
-                remote.as_ref().and_then(|node| node.size),
-                None,
-            )?;
-            if !updated {
-                return Err(SyncError::UnknownConflict { id: conflict.id });
+            if let Ok(remote) = current_remote(dav, remote_path).await {
+                let updated = db_lock(db).update_conflict_remote(
+                    conflict.id,
+                    remote.as_ref().and_then(|node| node.etag.as_deref()),
+                    remote.as_ref().and_then(|node| node.size),
+                    None,
+                )?;
+                if !updated {
+                    return Err(SyncError::UnknownConflict { id: conflict.id });
+                }
             }
             Ok(ResolveOutcome::RemoteChanged)
         }
@@ -240,11 +257,28 @@ fn record_resolved(
     Ok(())
 }
 
-/// The current remote state of a path (`None` when it no longer exists),
-/// e.g. after a failed optimistic write.
-async fn current_remote<P: TokenProvider>(dav: &WebDavClient<P>, path: &str) -> Option<RemoteNode> {
-    let resources = dav.propfind(path, Depth::Zero).await.ok()?;
-    resources.first().map(RemoteNode::from_resource)
+/// The current remote state of a path: `Ok(None)` — the path is gone on
+/// the server; `Err` — the state could not be determined (the PROPFIND
+/// failed or returned nothing). `None` must never be guessed from a
+/// failed lookup: the conflict row would read it as "deleted remotely",
+/// and a "server wins" resolution would delete local data on it.
+async fn current_remote<P: TokenProvider>(
+    dav: &WebDavClient<P>,
+    path: &str,
+) -> Result<Option<RemoteNode>, SyncError> {
+    match dav.propfind(path, Depth::Zero).await {
+        Ok(resources) => resources
+            .first()
+            .map(RemoteNode::from_resource)
+            .map(Some)
+            .ok_or_else(|| {
+                SyncError::Api(ApiError::protocol(format!(
+                    "'{path}' reported no current state"
+                )))
+            }),
+        Err(ApiError::NotFound) => Ok(None),
+        Err(source) => Err(SyncError::Api(source)),
+    }
 }
 
 /// Removes the local file of a resolved conflict (read-only attributes

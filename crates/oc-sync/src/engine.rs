@@ -514,7 +514,7 @@ async fn job_loop<P: TokenProvider + 'static>(
                 job_id: job.id.clone(),
                 summary,
             });
-            match aborted.filter(|error| error.is_connectivity()) {
+            match aborted.filter(|error| error.should_back_off()) {
                 Some(_) => {
                     // Unreachable server: pause the schedule, retry with
                     // a doubled backoff. Queued triggers stay pending.
@@ -610,12 +610,82 @@ enum PendingTransfer {
     },
 }
 
+/// Per-path failure bookkeeping of one pass: counts errors, emits the
+/// `Failed` events, and remembers the first throttling error (425/429).
+/// A throttling server means the pass should stop and the job back off
+/// — pushing through the remaining plan only prolongs the throttling
+/// and leaves half-applied state behind.
+struct PassFailures<'a> {
+    /// The failing job (for the events).
+    job_id: &'a str,
+    /// Where the `Failed` events go.
+    events: &'a UnboundedSender<EngineEvent>,
+    /// How many paths failed so far (merged into the run summary).
+    errors: usize,
+    /// The first throttling error seen, if any.
+    throttled: Option<SyncError>,
+}
+
+impl<'a> PassFailures<'a> {
+    fn new(job_id: &'a str, events: &'a UnboundedSender<EngineEvent>) -> Self {
+        Self {
+            job_id,
+            events,
+            errors: 0,
+            throttled: None,
+        }
+    }
+
+    /// Records one failed path: counts it, emits the event, and notes
+    /// the first throttling error. [`SyncError`] cannot be cloned (it
+    /// wraps io errors), so a fresh representative of the throttling
+    /// kind is kept; the per-path event carries the original.
+    fn fail(&mut self, path: &str, error: &SyncError) {
+        if self.throttled.is_none() {
+            self.throttled = match error {
+                SyncError::Api(ApiError::Status { code }) if *code == 425 => {
+                    Some(SyncError::Api(ApiError::Status { code: *code }))
+                }
+                SyncError::Api(ApiError::RateLimited { retry_after }) => {
+                    Some(SyncError::Api(ApiError::RateLimited {
+                        retry_after: *retry_after,
+                    }))
+                }
+                _ => None,
+            };
+        }
+        self.errors += 1;
+        let _ = self.events.send(EngineEvent::Failed {
+            job_id: self.job_id.to_owned(),
+            path: path.to_owned(),
+            error: error.to_string(),
+        });
+    }
+}
+
+/// Reports the run-level failure and marks the pass aborted.
+fn abort_pass(failures: &mut PassFailures<'_>, aborted: &mut Option<SyncError>, error: SyncError) {
+    failures.fail("", &error);
+    *aborted = Some(error);
+}
+
+/// Ends the pass: merges the counted per-path failures into the summary
+/// and hands both to the job loop.
+fn finish_pass(
+    mut summary: RunSummary,
+    failures: PassFailures<'_>,
+    aborted: Option<SyncError>,
+) -> (RunSummary, Option<SyncError>) {
+    summary.errors += failures.errors;
+    (summary, aborted)
+}
+
 /// One sync pass: recovery, scans, diff, plan execution, bookkeeping.
 /// Failures of individual paths are reported as [`EngineEvent::Failed`]
 /// and counted; only a failing scan or database aborts the pass early —
 /// the aborting error is returned alongside the summary so the job loop
-/// can classify it (a connectivity failure switches the job to offline
-/// backoff, Phase 8).
+/// can classify it (a connectivity failure or server throttling switches
+/// the job to offline backoff, Phase 8).
 async fn run_once<P: TokenProvider + 'static>(
     job: &JobTask<P>,
     options: &EngineOptions,
@@ -623,40 +693,27 @@ async fn run_once<P: TokenProvider + 'static>(
 ) -> (RunSummary, Option<SyncError>) {
     let mut summary = RunSummary::default();
     let mut aborted = None;
+    let mut failures = PassFailures::new(&job.id, events);
     let now = unix_now();
-
-    let fail = |summary: &mut RunSummary, path: &str, error: &SyncError| {
-        summary.errors += 1;
-        let _ = events.send(EngineEvent::Failed {
-            job_id: job.id.clone(),
-            path: path.to_owned(),
-            error: error.to_string(),
-        });
-    };
-    // Reports the run-level failure and marks the pass aborted.
-    let abort = |summary: &mut RunSummary, aborted: &mut Option<SyncError>, error: SyncError| {
-        fail(summary, "", &error);
-        *aborted = Some(error);
-    };
 
     // Crash recovery: interrupted transfers keep their recorded baseline,
     // so the diff re-plans them; the stale state must not linger.
     if let Err(error) = db_lock(&job.db).reset_transfer_states() {
-        abort(&mut summary, &mut aborted, SyncError::from(error));
-        return (summary, aborted);
+        abort_pass(&mut failures, &mut aborted, SyncError::from(error));
+        return finish_pass(summary, failures, aborted);
     }
 
     // Stale .part files from a crash never become real files.
     if let Err(error) = scan::remove_part_files(&job.local_root) {
-        abort(&mut summary, &mut aborted, error);
-        return (summary, aborted);
+        abort_pass(&mut failures, &mut aborted, error);
+        return finish_pass(summary, failures, aborted);
     }
 
     let (local, unreadable) = match scan::scan_local(&job.local_root, &job.filter) {
         Ok(scan) => (scan.entries, scan.unreadable),
         Err(error) => {
-            abort(&mut summary, &mut aborted, error);
-            return (summary, aborted);
+            abort_pass(&mut failures, &mut aborted, error);
+            return finish_pass(summary, failures, aborted);
         }
     };
 
@@ -667,8 +724,8 @@ async fn run_once<P: TokenProvider + 'static>(
     let db_entries = match load_covered_entries(&job.db, &job.filter) {
         Ok(entries) => entries,
         Err(error) => {
-            abort(&mut summary, &mut aborted, error);
-            return (summary, aborted);
+            abort_pass(&mut failures, &mut aborted, error);
+            return finish_pass(summary, failures, aborted);
         }
     };
 
@@ -678,8 +735,8 @@ async fn run_once<P: TokenProvider + 'static>(
         Ok(root) => root,
         Err(error) => {
             let error = SyncError::from(error);
-            abort(&mut summary, &mut aborted, error);
-            return (summary, aborted);
+            abort_pass(&mut failures, &mut aborted, error);
+            return finish_pass(summary, failures, aborted);
         }
     };
     let root_etag = root.first().and_then(|resource| resource.etag.clone());
@@ -701,8 +758,8 @@ async fn run_once<P: TokenProvider + 'static>(
             Ok(listing) => listing,
             Err(error) => {
                 let error = SyncError::from(error);
-                abort(&mut summary, &mut aborted, error);
-                return (summary, aborted);
+                abort_pass(&mut failures, &mut aborted, error);
+                return finish_pass(summary, failures, aborted);
             }
         };
         match scan::scan_remote_from_root(
@@ -715,7 +772,7 @@ async fn run_once<P: TokenProvider + 'static>(
         {
             Ok(snapshot) => {
                 if let Err(error) = db_lock(&job.db).replace_server_names(&snapshot.server_names) {
-                    fail(&mut summary, "", &SyncError::from(error));
+                    failures.fail("", &SyncError::from(error));
                 }
                 (
                     snapshot.entries,
@@ -725,8 +782,8 @@ async fn run_once<P: TokenProvider + 'static>(
                 )
             }
             Err(error) => {
-                abort(&mut summary, &mut aborted, error);
-                return (summary, aborted);
+                abort_pass(&mut failures, &mut aborted, error);
+                return finish_pass(summary, failures, aborted);
             }
         }
     };
@@ -739,8 +796,8 @@ async fn run_once<P: TokenProvider + 'static>(
         Ok(conflicts) => frozen.extend(conflicts.into_iter().map(|conflict| conflict.path)),
         Err(error) => {
             let error = SyncError::from(error);
-            abort(&mut summary, &mut aborted, error);
-            return (summary, aborted);
+            abort_pass(&mut failures, &mut aborted, error);
+            return finish_pass(summary, failures, aborted);
         }
     }
     frozen.extend(
@@ -752,7 +809,7 @@ async fn run_once<P: TokenProvider + 'static>(
     // Locally unreadable paths are in an unknown state: freeze them for
     // this pass (a folder that cannot be listed must not look deleted).
     for (path, error) in unreadable {
-        fail(&mut summary, &path, &error);
+        failures.fail(&path, &error);
         frozen.insert(path);
     }
     // The same applies to remote folders whose listing failed with a
@@ -760,7 +817,7 @@ async fn run_once<P: TokenProvider + 'static>(
     // the server's internal message limit): their state is unknown, so
     // freeze the subtree and keep syncing the rest of the space.
     for (path, error) in remote_unreadable {
-        fail(&mut summary, &path, &error);
+        failures.fail(&path, &error);
         frozen.insert(path);
     }
     // Server names that differ only in case cannot coexist on a
@@ -771,7 +828,7 @@ async fn run_once<P: TokenProvider + 'static>(
             let error = SyncError::CaseCollision {
                 paths: group.join("', '"),
             };
-            fail(&mut summary, &group[0], &error);
+            failures.fail(&group[0], &error);
             frozen.extend(group);
         }
     }
@@ -821,6 +878,12 @@ async fn run_once<P: TokenProvider + 'static>(
     let mut db_writes: Vec<DbWrite> = Vec::new();
 
     for action in plan {
+        // A throttling server ends the pass: no further requests are
+        // issued, and the job loop backs off before the next one. The
+        // remaining actions are re-planned from unchanged baselines.
+        if failures.throttled.is_some() {
+            break;
+        }
         match action {
             SyncAction::MkcolRemote { path } => match job.dav.mkcol(&names.resolve(&path)).await {
                 // 405: the folder already exists (created concurrently).
@@ -831,19 +894,19 @@ async fn run_once<P: TokenProvider + 'static>(
                             if let Err(error) =
                                 upsert_synced(&job.db, &path, true, node, None, None, now)
                             {
-                                fail(&mut summary, &path, &error);
+                                failures.fail(&path, &error);
                             }
                         }
                         Ok(None) => {}
-                        Err(error) => fail(&mut summary, &path, &error),
+                        Err(error) => failures.fail(&path, &error),
                     }
                 }
-                Err(error) => fail(&mut summary, &path, &SyncError::from(error)),
+                Err(error) => failures.fail(&path, &SyncError::from(error)),
             },
             SyncAction::MkcolLocal { path } => match scan::abs_local_path(&job.local_root, &path) {
                 Ok(target) => {
                     if let Err(source) = std::fs::create_dir_all(&target) {
-                        fail(&mut summary, &path, &SyncError::io(&target, source));
+                        failures.fail(&path, &SyncError::io(&target, source));
                     } else {
                         summary.folders_created += 1;
                         let remote_node = remote.get(&path);
@@ -858,15 +921,15 @@ async fn run_once<P: TokenProvider + 'static>(
                                     remote_node.and_then(|node| node.size),
                                     now,
                                 ) {
-                                    fail(&mut summary, &path, &error);
+                                    failures.fail(&path, &error);
                                 }
                             }
                             Ok(None) => {}
-                            Err(error) => fail(&mut summary, &path, &error),
+                            Err(error) => failures.fail(&path, &error),
                         }
                     }
                 }
-                Err(error) => fail(&mut summary, &path, &error),
+                Err(error) => failures.fail(&path, &error),
             },
             SyncAction::DeleteRemote { path, is_dir } => {
                 match job.dav.delete(&names.resolve(&path)).await {
@@ -879,12 +942,12 @@ async fn run_once<P: TokenProvider + 'static>(
                             db_lock(&job.db).delete_entry(&path).map(|_| 0)
                         };
                         if let Err(error) = result {
-                            fail(&mut summary, &path, &SyncError::from(error));
+                            failures.fail(&path, &SyncError::from(error));
                         } else {
                             summary.deletes += 1;
                         }
                     }
-                    Err(error) => fail(&mut summary, &path, &SyncError::from(error)),
+                    Err(error) => failures.fail(&path, &SyncError::from(error)),
                 }
             }
             SyncAction::DeleteLocal { path, is_dir } => {
@@ -911,15 +974,15 @@ async fn run_once<P: TokenProvider + 'static>(
                                 db_lock(&job.db).delete_entry(&path).map(|_| 0)
                             };
                             if let Err(error) = result {
-                                fail(&mut summary, &path, &SyncError::from(error));
+                                failures.fail(&path, &SyncError::from(error));
                             } else {
                                 summary.deletes += 1;
                             }
                         } else if let Err(error) = result {
-                            fail(&mut summary, &path, &error);
+                            failures.fail(&path, &error);
                         }
                     }
-                    Err(error) => fail(&mut summary, &path, &error),
+                    Err(error) => failures.fail(&path, &error),
                 }
             }
             SyncAction::Upload {
@@ -991,7 +1054,7 @@ async fn run_once<P: TokenProvider + 'static>(
             Ok(())
         });
         if let Err(error) = result {
-            fail(&mut summary, "", &SyncError::from(error));
+            failures.fail("", &SyncError::from(error));
         }
     }
 
@@ -1022,25 +1085,41 @@ async fn run_once<P: TokenProvider + 'static>(
                             summary.downloads += 1;
                         }
                     }
-                    Err(error) => fail(&mut summary, &path, &error),
+                    Err(error) => failures.fail(&path, &error),
                 }
             }
             Ok(TransferResult::PreconditionFailed) => {
-                // The remote side changed while we uploaded: conflict.
-                let current_remote = job
-                    .dav
-                    .propfind(&names.resolve(&path), Depth::Zero)
-                    .await
-                    .ok()
-                    .and_then(|resources| resources.first().map(RemoteNode::from_resource));
+                // The remote side changed while we uploaded: conflict,
+                // with the server's current state as its remote half.
+                // That lookup must succeed — a failed one (throttling,
+                // network) must not read as "deleted remotely", so the
+                // path is left to the next pass instead of freezing it
+                // behind a conflict with a made-up remote side.
+                let current_remote =
+                    match current_remote(job.dav.as_ref(), &names.resolve(&path), &path).await {
+                        Ok(remote) => remote,
+                        Err(error) => {
+                            failures.fail(&path, &error);
+                            let _ = mark_state(&job.db, &path, EntryState::Synced);
+                            continue;
+                        }
+                    };
                 let local_node = local.get(&path).copied();
-                let sighting = ConflictSighting {
-                    path,
-                    local: local_node,
-                    remote: current_remote,
-                    at: now,
-                };
-                handle_conflict(job, options, events, &mut summary, &sighting).await;
+                if local_node.is_none() && current_remote.is_none() {
+                    // The path vanished on both sides since the scan:
+                    // not a conflict — whatever entry exists goes too.
+                    if let Err(error) = db_lock(&job.db).delete_entry(&path) {
+                        failures.fail(&path, &SyncError::from(error));
+                    }
+                } else {
+                    let sighting = ConflictSighting {
+                        path,
+                        local: local_node,
+                        remote: current_remote,
+                        at: now,
+                    };
+                    handle_conflict(job, options, events, &mut summary, &sighting).await;
+                }
             }
             Ok(TransferResult::LocalChanged) => {
                 // The local file was edited while the download ran; the
@@ -1052,7 +1131,7 @@ async fn run_once<P: TokenProvider + 'static>(
             }
             Err(error) => {
                 let _ = mark_state(&job.db, &path, EntryState::Error);
-                fail(&mut summary, &path, &error);
+                failures.fail(&path, &error);
             }
         }
     }
@@ -1065,18 +1144,24 @@ async fn run_once<P: TokenProvider + 'static>(
     // database still holds the old remote state for it; storing the new
     // ETag would let the shortcut hide the change until something else
     // changes on the server, so the next pass must traverse again.
-    let complete = summary.errors == 0 && !rescan_needed;
+    // (Like before, a failing ETag write itself does not revoke the
+    // pass's completeness — it only counts as an error.)
+    let complete = failures.errors == 0 && summary.errors == 0 && !rescan_needed;
     let etag_result = match root_etag.filter(|_| complete) {
         Some(etag) => db_lock(&job.db).set_meta("space_etag", &etag),
         None => db_lock(&job.db).delete_meta("space_etag"),
     };
     if let Err(error) = etag_result {
-        fail(&mut summary, "", &SyncError::from(error));
+        failures.fail("", &SyncError::from(error));
     }
     if let Err(error) = db_lock(&job.db).set_last_sync(now) {
-        fail(&mut summary, "", &SyncError::from(error));
+        failures.fail("", &SyncError::from(error));
     }
-    (summary, aborted)
+    // The struct counted the per-path errors along the way; the summary
+    // carries its own (conflict bookkeeping). A throttling server ends
+    // the pass as its run-level error, so the job loop backs off.
+    let aborted = aborted.or(failures.throttled.take());
+    finish_pass(summary, failures, aborted)
 }
 
 /// What every transfer task of one pass shares.
@@ -1288,6 +1373,32 @@ pub(crate) fn local_node_at(
         })),
         Err(source) if source.kind() == ErrorKind::NotFound => Ok(None),
         Err(source) => Err(SyncError::io(&target, source)),
+    }
+}
+
+/// The current remote state of a path, as needed after a rejected
+/// optimistic write: `Ok(None)` — the path is gone on the server; `Err`
+/// — the state could not be determined (the PROPFIND failed or returned
+/// nothing). `None` must never be guessed from a failed lookup: a
+/// conflict row would read it as "deleted remotely", and resolutions
+/// would delete or discard local data on that guess.
+async fn current_remote<P: TokenProvider>(
+    dav: &WebDavClient<P>,
+    remote_path: &str,
+    path: &str,
+) -> Result<Option<RemoteNode>, SyncError> {
+    match dav.propfind(remote_path, Depth::Zero).await {
+        Ok(resources) => resources
+            .first()
+            .map(RemoteNode::from_resource)
+            .map(Some)
+            .ok_or_else(|| {
+                SyncError::Api(ApiError::protocol(format!(
+                    "'{path}' rejected the write and reported no current state"
+                )))
+            }),
+        Err(ApiError::NotFound) => Ok(None),
+        Err(source) => Err(SyncError::Api(source)),
     }
 }
 

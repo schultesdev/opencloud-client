@@ -3163,7 +3163,7 @@ dependencies = [
 
 [[package]]
 name = "oc-api"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "futures-util",
@@ -3183,7 +3183,7 @@ dependencies = [
 
 [[package]]
 name = "oc-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "eframe",
@@ -3210,7 +3210,7 @@ dependencies = [
 
 [[package]]
 name = "oc-auth"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "keyring",
@@ -3228,7 +3228,7 @@ dependencies = [
 
 [[package]]
 name = "oc-config"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dirs",
  "serde",
@@ -3240,7 +3240,7 @@ dependencies = [
 
 [[package]]
 name = "oc-db"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rusqlite",
  "tempfile",
@@ -3249,7 +3249,7 @@ dependencies = [
 
 [[package]]
 name = "oc-sync"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "notify",
  "oc-api",

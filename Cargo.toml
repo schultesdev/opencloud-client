@@ -10,10 +10,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.99.0"
 authors = ["Gregor Schulte"]
 homepage = "https://www.schultes.dev"
 repository = "https://github.com/schultesdev/opencloud-client"

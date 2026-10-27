@@ -52,6 +52,17 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **GTK-Warnung beim Tray-Start unter Linux unterdrückt**: Beim Start
+  schrieb das Systempaket libayatana-appindicator (die Basis des
+  Tray-Icons unter Linux) jedes Mal die Meldung
+  `Gtk-CRITICAL **: gtk_widget_get_scale_factor: assertion 'GTK_IS_WIDGET
+  (widget)' failed` auf stderr — der Bibliotheks-Fallback auf ein
+  GtkStatusIcon-Widget ist auf modernem GTK immer leer. Die Meldung ist
+  harmlos (das Tray-Icon erscheint, sobald die Statusleiste den Dienst
+  anmeldet); sie wird jetzt per Gtk-Log-Handler gezielt gefiltert und nur
+  noch mit `RUST_LOG=debug` ins normale Log geschrieben. Alle anderen
+  GTK-Meldungen bleiben unverändert sichtbar.
+
 - **Konflikt-Kaskade bei gedrosseltem Server (HTTP 425)**: Antwortet
   OpenCloud auf die Sync-Flut mit `425 Too Early` (z. B. wenn versehentlich
   ein Build-Verzeichnis synchronisiert wird), wurde jeder einzelne

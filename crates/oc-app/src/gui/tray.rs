@@ -217,7 +217,40 @@ mod linux {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    use gtk::glib;
+    use gtk::glib::LogLevels;
+
     use super::Update;
+
+    /// The critical libayatana-appindicator emits when the panel's
+    /// StatusNotifierWatcher is not on the bus (yet) and the library
+    /// queries its internal GtkStatusIcon fallback — always `NULL` on
+    /// modern GTK, since GtkStatusIcon is a stub there. Harmless (the
+    /// icon appears once the watcher registers), but it spams stderr
+    /// on every start.
+    const APPINDICATOR_CRITICAL: &str =
+        "gtk_widget_get_scale_factor: assertion 'GTK_IS_WIDGET (widget)' failed";
+
+    /// Installs a "Gtk" log handler that drops only the known
+    /// libappindicator critical (see [`APPINDICATOR_CRITICAL`]) and
+    /// forwards every other message to the default handler unchanged.
+    /// GLib handlers are process-wide, so this also covers the menus in
+    /// `muda` and the file dialogs in `rfd`.
+    fn drop_known_appindicator_critical() {
+        let _ = glib::log_set_handler(
+            Some("Gtk"),
+            LogLevels::LEVEL_CRITICAL,
+            true,
+            false,
+            |domain, level, message| {
+                if message.contains(APPINDICATOR_CRITICAL) {
+                    tracing::debug!("suppressed libappindicator critical: {message}");
+                    return;
+                }
+                glib::log_default_handler(domain, level, Some(message));
+            },
+        );
+    }
 
     /// Starts the gtk thread and builds the icon there; returns the
     /// update channel, or `None` when gtk or the icon is unavailable
@@ -232,6 +265,7 @@ mod linux {
                     let _ = ready_tx.send(false);
                     return;
                 }
+                drop_known_appindicator_critical();
                 let Some(parts) = super::build() else {
                     let _ = ready_tx.send(false);
                     return;

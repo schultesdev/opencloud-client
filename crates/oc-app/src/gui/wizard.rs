@@ -252,6 +252,16 @@ impl Wizard {
         consumed
     }
 
+    /// Preselects `account_id` when none is chosen yet. The account
+    /// combobox displays the first account either way, and clicking the
+    /// already-displayed entry is a no-op — without the preselection the
+    /// wizard would never leave step 1.
+    pub fn preselect_account(&mut self, account_id: &str) {
+        if self.account_id.is_none() {
+            self.account_id = Some(account_id.to_owned());
+        }
+    }
+
     /// Resets the space-dependent state (after choosing another space).
     pub fn reset_space(&mut self, space: Option<&Space>) {
         self.space_id = space.map(|space| space.id.clone());
@@ -314,6 +324,16 @@ mod tests {
         assert!(tree.children.contains_key(""));
         // Stale token: ignored.
         assert!(!tree.apply_children(7, Ok(Vec::new())));
+    }
+
+    #[test]
+    fn preselect_account_sets_only_when_unset() {
+        let mut wizard = Wizard::default();
+        wizard.preselect_account("konto-1");
+        assert_eq!(wizard.account_id.as_deref(), Some("konto-1"));
+        // An existing choice is not overwritten.
+        wizard.preselect_account("konto-2");
+        assert_eq!(wizard.account_id.as_deref(), Some("konto-1"));
     }
 
     #[test]

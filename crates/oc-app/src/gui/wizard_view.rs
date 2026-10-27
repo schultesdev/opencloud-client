@@ -154,10 +154,12 @@ impl SyncApp {
                 )
             })
             .collect();
-        let selected = wizard
-            .account_id
-            .clone()
-            .or_else(|| accounts.first().map(|(id, _)| id.clone()));
+        // The displayed first account is also the actual preselection;
+        // picking it in the dropdown must not be required.
+        if let Some((id, _)) = accounts.first() {
+            wizard.preselect_account(id);
+        }
+        let selected = wizard.account_id.clone();
         let mut choice = selected.clone();
         ComboBox::from_id_salt("wizard-account")
             .selected_text(choice.clone().unwrap_or_else(|| "—".into()))

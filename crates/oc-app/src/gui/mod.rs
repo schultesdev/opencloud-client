@@ -303,10 +303,10 @@ impl SyncApp {
                 self.engine_restarted();
             }
             BackendEvent::Spaces { account_id, result } => {
-                if let Some(wizard) = &mut self.wizard {
-                    if wizard.account_id.as_deref() == Some(account_id.as_str()) {
-                        wizard.apply_spaces(result.clone());
-                    }
+                if let Some(wizard) = &mut self.wizard
+                    && wizard.account_id.as_deref() == Some(account_id.as_str())
+                {
+                    wizard.apply_spaces(result.clone());
                 }
                 if let Some(state) = self.accounts.get_mut(&account_id) {
                     state.spaces_pending = false;

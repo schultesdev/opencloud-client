@@ -1728,10 +1728,10 @@ async fn apply_policy<P: TokenProvider>(
         ConflictPolicy::ConflictCopy => {
             // Keep the local version as a dated copy, then let the
             // server version win. The copy syncs as a new file.
-            if local.is_some_and(|node| !node.is_dir) {
-                if let Err(error) = conflict::keep_conflict_copy(&job.local_root, path) {
-                    return PolicyOutcome::NeedsReview { error: Some(error) };
-                }
+            if local.is_some_and(|node| !node.is_dir)
+                && let Err(error) = conflict::keep_conflict_copy(&job.local_root, path)
+            {
+                return PolicyOutcome::NeedsReview { error: Some(error) };
             }
             ConflictResolution::Server
         }

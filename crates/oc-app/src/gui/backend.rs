@@ -569,10 +569,10 @@ impl Managers {
     /// server URL replaces the cached manager.
     fn get(&self, account_id: &str, server_url: &str) -> Result<Arc<Manager>, String> {
         let mut cache = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
-        if let Some((server, manager)) = cache.get(account_id) {
-            if server == server_url {
-                return Ok(manager.clone());
-            }
+        if let Some((server, manager)) = cache.get(account_id)
+            && server == server_url
+        {
+            return Ok(manager.clone());
         }
         let auth = AuthClient::new(server_url).map_err(|error| error.to_string())?;
         let manager = Arc::new(TokenManager::new(auth, KeyringStore::new(), account_id));

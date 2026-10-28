@@ -233,48 +233,48 @@ impl SyncApp {
                 });
             });
 
-            if state.running {
-                if let Some(progress) = state.progress.as_ref().filter(|p| p.transfers_total > 0) {
-                    let remaining = progress.bytes_total.saturating_sub(progress.bytes_done);
-                    let mut label = format!(
-                        "{} von {} Dateien · {} / {}",
-                        progress.transfers_done,
-                        progress.transfers_total,
-                        format_bytes(progress.bytes_done),
-                        format_bytes(progress.bytes_total),
+            if state.running
+                && let Some(progress) = state.progress.as_ref().filter(|p| p.transfers_total > 0)
+            {
+                let remaining = progress.bytes_total.saturating_sub(progress.bytes_done);
+                let mut label = format!(
+                    "{} von {} Dateien · {} / {}",
+                    progress.transfers_done,
+                    progress.transfers_total,
+                    format_bytes(progress.bytes_done),
+                    format_bytes(progress.bytes_total),
+                );
+                if let Some(eta) = state.speed.eta(remaining) {
+                    label.push_str(&format!(
+                        " · {} · noch {}",
+                        format_speed(state.speed.bps()),
+                        format_eta(eta)
+                    ));
+                }
+                ui.add_space(8.0);
+                ui.add(
+                    egui::ProgressBar::new(progress.fraction())
+                        .desired_width(f32::INFINITY)
+                        .desired_height(18.0)
+                        .corner_radius(egui::CornerRadius::same(5))
+                        .text(egui::RichText::new(label).small().color(theme.text)),
+                );
+                ui.add_space(4.0);
+                for transfer in &progress.active {
+                    let speed = state
+                        .file_speeds
+                        .get(&transfer.path)
+                        .map(SpeedEstimate::bps)
+                        .unwrap_or(0.0);
+                    show_transfer_row(ui, transfer, speed);
+                }
+                let pending = progress.pending();
+                if pending > 0 {
+                    ui.label(
+                        egui::RichText::new(format!("noch {pending} wartend"))
+                            .small()
+                            .color(theme.text_dim),
                     );
-                    if let Some(eta) = state.speed.eta(remaining) {
-                        label.push_str(&format!(
-                            " · {} · noch {}",
-                            format_speed(state.speed.bps()),
-                            format_eta(eta)
-                        ));
-                    }
-                    ui.add_space(8.0);
-                    ui.add(
-                        egui::ProgressBar::new(progress.fraction())
-                            .desired_width(f32::INFINITY)
-                            .desired_height(18.0)
-                            .corner_radius(egui::CornerRadius::same(5))
-                            .text(egui::RichText::new(label).small().color(theme.text)),
-                    );
-                    ui.add_space(4.0);
-                    for transfer in &progress.active {
-                        let speed = state
-                            .file_speeds
-                            .get(&transfer.path)
-                            .map(SpeedEstimate::bps)
-                            .unwrap_or(0.0);
-                        show_transfer_row(ui, transfer, speed);
-                    }
-                    let pending = progress.pending();
-                    if pending > 0 {
-                        ui.label(
-                            egui::RichText::new(format!("noch {pending} wartend"))
-                                .small()
-                                .color(theme.text_dim),
-                        );
-                    }
                 }
             }
             if !details.is_empty() || state.last_summary.is_some() {

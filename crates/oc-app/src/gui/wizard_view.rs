@@ -329,10 +329,10 @@ impl SyncApp {
             // The browse button is allocated first (rightmost edge), so a
             // long path in the edit field clips instead of running under it.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::quiet(ui, "Durchsuchen…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        wizard.local_path = path.display().to_string();
-                    }
+                if theme::quiet(ui, "Durchsuchen…").clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_folder()
+                {
+                    wizard.local_path = path.display().to_string();
                 }
                 ui.add(
                     egui::TextEdit::singleline(&mut wizard.local_path).desired_width(f32::INFINITY),

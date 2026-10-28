@@ -73,13 +73,13 @@ pub async fn resolve<P: TokenProvider>(
     };
     // Folder/file mismatches (a collection here, a file there) have no
     // meaningful automatic resolution.
-    if let Some(entry) = db_lock(db).get_entry(&conflict.path)? {
-        if entry.entry.is_dir {
-            return Err(SyncError::UnresolvableConflict {
-                path: conflict.path,
-                reason: "one side is a folder; remove one side manually",
-            });
-        }
+    if let Some(entry) = db_lock(db).get_entry(&conflict.path)?
+        && entry.entry.is_dir
+    {
+        return Err(SyncError::UnresolvableConflict {
+            path: conflict.path,
+            reason: "one side is a folder; remove one side manually",
+        });
     }
 
     // The server spelling of the path (recorded by the last full scan).

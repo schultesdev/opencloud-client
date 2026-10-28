@@ -52,6 +52,18 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Erneut angewählte Ordner synchronisieren wieder**: Wurde ein Ordner
+  abgewählt (lokal gelöscht, Cloud behält ihn) und später wieder in die
+  Ordnerauswahl aufgenommen, synchronisierte ihn die Engine nicht mehr:
+  Der Wurzel-ETag-Shortcut griff, obwohl sich der Filter geändert hatte,
+  und baute die Server-Sicht aus der Statusdatenbank auf — in der die
+  Einträge des Ordners beim Abwählen entfernt worden waren. Der Ordner
+  erschien dadurch erst wieder, wenn sich auf dem Server etwas änderte.
+  Die Engine speichert jetzt einen Fingerprint des Filters
+  (`include`/`exclude`/„Dateien im Hauptordner“) in der Job-Datenbank und
+  durchläuft den Server nach jeder Filteränderung einmal vollständig,
+  bevor der Shortcut wieder gültig ist.
+
 - **GTK-Warnung beim Tray-Start unter Linux unterdrückt**: Beim Start
   schrieb das Systempaket libayatana-appindicator (die Basis des
   Tray-Icons unter Linux) jedes Mal die Meldung

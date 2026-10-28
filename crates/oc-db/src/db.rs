@@ -165,7 +165,7 @@ impl StatusDb {
                     "DELETE FROM entries;
                      DELETE FROM conflicts;
                      DELETE FROM server_names;
-                     DELETE FROM meta WHERE key IN ('space_etag', 'last_sync');",
+                     DELETE FROM meta WHERE key IN ('space_etag', 'filter_sig', 'last_sync');",
                 )?;
                 true
             }

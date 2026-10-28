@@ -80,6 +80,26 @@ impl Filter {
         self.include.is_empty()
     }
 
+    /// A canonical fingerprint of everything `covers` depends on: the
+    /// sorted `include` and `exclude` patterns plus the root-files
+    /// toggle (global excludes arrive via `add_global_excludes`, so
+    /// they are part of it as well). It changes exactly when the
+    /// synced set changes, which lets the engine detect
+    /// selective-sync edits between two passes and invalidate the
+    /// root-ETag shortcut (see `run_once`).
+    pub fn signature(&self) -> String {
+        let mut include = self.include.clone();
+        let mut exclude = self.exclude.clone();
+        include.sort_unstable();
+        exclude.sort_unstable();
+        format!(
+            "i\u{1f}{}\u{1f}e\u{1f}{}\u{1f}r\u{1f}{}",
+            include.join("\u{1f}"),
+            exclude.join("\u{1f}"),
+            self.root_files
+        )
+    }
+
     /// Whether `path` (relative to the space root; `""` is the root
     /// itself) belongs to the synced set. The root is always covered —
     /// included folders may live anywhere in the tree. With a
@@ -233,6 +253,35 @@ mod tests {
         // Inside whitelisted branches the toggle is irrelevant.
         assert!(on.covers("Dokumente/a.pdf", false));
         assert!(off.covers("Dokumente/a.pdf", false));
+    }
+
+    #[test]
+    fn signature_is_order_insensitive_and_tracks_every_input() {
+        // Pattern order is irrelevant for `covers`, so it must not
+        // change the signature.
+        assert_eq!(
+            filter(&["A", "B"], &["x", "y"]).signature(),
+            filter(&["B", "A"], &["y", "x"]).signature()
+        );
+        // Include, exclude and the root-files toggle each do.
+        assert_ne!(
+            filter(&["A"], &[]).signature(),
+            filter(&["A", "B"], &[]).signature()
+        );
+        assert_ne!(
+            filter(&["A"], &[]).signature(),
+            filter(&["A"], &["x"]).signature()
+        );
+        let include: Vec<String> = vec!["A".into()];
+        let empty: Vec<String> = vec![];
+        assert_ne!(
+            Filter::new(&include, &empty, true)
+                .expect("filter")
+                .signature(),
+            Filter::new(&include, &empty, false)
+                .expect("filter")
+                .signature()
+        );
     }
 
     #[test]

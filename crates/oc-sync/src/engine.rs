@@ -747,8 +747,17 @@ async fn run_once<P: TokenProvider + 'static>(
     };
     let root_etag = root.first().and_then(|resource| resource.etag.clone());
     let stored_etag = db_lock(&job.db).meta("space_etag").ok().flatten();
-    let skip_remote =
-        options.root_etag_shortcut && stored_etag.is_some() && stored_etag == root_etag;
+    // The ETag only vouches for the state the filter covered when it was
+    // recorded. A changed include/exclude set has removed entries from
+    // the database (or needs to re-cover paths it no longer knows), so
+    // the shortcut must not reconstruct the remote view from it — the
+    // pass traverses the server instead.
+    let stored_filter = db_lock(&job.db).meta("filter_sig").ok().flatten();
+    let filter_changed = stored_filter.as_deref() != Some(job.filter.signature().as_str());
+    let skip_remote = options.root_etag_shortcut
+        && stored_etag.is_some()
+        && stored_etag == root_etag
+        && !filter_changed;
 
     let (remote, names, checksums, remote_unreadable) = if skip_remote {
         summary.remote_scan_skipped = true;
@@ -1158,6 +1167,17 @@ async fn run_once<P: TokenProvider + 'static>(
         None => db_lock(&job.db).delete_meta("space_etag"),
     };
     if let Err(error) = etag_result {
+        failures.fail("", &SyncError::from(error));
+    }
+    // The filter signature follows the same policy: stored once the pass
+    // applied everything it planned, dropped otherwise, so the next pass
+    // traverses the server again.
+    let sig_result = if complete {
+        db_lock(&job.db).set_meta("filter_sig", &job.filter.signature())
+    } else {
+        db_lock(&job.db).delete_meta("filter_sig")
+    };
+    if let Err(error) = sig_result {
         failures.fail("", &SyncError::from(error));
     }
     if let Err(error) = db_lock(&job.db).set_last_sync(now) {

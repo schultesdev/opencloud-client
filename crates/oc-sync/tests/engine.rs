@@ -906,6 +906,98 @@ async fn filter_change_deletes_synced_local_copies_not_the_cloud() {
 }
 
 #[tokio::test]
+async fn reselected_folder_resyncs_despite_unchanged_root_etag() {
+    let mut options = test_options();
+    options.root_etag_shortcut = true;
+    let mut f = fixture(&["keep", "workspace"], &[]).await;
+
+    // The server never changes: the root ETag stays "root-1" through
+    // all three passes.
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    mount_propfind(
+        &f.server,
+        "",
+        "1",
+        &[
+            ("", true, Some("\"root-1\""), None),
+            ("keep", true, None, None),
+            ("workspace", true, None, None),
+        ],
+    )
+    .await;
+    mount_propfind(
+        &f.server,
+        "keep",
+        "1",
+        &[
+            ("keep", true, None, None),
+            ("keep/k.txt", false, Some("\"k1\""), Some(1)),
+        ],
+    )
+    .await;
+    mount_propfind(
+        &f.server,
+        "workspace",
+        "1",
+        &[
+            ("workspace", true, None, None),
+            ("workspace/w.txt", false, Some("\"w1\""), Some(1)),
+        ],
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/keep/k.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("k"))
+        .mount(&f.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/workspace/w.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("w"))
+        .mount(&f.server)
+        .await;
+    // Deselection must never delete anything on the server.
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&f.server)
+        .await;
+
+    // Pass 1: both folders selected, both download.
+    let mut engine = f.engine(options.clone());
+    let (first, _) = next_run(&mut engine).await;
+    assert_eq!(first.errors, 0);
+    assert_eq!(first.downloads, 2);
+    engine.stop().await;
+
+    // Pass 2: "workspace" deselected — its local copy goes, the DB
+    // entries are dropped, the cloud keeps everything.
+    f.include = vec!["keep".to_owned()];
+    let mut engine = f.engine(options.clone());
+    let (second, _) = next_run(&mut engine).await;
+    assert_eq!(second.errors, 0);
+    assert_eq!(second.deletes, 2); // file + emptied folder
+    assert!(!f.root.join("workspace").exists());
+    engine.stop().await;
+
+    // Pass 3: "workspace" reselected. The root ETag is unchanged, but
+    // the filter changed since it was recorded: the shortcut would
+    // rebuild the remote view from the DB — which no longer knows the
+    // folder — and never download it again. The pass must traverse.
+    f.include = vec!["keep".to_owned(), "workspace".to_owned()];
+    let mut engine = f.engine(options);
+    let (third, _) = next_run(&mut engine).await;
+    assert_eq!(third.errors, 0);
+    assert!(!third.remote_scan_skipped);
+    assert_eq!(third.downloads, 1);
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("workspace/w.txt")).expect("downloaded"),
+        "w"
+    );
+    f.server.verify().await;
+    engine.stop().await;
+}
+
+#[tokio::test]
 async fn filter_change_keeps_new_and_changed_local_content() {
     let f = fixture(&["keep"], &[]).await;
 

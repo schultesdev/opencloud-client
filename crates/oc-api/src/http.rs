@@ -94,11 +94,11 @@ impl<P: TokenProvider> AuthedHttp<P> {
     /// HTTP client; if that cannot be built, the shared one is kept.
     pub fn with_timeouts(mut self, request: Duration, transfer: Duration) -> Self {
         self.request_timeout = request;
-        if transfer != self.transfer_timeout {
-            if let Ok(http) = build_client(transfer) {
-                self.http = http;
-                self.transfer_timeout = transfer;
-            }
+        if transfer != self.transfer_timeout
+            && let Ok(http) = build_client(transfer)
+        {
+            self.http = http;
+            self.transfer_timeout = transfer;
         }
         self
     }

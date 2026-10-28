@@ -103,10 +103,10 @@ pub(crate) fn parse_multistatus(xml: &str) -> Result<Vec<RawResource>, ApiError>
             Event::Empty(empty) => {
                 // Only structurally relevant empty tags: a self-closing
                 // `<collection/>` marks a directory.
-                if local_name(empty.name()) == "collection" {
-                    if let Some(resource) = current.as_mut() {
-                        resource.is_dir = true;
-                    }
+                if local_name(empty.name()) == "collection"
+                    && let Some(resource) = current.as_mut()
+                {
+                    resource.is_dir = true;
                 }
             }
             Event::Text(bytes) => {
@@ -142,19 +142,17 @@ pub(crate) fn parse_multistatus(xml: &str) -> Result<Vec<RawResource>, ApiError>
                             resources.push(resource);
                         }
                     }
-                } else if name == "propstat" {
-                    if let (Some(stage), Some(resource)) = (propstat.take(), current.as_mut()) {
-                        if stage.is_ok() {
-                            resource.etag = resource.etag.take().or(stage.etag);
-                            resource.size = resource.size.or(stage.size);
-                            resource.last_modified =
-                                resource.last_modified.take().or(stage.last_modified);
-                            resource.quota_available_bytes = resource
-                                .quota_available_bytes
-                                .or(stage.quota_available_bytes);
-                            resource.checksums = resource.checksums.take().or(stage.checksums);
-                        }
-                    }
+                } else if name == "propstat"
+                    && let (Some(stage), Some(resource)) = (propstat.take(), current.as_mut())
+                    && stage.is_ok()
+                {
+                    resource.etag = resource.etag.take().or(stage.etag);
+                    resource.size = resource.size.or(stage.size);
+                    resource.last_modified = resource.last_modified.take().or(stage.last_modified);
+                    resource.quota_available_bytes = resource
+                        .quota_available_bytes
+                        .or(stage.quota_available_bytes);
+                    resource.checksums = resource.checksums.take().or(stage.checksums);
                 }
             }
             Event::Eof => break,
@@ -278,15 +276,15 @@ fn handle_close(
             }
         }
         Pending::Checksum => {
-            if let Some(stage) = propstat {
-                if !value.is_empty() {
-                    // Several <oc:checksum> elements are joined.
-                    let joined = match stage.checksums.take() {
-                        Some(previous) => format!("{previous} {value}"),
-                        None => value,
-                    };
-                    stage.checksums = Some(joined);
-                }
+            if let Some(stage) = propstat
+                && !value.is_empty()
+            {
+                // Several <oc:checksum> elements are joined.
+                let joined = match stage.checksums.take() {
+                    Some(previous) => format!("{previous} {value}"),
+                    None => value,
+                };
+                stage.checksums = Some(joined);
             }
         }
     }
@@ -310,10 +308,10 @@ fn parse_u64(value: &str) -> Result<Option<u64>, ApiError> {
 /// infinite). Servers like OpenCloud/reva send them for spaces without
 /// quota; they map to "unknown" instead of failing the whole response.
 fn parse_quota_bytes(value: &str) -> Result<Option<u64>, ApiError> {
-    if let Ok(signed) = value.parse::<i64>() {
-        if signed < 0 {
-            return Ok(None);
-        }
+    if let Ok(signed) = value.parse::<i64>()
+        && signed < 0
+    {
+        return Ok(None);
     }
     parse_u64(value)
 }

@@ -140,10 +140,10 @@ impl<S: TokenStore + 'static> TokenManager<S> {
     /// expired (or about to expire). Concurrent calls share one refresh.
     pub async fn access_token(&self) -> Result<String, AuthError> {
         let mut guard = self.state.lock().await;
-        if let Some(active) = guard.as_ref() {
-            if !active.is_expired(self.refresh_skew) {
-                return Ok(active.access_token.clone());
-            }
+        if let Some(active) = guard.as_ref()
+            && !active.is_expired(self.refresh_skew)
+        {
+            return Ok(active.access_token.clone());
         }
         self.refresh_locked(&mut guard).await
     }
@@ -160,10 +160,11 @@ impl<S: TokenStore + 'static> TokenManager<S> {
     /// each rotating the refresh token again.
     pub async fn refresh_rejected(&self, rejected: &str) -> Result<String, AuthError> {
         let mut guard = self.state.lock().await;
-        if let Some(active) = guard.as_ref() {
-            if active.access_token != rejected && !active.is_expired(self.refresh_skew) {
-                return Ok(active.access_token.clone());
-            }
+        if let Some(active) = guard.as_ref()
+            && active.access_token != rejected
+            && !active.is_expired(self.refresh_skew)
+        {
+            return Ok(active.access_token.clone());
         }
         self.refresh_locked(&mut guard).await
     }

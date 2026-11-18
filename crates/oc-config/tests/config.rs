@@ -2,11 +2,15 @@
 
 use std::path::{Path, PathBuf};
 
-use oc_config::{Account, Config, ConflictPolicy, Jobs, LogLevel, Settings, SyncJob};
+use oc_config::{
+    Account, CONFIG_VERSION, Config, ConflictPolicy, Jobs, LogLevel, ProviderKind, Settings,
+    SyncJob,
+};
 
 fn account(id: &str) -> Account {
     Account {
         id: id.into(),
+        provider: ProviderKind::OpenCloud,
         server_url: "https://cloud.example.com".into(),
         username: "max@example.com".into(),
     }
@@ -33,7 +37,7 @@ fn job(id: &str, account_id: &str) -> SyncJob {
 
 fn sample_config() -> Config {
     Config {
-        version: 1,
+        version: CONFIG_VERSION,
         accounts: vec![account("konto-1")],
         settings: Settings {
             sync_interval_secs: 45,
@@ -50,7 +54,7 @@ fn sample_config() -> Config {
 
 fn sample_jobs() -> Jobs {
     Jobs {
-        version: 1,
+        version: CONFIG_VERSION,
         jobs: vec![job("job-1", "konto-1"), job("job-2", "konto-1")],
     }
 }
@@ -64,7 +68,7 @@ fn config_roundtrip() {
     let loaded = oc_config::load_config(dir.path()).unwrap();
 
     assert_eq!(original, loaded);
-    assert_eq!(loaded.version, 1);
+    assert_eq!(loaded.version, CONFIG_VERSION);
 }
 
 #[test]
@@ -76,7 +80,7 @@ fn jobs_roundtrip() {
     let loaded = oc_config::load_jobs(dir.path()).unwrap();
 
     assert_eq!(original, loaded);
-    assert_eq!(loaded.version, 1);
+    assert_eq!(loaded.version, CONFIG_VERSION);
 }
 
 #[test]
@@ -245,7 +249,7 @@ fn settings_ranges_are_enforced() {
 }
 
 #[test]
-fn legacy_version_0_is_migrated_to_1() {
+fn legacy_version_0_is_migrated_to_current() {
     let dir = tempfile::tempdir().unwrap();
     // v0 = no "version" field; settings filled with defaults.
     std::fs::write(
@@ -259,7 +263,8 @@ fn legacy_version_0_is_migrated_to_1() {
     .unwrap();
 
     let config = oc_config::load_config(dir.path()).unwrap();
-    assert_eq!(config.version, 1);
+    assert_eq!(config.version, CONFIG_VERSION);
+    assert_eq!(config.accounts[0].provider, ProviderKind::OpenCloud);
     assert_eq!(config.accounts.len(), 1);
     assert_eq!(config.settings, Settings::default());
 
@@ -281,7 +286,7 @@ fn legacy_version_0_is_migrated_to_1() {
     .unwrap();
 
     let jobs = oc_config::load_jobs(dir.path()).unwrap();
-    assert_eq!(jobs.version, 1);
+    assert_eq!(jobs.version, CONFIG_VERSION);
     assert_eq!(jobs.jobs.len(), 1);
     assert!(jobs.jobs[0].enabled, "enabled defaults to true");
     assert!(jobs.jobs[0].include.is_empty());
@@ -323,4 +328,21 @@ fn settings_upper_bounds_are_enforced() {
     assert!(config.validate().is_err());
     config.settings.propfind_pause_ms = 0;
     config.validate().unwrap();
+}
+
+#[test]
+fn nextcloud_accounts_round_trip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = Config::default();
+    config.accounts.push(Account {
+        id: "nc".into(),
+        provider: ProviderKind::Nextcloud,
+        server_url: "https://nc.example.com".into(),
+        username: "alice".into(),
+    });
+    oc_config::save_config(dir.path(), &config).expect("save");
+    let raw = std::fs::read_to_string(oc_config::config_path(dir.path())).expect("read");
+    assert!(raw.contains(r#""provider": "nextcloud""#), "{raw}");
+    let loaded = oc_config::load_config(dir.path()).expect("load");
+    assert_eq!(loaded.accounts[0].provider, ProviderKind::Nextcloud);
 }

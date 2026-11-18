@@ -1,0 +1,19 @@
+[package]
+name = "oc-storage"
+description = "Provider-neutral remote storage traits and types used by the sync engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

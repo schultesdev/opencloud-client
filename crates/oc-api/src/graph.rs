@@ -57,8 +57,8 @@ impl<P: TokenProvider> GraphClient<P> {
             .map_err(|err| ApiError::invalid_url(self.base.as_str(), err.to_string()))?;
         let response = self
             .http
-            .send(Some(self.http.request_timeout()), Replay::Safe, |token| {
-                self.http.http().get(url.clone()).bearer_auth(token)
+            .send(Some(self.http.request_timeout()), Replay::Safe, || {
+                self.http.http().get(url.clone())
             })
             .await?;
         let body = response.text().await?;

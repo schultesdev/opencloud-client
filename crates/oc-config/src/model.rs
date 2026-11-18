@@ -30,14 +30,45 @@ fn default_check_updates() -> bool {
     true
 }
 
-/// An OpenCloud account (one server + user).
+/// The kind of server an account belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ProviderKind {
+    /// OpenCloud: OIDC login, spaces via the Graph API. Default (and the
+    /// only kind before config schema v2).
+    #[default]
+    #[serde(rename = "opencloud")]
+    OpenCloud,
+    /// Nextcloud: Login Flow v2 with an app password, one file tree per
+    /// user.
+    #[serde(rename = "nextcloud")]
+    Nextcloud,
+}
+
+impl ProviderKind {
+    /// All providers, in display order.
+    pub const ALL: [ProviderKind; 2] = [ProviderKind::OpenCloud, ProviderKind::Nextcloud];
+
+    /// The product name for display.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenCloud => "OpenCloud",
+            Self::Nextcloud => "Nextcloud",
+        }
+    }
+}
+
+/// A storage account (one server + user).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     /// Stable, unique account identifier, referenced by sync jobs.
     pub id: String,
-    /// Base URL of the OpenCloud server, e.g. `https://cloud.example.com`.
+    /// The kind of server (`opencloud` when missing).
+    #[serde(default)]
+    pub provider: ProviderKind,
+    /// Base URL of the server, e.g. `https://cloud.example.com`.
     pub server_url: String,
-    /// User name (login), e.g. `max@example.com`.
+    /// User name for display, e.g. `max@example.com`; the login itself
+    /// happens in the browser.
     pub username: String,
 }
 

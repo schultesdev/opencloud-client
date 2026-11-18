@@ -59,8 +59,11 @@ opencloud-sync/
 ├── Cargo.toml            # Workspace
 ├── crates/
 │   ├── oc-config/        # JSON-Konfiguration laden/speichern/validieren
-│   ├── oc-auth/          # OIDC-Login (Code Flow + PKCE), Token-Refresh, Keyring
-│   ├── oc-api/           # HTTP-Client: Graph-API (Spaces) + WebDAV
+│   ├── oc-storage/       # anbieterneutrale Storage-Traits (Phase 10)
+│   ├── oc-auth/          # OIDC-Login (Code Flow + PKCE), Token-Refresh,
+│   │                     # Nextcloud Login Flow v2, Keyring
+│   ├── oc-api/           # HTTP-Client: WebDAV, Graph-API (Spaces),
+│   │                     # Nextcloud (OCS, Chunked Upload v2)
 │   ├── oc-db/            # SQLite-Schema, Migrationen, Statusabfragen
 │   ├── oc-sync/          # Sync-Engine: Scannen, Diff, Transfers, Konflikte
 │   └── oc-app/           # GUI (egui) + Tray + main()
@@ -98,6 +101,24 @@ opencloud-sync/
   - `GET`/`HEAD` (Download), `PUT` (Upload), `MKCOL` (Ordner anlegen), `MOVE`, `COPY`, `DELETE`
   - ETag-basierte Änderungserkennung; `If-Match` für optimistisches Schreiben
   - Optional später: TUS-Upload (`/tus-upload`) für große Dateien
+
+### 2.5 API-Grundlagen Nextcloud (Phase 10)
+
+- **Login Flow v2**: `POST <server>/index.php/login/v2` (User-Agent =
+  Gerätename) → `login`-URL im Browser, `poll.endpoint` mit `token=…`
+  abfragen (404 = noch offen) → `loginName` + `appPassword`. Alle
+  weiteren Requests mit HTTP Basic (Login-Name + App-Passwort). Logout:
+  `DELETE <server>/ocs/v2.php/core/apppassword`.
+- **Benutzer/Quota**: `GET <server>/ocs/v2.php/cloud/user?format=json`
+  (`OCS-APIRequest: true`) → `id` (Pfadsegment des WebDAV-Baums),
+  `display-name`, `quota` (negative Werte = unbegrenzt).
+- **WebDAV**: `https://<server>/remote.php/dav/files/{userId}/{path}` —
+  gleiche Operationen und PROPFIND-Properties wie bei OpenCloud.
+- **Chunked Upload v2**: `MKCOL /remote.php/dav/uploads/{userId}/{id}`
+  (mit `Destination`), Chunks `PUT …/{id}/{n}` (n = 1…10000, mit
+  `Destination` + `OC-Total-Length`), Abschluss `MOVE …/{id}/.file`;
+  Schreibbedingungen am MOVE: `If: <ziel> (["etag"])` statt `If-Match`,
+  `Overwrite: F` statt `If-None-Match: *`.
 
 ---
 
@@ -377,6 +398,54 @@ Remote geändert? = ETag != DB-Werte
   (`config.json`/`jobs.json` mit Feldern und Grenzen), Protokolle,
   Grenzen und Entwicklungshinweise.
 
+### Phase 10 — Nextcloud als zweiter Storage-Provider
+
+Ziel: Nextcloud gleichwertig neben OpenCloud anbieten; Scan, Diff,
+Transfers und Konfliktbehandlung bleiben identisch und anbieterneutral.
+
+- [x] **Storage-Abstraktion** (`oc-storage`, neue unterste Schicht ohne
+  HTTP): `RemoteStorage` (stat, list, download mit Range/If-Match, upload
+  mit Schreibbedingung, create_dir, delete) und `StorageProvider` (Login,
+  Logout, Wurzeln/Spaces, Storage je Wurzel), neutrale Typen
+  (`RemoteEntry`, `Listing`, `Download`, `StorageRoot`) und
+  `StorageError`. Dyn-kompatibel über `BoxFuture`, damit Jobs beider
+  Anbieter in einer Engine laufen.
+- [x] **Engine anbieterneutral** (`oc-sync`): kennt nur noch
+  `Arc<dyn RemoteStorage>`; `oc-api` und `reqwest` sind nur noch
+  Test-Abhängigkeiten. WebDAV-Konventionen (405 bei MKCOL = vorhanden,
+  404 bei DELETE = weg, 425/429 = Drosselung) liegen in der
+  Implementierung. Ein leeres PROPFIND-Ergebnis der Wurzel ist jetzt ein
+  Protokollfehler statt eines leeren Remote-Stands.
+- [x] **Auth zentral** (`oc-api`): `TokenProvider::scheme()` (Bearer oder
+  Basic); der `Authorization`-Header wird an einer Stelle gesetzt. Ein
+  abgelehntes App-Passwort wird nicht erneut gesendet (Nextcloud drosselt
+  wiederholte Fehlanmeldungen). Href-Präfixe werden dekodiert verglichen.
+- [x] **Upload-Timeout korrigiert**: reqwests `read_timeout` lief ab dem
+  Senden bis zu den Antwort-Headern und brach jeden Upload über 120 s
+  ab. Uploads nutzen jetzt einen eigenen Client ohne diesen Timeout und
+  einen Watchdog, der nur bei stehendem Datenfluss abbricht (nach dem
+  Senden: fünffaches Limit für Puffer-Restlauf und Serververarbeitung).
+- [x] **Provider-Factory** (`oc-app/src/provider.rs`): ein Ort für
+  `Account → StorageProvider`, genutzt von CLI und GUI; der Cache hält
+  genau eine Instanz pro Konto (rotierende Refresh-Tokens) und baut sie
+  bei geänderter Server-URL oder geändertem Anbieter neu.
+- [x] **Konfiguration** (`oc-config`): `accounts[].provider`
+  (`opencloud` Standard, `nextcloud`), Schema v2 mit Migration v1→v2.
+- [x] **Nextcloud-Login** (`oc-auth`): Login Flow v2,
+  `AppPasswordManager` (App-Passwort als JSON im bestehenden
+  Keyring-Eintrag des Kontos), Logout mit serverseitigem Widerruf.
+- [x] **Nextcloud-Provider** (`oc-api::nextcloud`): OCS-Benutzer und
+  Quota, `NextcloudStorage` auf `/remote.php/dav/files/{user}/`, Chunked
+  Upload v2 ab 50 MiB (25-MiB-Stücke) mit Vorabprüfung der Bedingung,
+  Prüfung der lokalen Datei vor dem Zusammensetzen und Aufräumen
+  abgebrochener Uploads.
+- [x] **GUI**: Anbieter-Auswahl beim Anlegen eines Kontos, Anbieter in der
+  Kontokarte, anbieterabhängige Begriffe (Spaces/Speicher), eine einzelne
+  Wurzel ist im Wizard vorausgewählt.
+- [ ] **Manueller Test gegen echte Nextcloud** (z. B. Docker-Image
+  `nextcloud`): Login/Logout, Erstsync, Datei > 50 MiB, Konflikt mit
+  zweitem Client, parallel ein OpenCloud-Job.
+
 ---
 
 ## 4. Meilensteine & Reihenfolge
@@ -438,6 +507,11 @@ vor einem öffentlichen Release rotieren (Instanz sperren oder Passwort
   ETag-basiert, kein Locking in v1; Verhalten dokumentieren.
 - **Keychain auf headless Linux**: Fallback auf `pass`-ähnlichen verschlüsselten
   Datei-Store, wenn kein Secret Service läuft.
+- **Nextcloud, nur aus der Dokumentation umgesetzt** (Phase 10, am echten
+  Server zu prüfen): Benennung der Chunks, Verhalten von `If`/`Overwrite:
+  F` beim `.file`-MOVE und dessen Statuscode bei inzwischen gelöschtem
+  Ziel, ETag-Weitergabe an die Wurzel bei externem Speicher und
+  Gruppenordnern (sonst greift der Root-ETag-Shortcut dort nicht).
 - **GUI-Framework**: egui gewählt; falls Anforderungen (z. B. native File-Dialoge,
   komplexe Virtualisierung) wachsen, ist der GUI-Code isoliert genug, um auf
   iced/Tauri zu wechseln.

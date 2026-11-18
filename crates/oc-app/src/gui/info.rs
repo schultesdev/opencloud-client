@@ -21,6 +21,8 @@ const LICENSE_URL: &str = "https://www.apache.org/licenses/LICENSE-2.0";
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 /// The OpenCloud project this client talks to.
 const OPENCLOUD_URL: &str = "https://opencloud.eu";
+/// The Nextcloud project this client talks to.
+const NEXTCLOUD_URL: &str = "https://nextcloud.com";
 
 impl SyncApp {
     /// The "Info" tab: about the program and where it keeps its files.
@@ -54,7 +56,7 @@ impl SyncApp {
                             ui.label(
                                 egui::RichText::new(
                                     "Synchronisiert Ordner zwischen diesem Rechner und \
-                                     OpenCloud-Spaces.",
+                                     OpenCloud- oder Nextcloud-Servern.",
                                 )
                                 .color(theme.text_dim),
                             );
@@ -108,12 +110,16 @@ impl SyncApp {
                             ui.hyperlink_to(display_url(OPENCLOUD_URL), OPENCLOUD_URL)
                                 .on_hover_text(OPENCLOUD_URL);
                             ui.end_row();
+                            ui.label("Nextcloud");
+                            ui.hyperlink_to(display_url(NEXTCLOUD_URL), NEXTCLOUD_URL)
+                                .on_hover_text(NEXTCLOUD_URL);
+                            ui.end_row();
                         });
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new(
-                            "Ein unabhängiger Sync-Client für OpenCloud, kein offizielles \
-                             Produkt des OpenCloud-Projekts.",
+                            "Ein unabhängiger Sync-Client für OpenCloud und Nextcloud, kein \
+                             offizielles Produkt der beiden Projekte.",
                         )
                         .small()
                         .color(theme.text_dim),

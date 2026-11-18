@@ -26,13 +26,13 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use oc_api::{ApiError, Depth, TokenProvider, WebDavClient};
 use oc_db::Conflict;
 use oc_db::ConflictResolution;
 use oc_db::ConflictStatus;
 use oc_db::EntryState;
 use oc_db::NewEntry;
 use oc_db::StatusDb;
+use oc_storage::{RemoteStorage, StorageError};
 
 use crate::engine::db_lock;
 use crate::engine::local_node_at;
@@ -59,8 +59,8 @@ pub enum ResolveOutcome {
 /// Resolves a pending conflict by row id. `Server` downloads and
 /// overwrites the local file; `Local` uploads and overwrites the server
 /// file, guarded by the conflict's recorded ETag.
-pub async fn resolve<P: TokenProvider>(
-    dav: &WebDavClient<P>,
+pub async fn resolve(
+    storage: &dyn RemoteStorage,
     db: &Mutex<StatusDb>,
     local_root: &Path,
     conflict_id: i64,
@@ -86,10 +86,10 @@ pub async fn resolve<P: TokenProvider>(
     let remote_path = ServerNames::new(db_lock(db).server_names()?).resolve(&conflict.path);
     let outcome = match resolution {
         ConflictResolution::Server => {
-            resolve_server(dav, db, local_root, &conflict, &remote_path, chunk_size).await
+            resolve_server(storage, db, local_root, &conflict, &remote_path, chunk_size).await
         }
         ConflictResolution::Local => {
-            resolve_local(dav, db, local_root, &conflict, &remote_path).await
+            resolve_local(storage, db, local_root, &conflict, &remote_path).await
         }
     }?;
     if outcome == ResolveOutcome::Resolved {
@@ -104,8 +104,8 @@ pub async fn resolve<P: TokenProvider>(
 }
 
 /// Server wins: its current state overwrites the local side.
-async fn resolve_server<P: TokenProvider>(
-    dav: &WebDavClient<P>,
+async fn resolve_server(
+    storage: &dyn RemoteStorage,
     db: &Mutex<StatusDb>,
     local_root: &Path,
     conflict: &Conflict,
@@ -124,7 +124,7 @@ async fn resolve_server<P: TokenProvider>(
             size: conflict.remote_size,
         }
     } else {
-        match current_remote(dav, remote_path).await? {
+        match current_remote(storage, remote_path).await? {
             Some(node) => RemoteNode {
                 is_dir: false,
                 etag: node.etag,
@@ -143,7 +143,7 @@ async fn resolve_server<P: TokenProvider>(
         path: &conflict.path,
         remote_path,
     };
-    match transfer::download(dav, paths, &remote, chunk_size, LocalGuard::Any, None).await? {
+    match transfer::download(storage, paths, &remote, chunk_size, LocalGuard::Any, None).await? {
         TransferResult::Done(meta) => {
             record_resolved(
                 db,
@@ -156,16 +156,18 @@ async fn resolve_server<P: TokenProvider>(
         }
         // Downloads carry no write condition, and `Any` never keeps the
         // local file; neither can happen.
-        TransferResult::PreconditionFailed | TransferResult::LocalChanged => Err(SyncError::Api(
-            ApiError::protocol("download was rejected by a write condition"),
-        )),
+        TransferResult::PreconditionFailed | TransferResult::LocalChanged => {
+            Err(SyncError::Storage(StorageError::protocol(
+                "download was rejected by a write condition",
+            )))
+        }
     }
 }
 
 /// Local wins: the local state overwrites the server side, guarded by
 /// the conflict's recorded ETag.
-async fn resolve_local<P: TokenProvider>(
-    dav: &WebDavClient<P>,
+async fn resolve_local(
+    storage: &dyn RemoteStorage,
     db: &Mutex<StatusDb>,
     local_root: &Path,
     conflict: &Conflict,
@@ -173,10 +175,7 @@ async fn resolve_local<P: TokenProvider>(
 ) -> Result<ResolveOutcome, SyncError> {
     if local_node_at(local_root, &conflict.path)?.is_none() {
         // The local side was deleted: keep the deletion, propagate it.
-        match dav.delete(remote_path).await {
-            Ok(()) | Err(ApiError::NotFound) => {}
-            Err(error) => return Err(SyncError::Api(error)),
-        }
+        storage.delete(remote_path).await?;
         db_lock(db).delete_entry(&conflict.path)?;
         return Ok(ResolveOutcome::Resolved);
     }
@@ -190,7 +189,7 @@ async fn resolve_local<P: TokenProvider>(
         path: &conflict.path,
         remote_path,
     };
-    match transfer::upload(dav, paths, conflict.remote_etag.clone(), create, None).await? {
+    match transfer::upload(storage, paths, conflict.remote_etag.clone(), create, None).await? {
         TransferResult::Done(meta) => {
             record_resolved(
                 db,
@@ -202,7 +201,7 @@ async fn resolve_local<P: TokenProvider>(
             Ok(ResolveOutcome::Resolved)
         }
         // Uploads never report local changes.
-        TransferResult::LocalChanged => Err(SyncError::Api(ApiError::protocol(
+        TransferResult::LocalChanged => Err(SyncError::Storage(StorageError::protocol(
             "upload reported a local change",
         ))),
         // The server changed again: record its current state on the
@@ -210,7 +209,7 @@ async fn resolve_local<P: TokenProvider>(
         // An undeterminable state (failed lookup) keeps the recorded
         // one — it must not read as "deleted remotely".
         TransferResult::PreconditionFailed => {
-            if let Ok(remote) = current_remote(dav, remote_path).await {
+            if let Ok(remote) = current_remote(storage, remote_path).await {
                 let updated = db_lock(db).update_conflict_remote(
                     conflict.id,
                     remote.as_ref().and_then(|node| node.etag.as_deref()),
@@ -258,27 +257,18 @@ fn record_resolved(
 }
 
 /// The current remote state of a path: `Ok(None)` — the path is gone on
-/// the server; `Err` — the state could not be determined (the PROPFIND
+/// the server; `Err` — the state could not be determined (the lookup
 /// failed or returned nothing). `None` must never be guessed from a
 /// failed lookup: the conflict row would read it as "deleted remotely",
 /// and a "server wins" resolution would delete local data on it.
-async fn current_remote<P: TokenProvider>(
-    dav: &WebDavClient<P>,
+async fn current_remote(
+    storage: &dyn RemoteStorage,
     path: &str,
 ) -> Result<Option<RemoteNode>, SyncError> {
-    match dav.propfind(path, Depth::Zero).await {
-        Ok(resources) => resources
-            .first()
-            .map(RemoteNode::from_resource)
-            .map(Some)
-            .ok_or_else(|| {
-                SyncError::Api(ApiError::protocol(format!(
-                    "'{path}' reported no current state"
-                )))
-            }),
-        Err(ApiError::NotFound) => Ok(None),
-        Err(source) => Err(SyncError::Api(source)),
-    }
+    Ok(storage
+        .stat(path)
+        .await?
+        .map(|entry| RemoteNode::from_entry(&entry)))
 }
 
 /// Removes the local file of a resolved conflict (read-only attributes

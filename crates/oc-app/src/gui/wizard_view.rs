@@ -51,7 +51,8 @@ impl SyncApp {
                                 ui.add_space(8.0);
                                 theme::card().show(ui, |ui| {
                                     ui.set_width(ui.available_width());
-                                    theme::step(ui, 2, "Space");
+                                    let terms = self.root_terms(&account_id);
+                                    theme::step(ui, 2, terms.one);
                                     self.show_wizard_space(ui, &mut wizard, &account_id);
                                 });
                             }
@@ -127,8 +128,8 @@ impl SyncApp {
                                         } else {
                                             ui.label(
                                                 egui::RichText::new(
-                                                    "Konto, Space und lokales Verzeichnis \
-                                                 auswählen…",
+                                                    "Konto, Speicherort und lokales \
+                                                     Verzeichnis auswählen…",
                                                 )
                                                 .small()
                                                 .color(theme.text_dim),
@@ -195,8 +196,7 @@ impl SyncApp {
                 }
             });
         if choice != selected {
-            wizard.account_id = choice;
-            wizard.reset_space(None);
+            wizard.select_account(choice);
         }
         if accounts.is_empty() {
             ui.label(
@@ -207,9 +207,10 @@ impl SyncApp {
         }
     }
 
-    /// Wizard step 2: the space. The list comes from the account's
-    /// already loaded spaces when available, otherwise it is requested
-    /// automatically (Graph API) — no extra click needed.
+    /// Wizard step 2: the space (OpenCloud) or storage (Nextcloud). The
+    /// list comes from the account's already loaded roots when available,
+    /// otherwise it is requested automatically — no extra click needed; a
+    /// single root is selected right away.
     pub(super) fn show_wizard_space(
         &mut self,
         ui: &mut egui::Ui,
@@ -217,6 +218,7 @@ impl SyncApp {
         account_id: &str,
     ) {
         let theme = theme::palette();
+        let terms = self.root_terms(account_id);
         let account = self.accounts.get(account_id);
         let logged_in = account.and_then(|state| state.logged_in) == Some(true);
         if !logged_in {
@@ -231,9 +233,12 @@ impl SyncApp {
         }
         if let Some(error) = wizard.spaces.error.clone() {
             ui.label(
-                egui::RichText::new(format!("Spaces konnten nicht geladen werden: {error}"))
-                    .small()
-                    .color(theme.error),
+                egui::RichText::new(format!(
+                    "{} konnten nicht geladen werden: {error}",
+                    terms.many
+                ))
+                .small()
+                .color(theme.error),
             );
             if theme::quiet(ui, "Erneut versuchen").clicked() {
                 wizard.spaces.error = None;
@@ -261,7 +266,7 @@ impl SyncApp {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(
-                    egui::RichText::new("Lade Spaces…")
+                    egui::RichText::new(format!("Lade {}…", terms.many))
                         .small()
                         .color(theme.text_dim),
                 );
@@ -273,7 +278,7 @@ impl SyncApp {
         };
         if spaces.is_empty() {
             ui.label(
-                egui::RichText::new("Keine Spaces verfügbar.")
+                egui::RichText::new(format!("Keine {} verfügbar.", terms.many))
                     .small()
                     .color(theme.text_dim),
             );
@@ -281,6 +286,12 @@ impl SyncApp {
         }
         let selected_id = wizard.space_id.clone();
         let mut selected = selected_id.clone();
+        // A single root (always the case for Nextcloud) needs no choice.
+        if selected.is_none()
+            && let [only] = spaces.as_slice()
+        {
+            selected = Some(only.id.clone());
+        }
         Grid::new("wizard-spaces")
             .num_columns(3)
             .spacing(egui::Vec2::new(14.0, 6.0))
@@ -298,7 +309,7 @@ impl SyncApp {
                     }
                     theme::chip(theme.card_stroke).show(ui, |ui| {
                         ui.label(
-                            egui::RichText::new(&space.drive_type)
+                            egui::RichText::new(&space.kind)
                                 .small()
                                 .color(theme.text_dim),
                         );
@@ -425,7 +436,7 @@ impl SyncApp {
         &mut self,
         ui: &mut egui::Ui,
         wizard: &mut Wizard,
-        resource: &oc_api::DavResource,
+        resource: &oc_storage::RemoteEntry,
         depth: usize,
         account_id: &str,
         space_id: &str,

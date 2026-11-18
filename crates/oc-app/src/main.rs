@@ -1,4 +1,4 @@
-//! OpenCloud sync client application.
+//! OpenCloud/Nextcloud sync client application.
 //!
 //! Binary crate: GUI, tray icon, and `main()`. The sync engine is attached
 //! via the event/command channels (see `oc-sync`) so that it can run without
@@ -12,23 +12,27 @@
 mod assets;
 mod gui;
 mod logging;
+mod provider;
 mod updates;
 
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use oc_auth::{AuthClient, DEFAULT_LOGIN_TIMEOUT, KeyringStore, TokenManager};
+use oc_auth::DEFAULT_LOGIN_TIMEOUT;
 use oc_config::Account;
 use oc_config::LogLevel;
 use oc_db::{StatusDb, db_path};
 
-/// OpenCloud sync client.
+/// OpenCloud/Nextcloud sync client.
 #[derive(Debug, Parser)]
-#[command(name = "opencloud-sync", version, about = "Sync client for OpenCloud")]
+#[command(
+    name = "opencloud-sync",
+    version,
+    about = "Sync client for OpenCloud and Nextcloud"
+)]
 #[command(group(
     clap::ArgGroup::new("mode")
         .args(["login", "logout", "list_spaces", "conflicts", "resolve", "status", "sync_once"])
@@ -40,14 +44,15 @@ struct Args {
     headless: bool,
 
     /// Interactive login for an account from config.json: opens the
-    /// browser (OIDC code flow + PKCE) and stores the refresh token in
-    /// the OS keyring. Exits afterwards; combine with --headless to log
-    /// in and start the engine in one call.
+    /// browser (OpenCloud: OIDC code flow + PKCE; Nextcloud: Login Flow
+    /// v2) and stores the refresh token or app password in the OS
+    /// keyring. Exits afterwards; combine with --headless to log in and
+    /// start the engine in one call.
     #[arg(long, value_name = "ACCOUNT_ID")]
     login: Option<String>,
 
-    /// Logs an account out: revokes its refresh token at the server (best
-    /// effort) and removes it from the OS keyring.
+    /// Logs an account out: revokes its refresh token or app password at
+    /// the server (best effort) and removes it from the OS keyring.
     #[arg(long, value_name = "ACCOUNT_ID")]
     logout: Option<String>,
 
@@ -61,8 +66,9 @@ struct Args {
     #[arg(long)]
     sync_once: bool,
 
-    /// Lists the spaces of the account via the Graph API and prints id,
-    /// type, and name of each space. Requires a prior `--login`.
+    /// Lists the syncable roots of the account (OpenCloud: its spaces;
+    /// Nextcloud: the user's files) with id, type, and name; the id goes
+    /// into a job's `space_id`. Requires a prior `--login`.
     #[arg(long, value_name = "ACCOUNT_ID")]
     list_spaces: Option<String>,
 
@@ -172,16 +178,14 @@ async fn run_login(
     config_dir: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn Error>> {
     let account = find_account(config_dir, account_id)?;
-
-    let auth = AuthClient::new(&account.server_url)?;
-    let manager = TokenManager::new(auth, KeyringStore::new(), &account.id);
+    let provider = provider::create(&account)?;
     println!(
         "opening browser for login at {} (account '{}')",
         account.server_url, account.id
     );
-    manager.login(true, DEFAULT_LOGIN_TIMEOUT).await?;
+    provider.login(true, DEFAULT_LOGIN_TIMEOUT).await?;
     println!(
-        "login complete; refresh token stored for account '{}'",
+        "login complete; credentials stored for account '{}'",
         account.id
     );
     Ok(())
@@ -193,9 +197,7 @@ async fn run_logout(
     config_dir: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn Error>> {
     let account = find_account(config_dir, account_id)?;
-    let auth = AuthClient::new(&account.server_url)?;
-    let manager = TokenManager::new(auth, KeyringStore::new(), &account.id);
-    manager.logout().await?;
+    provider::create(&account)?.logout().await?;
     println!("account '{}' logged out", account.id);
     Ok(())
 }
@@ -209,9 +211,7 @@ fn run_status(config_dir: Option<&std::path::Path>) -> Result<(), Box<dyn Error>
     }
     let mut logins: HashMap<&str, bool> = HashMap::new();
     for account in &config.accounts {
-        let logged_in = AuthClient::new(&account.server_url)
-            .map(|auth| TokenManager::new(auth, KeyringStore::new(), &account.id))
-            .is_ok_and(|manager| manager.has_stored_login());
+        let logged_in = provider::create(account).is_ok_and(|provider| provider.has_stored_login());
         logins.insert(account.id.as_str(), logged_in);
     }
     for job in &jobs.jobs {
@@ -249,29 +249,26 @@ fn run_status(config_dir: Option<&std::path::Path>) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-/// Lists the spaces of the logged-in account via the Graph API
-/// (`GET /graph/v1.0/me/drives`).
+/// Lists the syncable roots of the logged-in account (OpenCloud: its
+/// spaces via the Graph API).
 async fn run_list_spaces(
     account_id: &str,
     config_dir: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn Error>> {
     let account = find_account(config_dir, account_id)?;
-
-    let auth = AuthClient::new(&account.server_url)?;
-    let manager = TokenManager::new(auth, KeyringStore::new(), &account.id);
-    if !manager.has_stored_login() {
+    let provider = provider::create(&account)?;
+    if !provider.has_stored_login() {
         return Err(
             format!("account '{account_id}' has no stored login (run --login first)").into(),
         );
     }
-    let graph = oc_api::GraphClient::new(&account.server_url, manager)?;
-    let spaces = graph.list_spaces().await?;
-    if spaces.is_empty() {
+    let roots = provider.roots().await?;
+    if roots.is_empty() {
         println!("no spaces found for account '{}'", account.id);
         return Ok(());
     }
-    for space in &spaces {
-        println!("{:<40} {:<10} {}", space.id, space.drive_type, space.name);
+    for root in &roots {
+        println!("{:<40} {:<10} {}", root.id, root.kind, root.name);
     }
     Ok(())
 }
@@ -429,20 +426,19 @@ async fn run_resolve(
                 job.id, job.account_id
             )
         })?;
-    let auth = AuthClient::new(&account.server_url)?;
-    let manager = TokenManager::new(auth, KeyringStore::new(), &account.id);
-    if !manager.has_stored_login() {
+    let provider = provider::create(account)?;
+    if !provider.has_stored_login() {
         return Err(format!(
             "account '{}' has no stored login (log in first with --login)",
             account.id
         )
         .into());
     }
-    let dav = oc_api::WebDavClient::new(&account.server_url, &job.space_id, manager)?;
+    let storage = provider.storage(&job.space_id)?;
 
     let chunk_size = oc_sync::EngineOptions::default().download_chunk_size;
     let outcome = oc_sync::resolve(
-        &dav,
+        storage.as_ref(),
         &std::sync::Mutex::new(db),
         &job.local_path,
         conflict_id,
@@ -495,9 +491,9 @@ async fn run_headless(
         overlapping.insert(a.id.clone(), b.id.clone());
         overlapping.insert(b.id.clone(), a.id.clone());
     }
-    // One token manager per account, shared by its jobs: separate
+    // One provider per account, shared by its jobs: separate token
     // managers would refresh with the same (rotating) refresh token.
-    let mut managers: HashMap<String, Arc<TokenManager<KeyringStore>>> = HashMap::new();
+    let providers = provider::Providers::default();
     let mut engine_jobs = Vec::new();
     for job in &enabled.jobs {
         if let Some(other) = overlapping.get(&job.id) {
@@ -517,23 +513,15 @@ async fn run_headless(
                 continue;
             }
         };
-        let manager = match managers.get(&account.id) {
-            Some(manager) => manager.clone(),
-            None => {
-                let auth = AuthClient::new(&account.server_url)?;
-                let manager = Arc::new(TokenManager::new(auth, KeyringStore::new(), &account.id));
-                managers.insert(account.id.clone(), manager.clone());
-                manager
-            }
-        };
-        if !manager.has_stored_login() {
+        let provider = providers.get(account)?;
+        if !provider.has_stored_login() {
             eprintln!(
                 "skipping job '{}': account '{}' has no stored login (log in first)",
                 job.id, account.id
             );
             continue;
         }
-        let dav = oc_api::WebDavClient::new(&account.server_url, &job.space_id, manager)?;
+        let storage = provider.storage(&job.space_id)?;
         let db = StatusDb::open(db_path(&config_dir, &job.id)?)?;
         if db.ensure_identity(&job.identity())? {
             eprintln!(
@@ -547,7 +535,7 @@ async fn run_headless(
             &job.include,
             &job.exclude,
             job.sync_root_files,
-            dav,
+            storage,
             db,
         )?);
     }

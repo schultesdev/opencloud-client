@@ -1,9 +1,11 @@
-//! Shared HTTP plumbing for the Graph and WebDAV clients: bearer
-//! authentication, forced refresh after 401, status classification, and
-//! retries with exponential backoff (honoring `Retry-After`).
+//! Shared HTTP plumbing for the Graph and WebDAV clients: authentication
+//! (bearer or Basic, set centrally), forced refresh after 401, status
+//! classification, retries with exponential backoff (honoring
+//! `Retry-After`), and the idle watchdog of uploads.
 
 use std::fmt;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use reqwest::{RequestBuilder, Response, StatusCode};
 use url::Url;
@@ -21,12 +23,18 @@ pub const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 /// Timeout for establishing a connection.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Builds an HTTP client with the given transfer idle timeout.
-fn build_client(transfer_idle: Duration) -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(transfer_idle)
-        .build()
+/// Builds an HTTP client with the given transfer idle timeout. Without
+/// one, the client serves uploads: reqwest's read timeout runs from
+/// sending until the response headers arrive and is not reset while the
+/// request body streams, so it would cut off any upload that takes
+/// longer than the timeout. Uploads are guarded by [`Activity`] instead.
+fn build_client(transfer_idle: Option<Duration>) -> Result<reqwest::Client, reqwest::Error> {
+    let builder = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT);
+    match transfer_idle {
+        Some(idle) => builder.read_timeout(idle),
+        None => builder,
+    }
+    .build()
 }
 
 /// The HTTP client shared by all API clients with default timeouts — one
@@ -36,13 +44,96 @@ fn shared_client() -> Result<reqwest::Client, ApiError> {
     if let Some(client) = SHARED.get() {
         return Ok(client.clone());
     }
-    let client = build_client(DEFAULT_TRANSFER_TIMEOUT)?;
+    let client = build_client(Some(DEFAULT_TRANSFER_TIMEOUT))?;
     Ok(SHARED.get_or_init(|| client).clone())
 }
+
+/// The shared client for uploads (no read timeout, see [`build_client`]).
+fn shared_upload_client() -> Result<reqwest::Client, ApiError> {
+    static SHARED: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = SHARED.get() {
+        return Ok(client.clone());
+    }
+    let client = build_client(None)?;
+    Ok(SHARED.get_or_init(|| client).clone())
+}
+
 /// Longest `Retry-After` hint the clients wait for inside one call; a
 /// server asking for more gets the error back, and the engine's next
 /// pass (or offline backoff) retries later instead of blocking a task.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// How much longer than the idle timeout an upload may wait for its
+/// answer once the whole body was handed to the network stack: the
+/// kernel's send buffer (several MiB) still drains over a slow line
+/// without any progress the client could observe, and the server may
+/// need time to store or assemble the file.
+const ANSWER_WAIT_FACTOR: u32 = 5;
+
+/// Progress state of one upload attempt; the watchdog of
+/// [`AuthedHttp::send_upload`] aborts the attempt once no data moved for
+/// the transfer idle timeout while the body streams, or for
+/// [`ANSWER_WAIT_FACTOR`] times that after it was sent.
+#[derive(Debug, Clone)]
+pub(crate) struct Activity(Arc<Mutex<ActivityState>>);
+
+/// See [`Activity`].
+#[derive(Debug, Clone, Copy)]
+struct ActivityState {
+    /// Last progress.
+    last: Instant,
+    /// Whether the whole body was handed off.
+    body_sent: bool,
+}
+
+impl Activity {
+    /// A fresh tracker, active now.
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(ActivityState {
+            last: Instant::now(),
+            body_sent: false,
+        })))
+    }
+
+    fn update(&self, change: impl FnOnce(&mut ActivityState)) -> ActivityState {
+        let mut state = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        change(&mut state);
+        *state
+    }
+
+    /// Starts a new attempt: active now, body not yet sent.
+    fn restart(&self) {
+        self.update(|state| {
+            state.last = Instant::now();
+            state.body_sent = false;
+        });
+    }
+
+    /// Records body progress: `sent` of `total` bytes.
+    pub fn progress(&self, sent: u64, total: u64) {
+        self.update(|state| {
+            state.last = Instant::now();
+            state.body_sent = sent >= total;
+        });
+    }
+
+    /// Resolves once nothing happened for the applicable limit.
+    async fn stalled(&self, idle: Duration) -> ApiError {
+        loop {
+            let state = self.update(|_| {});
+            let limit = if state.body_sent {
+                idle * ANSWER_WAIT_FACTOR
+            } else {
+                idle
+            };
+            let quiet = state.last.elapsed();
+            if quiet >= limit {
+                return ApiError::Stalled { idle: limit };
+            }
+            tokio::time::sleep(limit - quiet).await;
+        }
+    }
+}
 
 /// Whether a request may be sent again after a failure that leaves open
 /// whether the server already applied it (5xx, timeout, broken
@@ -64,6 +155,7 @@ pub(crate) enum Replay {
 /// HTTP core shared by [`crate::GraphClient`] and [`crate::WebDavClient`].
 pub(crate) struct AuthedHttp<P> {
     http: reqwest::Client,
+    upload_http: reqwest::Client,
     token: P,
     /// Retry policy applied to every request.
     pub retry: RetryConfig,
@@ -76,6 +168,7 @@ impl<P: TokenProvider> AuthedHttp<P> {
     pub fn new(token: P) -> Result<Self, ApiError> {
         Ok(Self {
             http: shared_client()?,
+            upload_http: shared_upload_client()?,
             token,
             retry: RetryConfig::default(),
             request_timeout: DEFAULT_TIMEOUT,
@@ -95,7 +188,7 @@ impl<P: TokenProvider> AuthedHttp<P> {
     pub fn with_timeouts(mut self, request: Duration, transfer: Duration) -> Self {
         self.request_timeout = request;
         if transfer != self.transfer_timeout
-            && let Ok(http) = build_client(transfer)
+            && let Ok(http) = build_client(Some(transfer))
         {
             self.http = http;
             self.transfer_timeout = transfer;
@@ -108,13 +201,19 @@ impl<P: TokenProvider> AuthedHttp<P> {
         &self.http
     }
 
+    /// The client for requests with a streamed body (uploads); use it
+    /// with [`AuthedHttp::send_upload`].
+    pub fn upload_http(&self) -> &reqwest::Client {
+        &self.upload_http
+    }
+
     /// Timeout for metadata requests.
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
 
-    /// Sends a request built by `build`, which receives the current bearer
-    /// token and is called once per attempt; `timeout` (a limit on the
+    /// Sends a request built by `build`, which is called once per attempt
+    /// (the `Authorization` header is added here); `timeout` (a limit on the
     /// whole request) is applied to every attempt — `None` for transfers,
     /// which are bounded by the client's idle timeout instead.
     ///
@@ -128,13 +227,50 @@ impl<P: TokenProvider> AuthedHttp<P> {
         &self,
         timeout: Option<Duration>,
         replay: Replay,
-        build: impl Fn(&str) -> RequestBuilder,
+        build: impl Fn() -> RequestBuilder,
+    ) -> Result<Response, ApiError> {
+        self.send_with(timeout, None, replay, build).await
+    }
+
+    /// Like [`AuthedHttp::send`] for uploads built on
+    /// [`AuthedHttp::upload_http`]: an attempt fails with
+    /// [`ApiError::Stalled`] once `activity` (fed by the body stream)
+    /// reports no progress for the transfer idle timeout while sending,
+    /// or for a multiple of it while waiting for the answer afterwards
+    /// (see [`Activity`]). There is no limit on the total duration.
+    pub async fn send_upload(
+        &self,
+        activity: &Activity,
+        replay: Replay,
+        build: impl Fn() -> RequestBuilder,
+    ) -> Result<Response, ApiError> {
+        self.send_with(None, Some(activity), replay, build).await
+    }
+
+    /// Shared retry loop of [`AuthedHttp::send`] and
+    /// [`AuthedHttp::send_upload`].
+    async fn send_with(
+        &self,
+        timeout: Option<Duration>,
+        watch: Option<&Activity>,
+        replay: Replay,
+        build: impl Fn() -> RequestBuilder,
     ) -> Result<Response, ApiError> {
         let max_attempts = self.retry.max_attempts.max(1);
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let (error, hint) = match self.attempt(timeout, &build).await {
+            let outcome = match watch {
+                None => self.attempt(timeout, &build).await,
+                Some(activity) => {
+                    activity.restart();
+                    tokio::select! {
+                        outcome = self.attempt(timeout, &build) => outcome,
+                        stalled = activity.stalled(self.transfer_timeout) => Err(stalled),
+                    }
+                }
+            };
+            let (error, hint) = match outcome {
                 Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response) => {
                     let status = response.status();
@@ -169,19 +305,20 @@ impl<P: TokenProvider> AuthedHttp<P> {
     async fn attempt(
         &self,
         timeout: Option<Duration>,
-        build: &impl Fn(&str) -> RequestBuilder,
+        build: &impl Fn() -> RequestBuilder,
     ) -> Result<Response, ApiError> {
         let limited = |request: RequestBuilder| match timeout {
             Some(timeout) => request.timeout(timeout),
             None => request,
         };
+        let scheme = self.token.scheme();
         let token = self.token.access_token().await?;
-        let response = limited(build(&token)).send().await?;
+        let response = limited(scheme.apply(build(), &token)).send().await?;
         if response.status() != StatusCode::UNAUTHORIZED {
             return Ok(response);
         }
         let refreshed = self.token.refresh(&token).await?;
-        Ok(limited(build(&refreshed)).send().await?)
+        Ok(limited(scheme.apply(build(), &refreshed)).send().await?)
     }
 }
 

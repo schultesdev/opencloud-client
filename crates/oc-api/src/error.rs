@@ -19,6 +19,13 @@ pub enum ApiError {
     /// Transport-level failure: DNS, connect, timeout, TLS, broken body.
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
+    /// An upload made no progress for the transfer idle timeout (body
+    /// stalled, or no answer after it was sent).
+    #[error("network error: no data transferred for {idle:?}")]
+    Stalled {
+        /// The idle timeout that elapsed.
+        idle: Duration,
+    },
     /// A URL could not be parsed or built.
     #[error("invalid URL '{url}': {reason}")]
     InvalidUrl {
@@ -136,7 +143,10 @@ impl ApiError {
     /// timeouts (408) are considered transient.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Network(_) | Self::Server { .. } | Self::RateLimited { .. } => true,
+            Self::Network(_)
+            | Self::Stalled { .. }
+            | Self::Server { .. }
+            | Self::RateLimited { .. } => true,
             Self::Status { code } => *code == 408 || *code == 425,
             // The token endpoint could not be reached; nothing was sent.
             Self::Auth(AuthError::Http(_)) => true,
@@ -179,6 +189,47 @@ impl ApiError {
         match self {
             Self::RateLimited { retry_after } => *retry_after,
             _ => None,
+        }
+    }
+}
+
+impl From<ApiError> for oc_storage::StorageError {
+    /// Maps the HTTP-level error onto the provider-neutral model; 429 and
+    /// 425 become [`oc_storage::StorageError::Throttled`].
+    fn from(error: ApiError) -> Self {
+        use oc_storage::StorageError as S;
+        let connectivity = error.is_connectivity();
+        match error {
+            ApiError::Network(source) => S::Network {
+                message: source.to_string(),
+                connectivity,
+            },
+            stalled @ ApiError::Stalled { .. } => S::Network {
+                message: stalled.to_string(),
+                connectivity: false,
+            },
+            ApiError::Auth(source) => S::Auth {
+                message: source.to_string(),
+                connectivity,
+            },
+            ApiError::InvalidUrl { url, reason } => S::InvalidUrl { url, reason },
+            ApiError::InvalidPath { path, reason } => S::InvalidPath { path, reason },
+            ApiError::Unauthorized => S::Unauthorized,
+            ApiError::Forbidden => S::Forbidden,
+            ApiError::NotFound => S::NotFound,
+            ApiError::PreconditionFailed => S::PreconditionFailed,
+            ApiError::Locked => S::Locked,
+            ApiError::RateLimited { retry_after } => S::Throttled {
+                code: 429,
+                retry_after,
+            },
+            ApiError::Status { code: 425 } => S::Throttled {
+                code: 425,
+                retry_after: None,
+            },
+            ApiError::Server { code } => S::Server { code },
+            ApiError::Status { code } => S::Status { code },
+            ApiError::Protocol(message) => S::Protocol(message),
         }
     }
 }
@@ -266,5 +317,34 @@ mod tests {
         assert!(ApiError::Server { code: 502 }.is_retryable());
         assert!(ApiError::Status { code: 408 }.is_retryable());
         assert!(!ApiError::Status { code: 400 }.is_retryable());
+    }
+
+    #[test]
+    fn storage_error_mapping_keeps_the_classification() {
+        use oc_storage::StorageError;
+        let throttled = StorageError::from(ApiError::Status { code: 425 });
+        assert!(throttled.is_throttled());
+        let limited = StorageError::from(ApiError::RateLimited {
+            retry_after: Some(Duration::from_secs(3)),
+        });
+        assert_eq!(
+            limited,
+            StorageError::Throttled {
+                code: 429,
+                retry_after: Some(Duration::from_secs(3))
+            }
+        );
+        assert_eq!(
+            StorageError::from(ApiError::Server { code: 507 }),
+            StorageError::Server { code: 507 }
+        );
+        assert_eq!(
+            StorageError::from(ApiError::Status { code: 405 }),
+            StorageError::Status { code: 405 }
+        );
+        assert_eq!(
+            StorageError::from(ApiError::PreconditionFailed),
+            StorageError::PreconditionFailed
+        );
     }
 }

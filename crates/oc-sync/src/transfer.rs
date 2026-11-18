@@ -5,7 +5,9 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-use oc_api::{ApiError, Depth, TokenProvider, WebDavClient, WriteCondition};
+use std::sync::Arc;
+
+use oc_storage::{ByteRange, Download, RemoteStorage, StorageError, WriteCondition};
 
 use crate::error::SyncError;
 use crate::progress::TransferHandle;
@@ -104,8 +106,8 @@ impl LocalGuard {
 /// checks that the local file was not changed in the meantime; if it was,
 /// the download is discarded ([`TransferResult::LocalChanged`]).
 /// `progress` receives chunk-granular byte counts.
-pub async fn download<P: TokenProvider>(
-    dav: &WebDavClient<P>,
+pub async fn download(
+    storage: &dyn RemoteStorage,
     paths: TransferPaths<'_>,
     remote: &RemoteNode,
     chunk_size: u64,
@@ -123,12 +125,18 @@ pub async fn download<P: TokenProvider>(
         .filter(|size| *size >= 0)
         .map(|size| size as u64);
     let landed = match size {
-        Some(size) if chunk_size > 0 && size > chunk_size => {
-            chunked_download(dav, remote_path, &target, size, chunk_size, guard, progress)
-                .await?
-                .map(|(etag, local)| (etag, local, Some(size as i64)))
-        }
-        _ => whole_download(dav, root, remote_path, remote, &target, guard, progress)
+        Some(size) if chunk_size > 0 && size > chunk_size => chunked_download(
+            storage,
+            remote_path,
+            &target,
+            size,
+            chunk_size,
+            guard,
+            progress,
+        )
+        .await?
+        .map(|(etag, local)| (etag, local, Some(size as i64))),
+        _ => whole_download(storage, root, remote_path, remote, &target, guard, progress)
             .await?
             .map(|(etag, local)| {
                 let remote_size = local.size;
@@ -150,8 +158,8 @@ pub async fn download<P: TokenProvider>(
 type Landed = Option<(Option<String>, LocalNode)>;
 
 /// Single-request download of a file of unknown or small size.
-async fn whole_download<P: TokenProvider>(
-    dav: &WebDavClient<P>,
+async fn whole_download(
+    storage: &dyn RemoteStorage,
     root: &Path,
     path: &str,
     remote: &RemoteNode,
@@ -159,10 +167,10 @@ async fn whole_download<P: TokenProvider>(
     guard: LocalGuard,
     progress: Option<&TransferHandle>,
 ) -> Result<Landed, SyncError> {
-    let response = dav.get(path).await?;
-    let etag = etag_of(&response).or_else(|| remote.etag.clone());
+    let download = storage.download(path, None, None).await?;
+    let etag = download.etag.clone().or_else(|| remote.etag.clone());
     let part = part_file(target);
-    stream_to_part(response, &part, progress).await?;
+    stream_to_part(download, &part, progress).await?;
     let (part, final_target) = (part, target.to_path_buf());
     let local = tokio::task::spawn_blocking(move || finish_atomic(&part, &final_target, guard))
         .await
@@ -170,11 +178,11 @@ async fn whole_download<P: TokenProvider>(
     Ok(local.map(|local| (etag, local)))
 }
 
-/// Streams a response body into a fresh `.part` file (parent folders are
+/// Streams a download body into a fresh `.part` file (parent folders are
 /// created) without holding it in memory; reports the received bytes to
 /// `progress`. A failed transfer removes the incomplete part file.
 async fn stream_to_part(
-    mut response: reqwest::Response,
+    mut download: Download,
     part: &Path,
     progress: Option<&TransferHandle>,
 ) -> Result<u64, SyncError> {
@@ -187,7 +195,7 @@ async fn stream_to_part(
         let mut file = tokio::fs::File::create(part)
             .await
             .map_err(|source| SyncError::io(part, source))?;
-        stream_body(&mut response, &mut file, part, 0, progress).await
+        stream_body(&mut download, &mut file, part, 0, progress).await
     }
     .await;
     if result.is_err() {
@@ -196,11 +204,11 @@ async fn stream_to_part(
     result
 }
 
-/// Streams a response body into `file` (open at `part`, already holding
+/// Streams a download body into `file` (open at `part`, already holding
 /// `base` bytes), reporting `base + received` to `progress` after every
 /// network chunk; flushes and returns the new length.
 async fn stream_body(
-    response: &mut reqwest::Response,
+    download: &mut Download,
     file: &mut tokio::fs::File,
     part: &Path,
     base: u64,
@@ -208,7 +216,7 @@ async fn stream_body(
 ) -> Result<u64, SyncError> {
     use tokio::io::AsyncWriteExt;
     let mut length = base;
-    while let Some(chunk) = response.chunk().await.map_err(ApiError::from)? {
+    while let Some(chunk) = download.chunk().await? {
         file.write_all(&chunk)
             .await
             .map_err(|source| SyncError::io(part, source))?;
@@ -225,10 +233,9 @@ async fn stream_body(
 
 /// Chunked download: repeated `Range` GETs, each streamed onto the end of
 /// the `.part` file, until the reported size is reached. A server that
-/// ignores the `Range` header (HTTP 200 with the whole body) is handled
-/// gracefully. Progress is reported per network chunk, not per range.
-async fn chunked_download<P: TokenProvider>(
-    dav: &WebDavClient<P>,
+/// ignores the range (sends the whole body) is handled gracefully. Progress is reported per network chunk, not per range.
+async fn chunked_download(
+    storage: &dyn RemoteStorage,
     path: &str,
     target: &Path,
     size: u64,
@@ -251,20 +258,26 @@ async fn chunked_download<P: TokenProvider>(
     let mut offset = 0u64;
     while offset < size {
         let end = (offset + chunk_size - 1).min(size - 1);
-        let response = dav.get_range(path, offset, end, etag.as_deref()).await?;
-        match (&etag, etag_of(&response)) {
+        let download = storage
+            .download(
+                path,
+                Some(ByteRange { start: offset, end }),
+                etag.as_deref(),
+            )
+            .await?;
+        match (&etag, download.etag.clone()) {
             (None, first) => etag = first,
             (Some(expected), Some(current)) if *expected != current => {
-                return Err(SyncError::Api(ApiError::protocol(format!(
+                return Err(SyncError::Storage(StorageError::protocol(format!(
                     "'{path}' changed on the server during the download; retrying next pass"
                 ))));
             }
             _ => {}
         }
-        if response.status() == reqwest::StatusCode::OK {
+        if !download.partial {
             // The server ignored the range and sends the whole body:
             // stream it into a fresh part file.
-            stream_to_part(response, &part, progress).await?;
+            stream_to_part(download, &part, progress).await?;
             let (part, whole_target) = (part.clone(), target.to_path_buf());
             let local =
                 tokio::task::spawn_blocking(move || finish_atomic(&part, &whole_target, guard))
@@ -274,22 +287,22 @@ async fn chunked_download<P: TokenProvider>(
         }
         // Opened per range (not held across the loop) so the HTTP-200
         // fallback above can start a fresh part file.
-        let mut response = response;
+        let mut download = download;
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&part)
             .await
             .map_err(|source| SyncError::io(&part, source))?;
-        let written = stream_body(&mut response, &mut file, &part, offset, progress).await?;
+        let written = stream_body(&mut download, &mut file, &part, offset, progress).await?;
         drop(file);
         if written == offset {
-            return Err(SyncError::Api(ApiError::protocol(format!(
+            return Err(SyncError::Storage(StorageError::protocol(format!(
                 "empty range response for '{path}' at offset {offset}"
             ))));
         }
         if written > size {
-            return Err(SyncError::Api(ApiError::protocol(format!(
+            return Err(SyncError::Storage(StorageError::protocol(format!(
                 "download of '{path}' delivered {written} bytes, expected {size}"
             ))));
         }
@@ -301,7 +314,7 @@ async fn chunked_download<P: TokenProvider>(
         .map(|meta| meta.len())
         .map_err(|source| SyncError::io(&part, source))?;
     if actual != size {
-        return Err(SyncError::Api(ApiError::protocol(format!(
+        return Err(SyncError::Storage(StorageError::protocol(format!(
             "download of '{path}' yielded {actual} bytes, expected {size}"
         ))));
     }
@@ -314,11 +327,11 @@ async fn chunked_download<P: TokenProvider>(
 
 /// Uploads `path` to the server. `base_etag` guards against concurrent
 /// remote changes (`If-Match`); `create` marks a new file
-/// (`If-None-Match: *`). Without an ETag in the PUT response the file is
-/// PROPFINDed once to learn its new ETag. While the body streams,
+/// (create-only). Without an ETag in the upload response the file is
+/// looked up once to learn its new ETag. While the body streams,
 /// `progress` receives byte-granular counts of the current attempt.
-pub async fn upload<P: TokenProvider>(
-    dav: &WebDavClient<P>,
+pub async fn upload(
+    storage: &dyn RemoteStorage,
     paths: TransferPaths<'_>,
     base_etag: Option<String>,
     create: bool,
@@ -342,26 +355,31 @@ pub async fn upload<P: TokenProvider>(
         base_etag.map(|etag| WriteCondition::IfMatch { etag })
     };
     let reporting = progress.cloned();
-    let response = dav
-        .put_file(remote_path, &source, length, condition, move |bytes| {
-            if let Some(handle) = &reporting {
-                handle.report(bytes);
-            }
-        })
+    let response = storage
+        .upload(
+            remote_path,
+            &source,
+            length,
+            condition,
+            Arc::new(move |bytes| {
+                if let Some(handle) = &reporting {
+                    handle.report(bytes);
+                }
+            }),
+        )
         .await;
     match response {
-        Err(ApiError::PreconditionFailed) => Ok(TransferResult::PreconditionFailed),
-        Err(source) => Err(SyncError::Api(source)),
+        Err(StorageError::PreconditionFailed) => Ok(TransferResult::PreconditionFailed),
+        Err(source) => Err(SyncError::Storage(source)),
         Ok(etag) => {
             let etag = match etag {
                 Some(etag) => Some(etag),
-                None => dav
-                    .propfind(remote_path, Depth::Zero)
+                None => storage
+                    .stat(remote_path)
                     .await
                     .ok()
-                    .and_then(|resources| {
-                        resources.first().and_then(|resource| resource.etag.clone())
-                    }),
+                    .flatten()
+                    .and_then(|entry| entry.etag),
             };
             Ok(TransferResult::Done(TransferMeta {
                 local,
@@ -430,15 +448,6 @@ fn part_file(target: &Path) -> PathBuf {
         .unwrap_or_default();
     name.push_str(".part");
     target.with_file_name(name)
-}
-
-/// The `ETag` header of a response, if the server reports one.
-fn etag_of(response: &reqwest::Response) -> Option<String> {
-    response
-        .headers()
-        .get(reqwest::header::ETAG)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
 }
 
 /// Clears the read-only flag if set: on Unix by setting the owner write

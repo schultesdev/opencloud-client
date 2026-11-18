@@ -567,6 +567,54 @@ async fn persistent_unauthorized_surfaces_after_refresh() {
     assert!(matches!(err, ApiError::Unauthorized));
 }
 
+/// App-password provider: HTTP Basic, and a rejected password is not
+/// sent a second time.
+struct AppPassword;
+impl TokenProvider for AppPassword {
+    async fn access_token(&self) -> Result<String, ApiError> {
+        Ok("alice:secret".into())
+    }
+    async fn refresh(&self, _rejected: &str) -> Result<String, ApiError> {
+        Err(ApiError::Unauthorized)
+    }
+    fn scheme(&self) -> oc_api::AuthScheme {
+        oc_api::AuthScheme::Basic
+    }
+}
+
+#[tokio::test]
+async fn basic_scheme_sends_login_and_password() {
+    let server = MockServer::start().await;
+    // base64("alice:secret")
+    Mock::given(method("DELETE"))
+        .and(path("/dav/files/alice/a.txt"))
+        .and(header("Authorization", "Basic YWxpY2U6c2VjcmV0"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client =
+        WebDavClient::from_webdav_url(&format!("{}/dav/files/alice", server.uri()), AppPassword)
+            .expect("client");
+    client.delete("a.txt").await.expect("delete");
+}
+
+#[tokio::test]
+async fn rejected_app_password_is_sent_only_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client =
+        WebDavClient::from_webdav_url(&format!("{}/dav/files/alice", server.uri()), AppPassword)
+            .expect("client")
+            .with_retry(oc_api::RetryConfig::immediate());
+    let err = client.delete("a.txt").await.unwrap_err();
+    assert!(matches!(err, ApiError::Unauthorized));
+}
+
 // --- client construction -----------------------------------------------------
 
 #[tokio::test]
@@ -832,4 +880,115 @@ fn webdav_urls_must_be_http() {
         )
         .is_ok()
     );
+}
+
+/// A server that reads request bodies slowly (small receive buffer, a
+/// pause between reads) and answers `201` with an ETag once the whole
+/// body arrived — data keeps flowing, but the upload takes much longer
+/// than the client's idle timeout.
+async fn slow_reading_server(body_len: usize) -> String {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket.set_recv_buffer_size(64 * 1024).expect("rcvbuf");
+    socket
+        .bind("127.0.0.1:0".parse().expect("addr"))
+        .expect("bind");
+    let listener = socket.listen(4).expect("listen");
+    let address = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut received = Vec::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        // Headers first.
+        let header_end = loop {
+            let read = stream.read(&mut buffer).await.expect("read");
+            assert!(read > 0, "client closed before sending headers");
+            received.extend_from_slice(&buffer[..read]);
+            if let Some(end) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let mut body = received.len() - header_end;
+        while body < body_len {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let read = stream.read(&mut buffer).await.expect("read");
+            if read == 0 {
+                return;
+            }
+            body += read;
+        }
+        let _ = stream
+            .write_all(
+                b"HTTP/1.1 201 Created\r\nETag: \"slow\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+    });
+    format!("http://{address}")
+}
+
+#[tokio::test]
+async fn slow_uploads_are_not_cut_off_while_data_flows() {
+    // Larger than the kernel's send buffer, so data keeps flowing for a
+    // while before the whole body is handed off.
+    const LEN: usize = 12 * 1024 * 1024;
+    let server = slow_reading_server(LEN).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("big.bin");
+    std::fs::write(&source, vec![7u8; LEN]).expect("write");
+    let client = WebDavClient::from_webdav_url(&format!("{server}/dav"), StaticToken::new("tok"))
+        .expect("client")
+        .with_retry(oc_api::RetryConfig {
+            max_attempts: 1,
+            ..oc_api::RetryConfig::immediate()
+        })
+        .with_timeouts(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(400),
+        );
+    let started = std::time::Instant::now();
+    let etag = client
+        .put_file("big.bin", &source, LEN as u64, None, |_| {})
+        .await
+        .expect("upload must not hit the idle timeout while data flows");
+    assert_eq!(etag.as_deref(), Some("\"slow\""));
+    // The upload really took longer than the idle timeout.
+    assert!(started.elapsed() > std::time::Duration::from_millis(800));
+}
+
+#[tokio::test]
+async fn stalled_uploads_are_aborted() {
+    // Accepts the connection but never reads: the body stops moving once
+    // the socket buffers are full.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        drop(stream);
+    });
+    const LEN: usize = 32 * 1024 * 1024;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("big.bin");
+    std::fs::write(&source, vec![7u8; LEN]).expect("write");
+    let client =
+        WebDavClient::from_webdav_url(&format!("http://{address}/dav"), StaticToken::new("tok"))
+            .expect("client")
+            .with_retry(oc_api::RetryConfig {
+                max_attempts: 1,
+                ..oc_api::RetryConfig::immediate()
+            })
+            .with_timeouts(
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_millis(300),
+            );
+    let started = std::time::Instant::now();
+    let err = client
+        .put_file("big.bin", &source, LEN as u64, None, |_| {})
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::Stalled { .. }), "{err:?}");
+    assert!(err.is_retryable());
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }

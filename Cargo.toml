@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/oc-config",
+    "crates/oc-storage",
     "crates/oc-auth",
     "crates/oc-api",
     "crates/oc-db",
@@ -49,6 +50,7 @@ tracing-appender = "0.2"
 
 # Workspace-internal crates
 oc-config = { version = "0.1.0", path = "crates/oc-config" }
+oc-storage = { version = "0.1.0", path = "crates/oc-storage" }
 oc-auth = { version = "0.1.0", path = "crates/oc-auth" }
 oc-api = { version = "0.1.0", path = "crates/oc-api" }
 oc-db = { version = "0.1.0", path = "crates/oc-db" }

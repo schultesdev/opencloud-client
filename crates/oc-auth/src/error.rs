@@ -69,6 +69,16 @@ pub enum AuthError {
     /// The system browser could not be opened.
     #[error("could not open the browser: {0}")]
     Browser(String),
+    /// The Nextcloud login flow failed (unexpected answer, insecure URL).
+    #[error("login flow failed: {0}")]
+    LoginFlow(String),
+    /// No Nextcloud app password is stored; a login is required first.
+    #[error("no app password stored; login required")]
+    NoAppPassword,
+    /// The server rejected the stored app password (revoked or wrong); a
+    /// new login is required.
+    #[error("app password rejected by the server; login required")]
+    AppPasswordRejected,
     /// I/O error on the loopback listener.
     #[error("I/O error on the loopback listener: {0}")]
     Io(#[from] std::io::Error),

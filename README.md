@@ -1,16 +1,23 @@
 # OpenCloud Sync Client
 
 Ein plattformübergreifender (Windows / macOS / Linux) Synchronisations-Client
-für [OpenCloud](https://opencloud.eu), geschrieben in Rust: beliebig viele
-Ordner mit OpenCloud-Spaces synchronisieren — mit GUI, Tray-Icon,
-Selective Sync und Konfliktlösung.
+für [OpenCloud](https://opencloud.eu) und [Nextcloud](https://nextcloud.com),
+geschrieben in Rust: beliebig viele Ordner mit OpenCloud-Spaces oder
+Nextcloud-Konten synchronisieren — mit GUI, Tray-Icon, Selective Sync und
+Konfliktlösung.
 
-Ein unabhängiges Projekt, kein offizielles Produkt des OpenCloud-Projekts.
+Ein unabhängiges Projekt, kein offizielles Produkt des OpenCloud- oder des
+Nextcloud-Projekts.
 
 ## Funktionen
 
-- **Beliebig viele Sync-Jobs**: je Space und lokalem Ordner ein Job,
-  beliebig kombinierbar; jeder Job hat seine eigene SQLite-Statusdatenbank.
+- **Zwei Anbieter, eine Engine**: OpenCloud (OIDC-Login, Spaces) und
+  Nextcloud (Login Flow v2 mit App-Passwort, Chunked Upload v2 für große
+  Dateien). Scan, Abgleich, Transfers und Konfliktlösung sind für beide
+  identisch; Konten beider Anbieter laufen nebeneinander.
+- **Beliebig viele Sync-Jobs**: je Space bzw. Nextcloud-Konto und lokalem
+  Ordner ein Job, beliebig kombinierbar; jeder Job hat seine eigene
+  SQLite-Statusdatenbank.
 - **Konfiguration als JSON**: `config.json` (Konten, Einstellungen) und
   `jobs.json` (Jobs) im Konfigurationsordner des Betriebssystems.
 - **Selective Sync**: pro Space wählbar, welche Ordner synchronisiert
@@ -25,8 +32,9 @@ Ein unabhängiges Projekt, kein offizielles Produkt des OpenCloud-Projekts.
 - **Tray-Icon**: Sync-Status, „Jetzt synchronisieren“-Zähler und Restzeit
   im Tooltip; Fenster schließen minimiert in den Tray.
 - **Betriebssystem-Integration**: Autostart je OS, Icon in Taskleiste und
-  Dateimanager; Refresh-Tokens liegen im OS-Schlüsselbund
-  (Windows Credential Manager, macOS Keychain, Linux Secret Service).
+  Dateimanager; Refresh-Tokens und App-Passwörter liegen im
+  OS-Schlüsselbund (Windows Credential Manager, macOS Keychain, Linux
+  Secret Service).
 - **Headless-Modus**: dieselbe Engine ohne GUI, für Server und Skripte.
 
 ## Installation
@@ -50,11 +58,11 @@ Hinweise:
   nicht konfiguriert ist): beim ersten Start die dmg per Rechtsklick →
   „Öffnen“ bestätigen.
 - **Linux**: der Client braucht einen laufenden Secret Service
-  (z. B. GNOME Keyring) für die Refresh-Tokens.
+  (z. B. GNOME Keyring) für Refresh-Tokens und App-Passwörter.
 
 ### Aus dem Source bauen
 
-Voraussetzungen: Rust 1.85+ (rust-toolchain.toml gilt automatisch),
+Voraussetzungen: Rust 1.99+ (rust-toolchain.toml gilt automatisch),
 unter Linux `libgtk-3-dev`.
 
 ```sh
@@ -75,12 +83,15 @@ cargo test --workspace --locked
 ## Erste Schritte
 
 1. **Konto anlegen**: GUI starten, Tab „Konten“ → „Konto hinzufügen“:
-   Server-URL (z. B. `https://cloud.example.com`), Benutzername und eine
-   Konto-ID vergeben.
-2. **Anmelden**: „Anmelden“ öffnet den Browser für den OIDC-Login
-   (Authorization Code Flow + PKCE). Das Refresh-Token landet im
-   OS-Schlüsselbund — nicht in einer Datei. Abmelden widerruft es.
-3. **Job anlegen**: „+ Neuer Job“ → Space auswählen → lokalen Ordner
+   Anbieter (OpenCloud oder Nextcloud), Server-URL (z. B.
+   `https://cloud.example.com`), Benutzername und eine Konto-ID vergeben.
+2. **Anmelden**: „Anmelden“ öffnet den Browser — bei OpenCloud für den
+   OIDC-Login (Authorization Code Flow + PKCE), bei Nextcloud für den
+   Login Flow v2 (funktioniert auch mit Zwei-Faktor-Anmeldung und SSO).
+   Refresh-Token bzw. App-Passwort landen im OS-Schlüsselbund — nicht in
+   einer Datei. Abmelden widerruft sie auf dem Server.
+3. **Job anlegen**: „+ Neuer Job“ → Space auswählen (bei Nextcloud ist der
+   einzige Speicher des Kontos vorausgewählt) → lokalen Ordner
    wählen → optional Ordner per Checkbox auswählen (Selective Sync,
    schreibt die `include`-Liste) und Ausschluss-Muster festlegen →
    speichern. Der erste Lauf baut die lokale Kopie und die
@@ -122,11 +133,11 @@ offen und der neue Serverzustand wird nachgetragen.
 ```text
 opencloud-sync                           # GUI (Standard)
 opencloud-sync --headless                # Engine ohne GUI, läuft bis Ctrl-C
-opencloud-sync --login <ACCOUNT_ID>      # Browser-Login, Refresh-Token -> Keyring
-opencloud-sync --logout <ACCOUNT_ID>     # Token widerrufen, Keyring leeren
+opencloud-sync --login <ACCOUNT_ID>      # Browser-Login, Token/App-Passwort -> Keyring
+opencloud-sync --logout <ACCOUNT_ID>     # Token/App-Passwort widerrufen, Keyring leeren
 opencloud-sync --status                  # Jobs, Logins, DB-Statistiken
 opencloud-sync --sync-once               # ein Lauf pro aktivem Job (für cron)
-opencloud-sync --list-spaces <ACCOUNT_ID> # Spaces des Kontos (Graph-API)
+opencloud-sync --list-spaces <ACCOUNT_ID> # Spaces bzw. Nextcloud-Speicher (ID für space_id)
 opencloud-sync --conflicts               # offene Konflikte auflisten
 opencloud-sync --resolve <id> server|local
 opencloud-sync --config-dir <DIR>        # Konfigurationsordner umstellen
@@ -149,18 +160,26 @@ Die Dateien liegen im OS-Konfigurationsordner:
 Dazu: `db/` (eine SQLite-Datei pro Job) und `logs/` (täglich rotierende
 Protokolle). Beide Dateien sind atomar geschrieben und per `version`-Feld
 migrationssicher; die GUI bearbeitet sie, Handbearbeitung ist aber möglich
-(solange das Programm nicht läuft).
+(solange das Programm nicht läuft). Ab Schema `version` 2 (Feld
+`provider`) lehnen ältere Programmversionen die Dateien ab.
 
 ### `config.json`
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "accounts": [
     {
       "id": "konto-1",
+      "provider": "opencloud",
       "server_url": "https://cloud.example.com",
       "username": "max@example.com"
+    },
+    {
+      "id": "nextcloud-privat",
+      "provider": "nextcloud",
+      "server_url": "https://nc.example.org",
+      "username": "max"
     }
   ],
   "settings": {
@@ -179,6 +198,7 @@ migrationssicher; die GUI bearbeitet sie, Handbearbeitung ist aber möglich
 | Feld | Bedeutung | Grenzen / Standard |
 | --- | --- | --- |
 | `accounts[].id` | interne Konto-ID, Referenz der Jobs | nicht leer, eindeutig |
+| `accounts[].provider` | `opencloud` \| `nextcloud` | Standard `opencloud` |
 | `accounts[].server_url` | Basis-URL des Servers | HTTP(S) mit Host |
 | `accounts[].username` | Anzeigename des Benutzers | nicht leer |
 | `settings.sync_interval_secs` | Takt der periodischen Scans | 1–86400, Standard 30 |
@@ -194,7 +214,7 @@ migrationssicher; die GUI bearbeitet sie, Handbearbeitung ist aber möglich
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "jobs": [
     {
       "id": "job-1",
@@ -213,10 +233,10 @@ migrationssicher; die GUI bearbeitet sie, Handbearbeitung ist aber möglich
 | --- | --- |
 | `id` | Job-ID; Name der Statusdatenbank, gültiger Dateiname, eindeutig |
 | `account_id` | referenziert `config.json` |
-| `space_id` | Space-ID (in der GUI im Wizard, per CLI mit `--list-spaces` zu sehen) |
+| `space_id` | OpenCloud: Space-ID; Nextcloud: die Benutzer-ID des Kontos (in der GUI im Wizard, per CLI mit `--list-spaces` zu sehen) |
 | `local_path` | lokaler Ordner; wird angelegt, falls er fehlt. Ordner zweier Jobs dürfen sich nicht überlappen |
 | `enabled` | `false` = Job wird übersprungen |
-| `include` | Ordner-Whitelist (Selective Sync): leer = alles. Pfade relativ zur Space-Wurzel |
+| `include` | Ordner-Whitelist (Selective Sync): leer = alles. Pfade relativ zur Wurzel des Space bzw. Nextcloud-Speichers |
 | `exclude` | Glob-Muster je Ordnersegment oder Pfad, z. B. `*.tmp`, `.git`, `Bilder/2025`; zusätzlich zu `settings.global_exclude` |
 
 ## Updates
@@ -241,14 +261,21 @@ helfen die Protokolle aus dem Info-Tab („Öffnen“).
   zu einem Konflikt, den der Client erkennt und festhält.
 - **Icon-Overlays im Dateimanager** (Häkchen auf Dateien) sind eine
   spätere Ausbaustufe (plattformabhängige Shell-Integration).
-- **Große Uploads** laufen als ein PUT-Request; TUS (stükeweises
-  Hochladen) ist für sehr große Dateien als Ausbaustufe notiert.
+- **Große Uploads** laufen bei OpenCloud als ein PUT-Request; TUS
+  (stückweises Hochladen) ist als Ausbaustufe notiert. Bei Nextcloud
+  werden Dateien ab 50 MiB in 25-MiB-Stücken hochgeladen (Chunked Upload
+  v2).
+- **Nextcloud: externer Speicher und Gruppenordner** melden Änderungen
+  je nach Servereinstellung nicht an die Wurzel weiter; dann erkennt der
+  ETag-Shortcut Server-Änderungen dort erst beim nächsten vollständigen
+  Scan.
 
 ## Entwicklung
 
-- Workspace: `oc-config` (JSON-Konfiguration), `oc-auth` (OIDC + Keyring),
-  `oc-api` (Graph + WebDAV), `oc-db` (SQLite je Job), `oc-sync` (Engine),
-  `oc-app` (GUI/CLI).
+- Workspace: `oc-config` (JSON-Konfiguration), `oc-storage`
+  (anbieterneutrale Storage-Traits), `oc-auth` (OIDC, Nextcloud-Login +
+  Keyring), `oc-api` (WebDAV, OpenCloud-Graph, Nextcloud-OCS + Chunking),
+  `oc-db` (SQLite je Job), `oc-sync` (Engine), `oc-app` (GUI/CLI).
 - `PLAN.md` ist das maßgebliche Design-Dokument, `CHANGELOG.md` hält die
   Änderungen fest, `CLAUDE.md` beschreibt Konventionen und Architektur.
 - Tests: Unit- und Integrationstests mit Mock-Servern (`wiremock`);
@@ -258,4 +285,5 @@ helfen die Protokolle aus dem Info-Tab („Öffnen“).
 ## Lizenz
 
 [Apache License 2.0](LICENSE). Der Client nutzt die Graph- und WebDAV-APIs
-von OpenCloud und ist kein offizielles Produkt des OpenCloud-Projekts.
+von OpenCloud sowie die WebDAV- und OCS-APIs von Nextcloud und ist kein
+offizielles Produkt des OpenCloud- oder des Nextcloud-Projekts.

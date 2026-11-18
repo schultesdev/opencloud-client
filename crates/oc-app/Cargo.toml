@@ -16,6 +16,7 @@ oc-auth.workspace = true
 oc-config.workspace = true
 oc-db.workspace = true
 oc-sync.workspace = true
+oc-storage.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true

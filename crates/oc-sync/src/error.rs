@@ -3,8 +3,8 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-use oc_api::ApiError;
 use oc_db::DbError;
+use oc_storage::StorageError;
 
 /// Everything the sync engine can fail with.
 #[derive(Debug, thiserror::Error)]
@@ -22,7 +22,7 @@ pub enum SyncError {
     },
     /// A request against the server failed (network, auth, protocol).
     #[error("server request failed: {0}")]
-    Api(#[from] ApiError),
+    Storage(#[from] StorageError),
     /// The status database failed.
     #[error("status database error: {0}")]
     Db(#[from] DbError),
@@ -85,23 +85,23 @@ impl SyncError {
     }
 
     /// Whether the server could not be reached at all (DNS/connect
-    /// failure, see [`ApiError::is_connectivity`]): the job should
+    /// failure, see [`StorageError::is_connectivity`]): the job should
     /// switch to offline backoff instead of its normal interval.
     pub fn is_connectivity(&self) -> bool {
-        matches!(self, Self::Api(error) if error.is_connectivity())
+        matches!(self, Self::Storage(error) if error.is_connectivity())
     }
 
     /// Whether the server is throttling this client (425/429, see
-    /// [`ApiError::is_throttled`]): continuing at full rate only
+    /// [`StorageError::is_throttled`]): continuing at full rate only
     /// prolongs the throttling.
     pub fn is_throttled(&self) -> bool {
-        matches!(self, Self::Api(error) if error.is_throttled())
+        matches!(self, Self::Storage(error) if error.is_throttled())
     }
 
     /// Whether an aborted pass should switch the job to offline
     /// backoff: an unreachable server, or one that is throttling —
     /// both call for fewer, later attempts, not the normal interval.
     pub fn should_back_off(&self) -> bool {
-        matches!(self, Self::Api(error) if error.is_connectivity() || error.is_throttled())
+        matches!(self, Self::Storage(error) if error.is_connectivity() || error.is_throttled())
     }
 }

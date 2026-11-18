@@ -19,7 +19,7 @@ pub use error::ConfigError;
 pub use jobs::{Jobs, SyncJob};
 pub use model::{
     Account, Config, ConflictPolicy, LogLevel, MAX_PARALLEL_TRANSFERS, MAX_PROPFIND_PAUSE_MS,
-    MAX_SYNC_INTERVAL_SECS, Settings,
+    MAX_SYNC_INTERVAL_SECS, ProviderKind, Settings,
 };
 pub use paths::{
     CONFIG_FILE, CONFIG_VERSION, JOBS_FILE, config_path, default_config_dir, jobs_path,

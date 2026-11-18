@@ -18,11 +18,12 @@ bytes.workspace = true
 rand.workspace = true
 quick-xml.workspace = true
 percent-encoding.workspace = true
-unicode-normalization.workspace = true
 oc-auth.workspace = true
+oc-storage.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

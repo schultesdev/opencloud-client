@@ -125,7 +125,7 @@ pub async fn discover(
 /// `relative` below the server base URL. A base path without trailing
 /// slash (`https://host/cloud`) counts as a folder, so the result is
 /// `https://host/cloud/<relative>` and not `https://host/<relative>`.
-fn below(server: &Url, relative: &str) -> String {
+pub(crate) fn below(server: &Url, relative: &str) -> String {
     let mut base = server.clone();
     if !base.path().ends_with('/') {
         let path = format!("{}/", base.path());

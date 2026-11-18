@@ -14,6 +14,9 @@
 //!   tracking, single-flight refresh (parallel callers share one refresh),
 //!   forced refresh after 401, logout.
 //!
+//! - [`AppPasswordManager`]: Nextcloud login (Login Flow v2) and the app
+//!   password used with HTTP Basic auth.
+//!
 //! The interactive browser login itself is only manually testable; refresh
 //! logic, expiry handling, PKCE, the callback listener, and the store are
 //! covered by tests against mock servers.
@@ -23,6 +26,7 @@ mod client;
 mod discovery;
 mod error;
 mod manager;
+mod nextcloud;
 mod pkce;
 mod store;
 mod token;
@@ -32,6 +36,9 @@ pub use client::{AuthClient, DEFAULT_HTTP_TIMEOUT, DEFAULT_LOGIN_TIMEOUT};
 pub use discovery::ProviderEndpoints;
 pub use error::AuthError;
 pub use manager::TokenManager;
+pub use nextcloud::{
+    AppPassword, AppPasswordManager, DEFAULT_POLL_INTERVAL, NEXTCLOUD_DEVICE_NAME,
+};
 pub use pkce::{Pkce, generate_verifier, s256};
 pub use store::{InMemoryTokenStore, KeyringStore, TokenStore};
 pub use token::TokenSet;

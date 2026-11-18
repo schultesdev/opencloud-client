@@ -1,4 +1,4 @@
-//! Scanners: the local directory tree and the remote WebDAV tree, plus the
+//! Scanners: the local directory tree and the remote tree, plus the
 //! mapping between space-relative paths and local paths.
 
 use std::collections::HashMap;
@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::SystemTime;
 
-use oc_api::{DavResource, Depth, TokenProvider, WebDavClient, normalize_nfc};
+use oc_storage::{Listing, RemoteEntry, RemoteStorage, StorageError, normalize_nfc};
 
 use crate::error::SyncError;
 use crate::filter::Filter;
@@ -28,7 +28,7 @@ pub struct LocalNode {
     pub size: Option<i64>,
 }
 
-/// Remote file/folder metadata as seen by PROPFIND.
+/// Remote file/folder metadata as seen by a remote listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteNode {
     /// Whether this is a collection (folder).
@@ -40,12 +40,12 @@ pub struct RemoteNode {
 }
 
 impl RemoteNode {
-    /// Converts a PROPFIND resource into a diff-relevant node.
-    pub fn from_resource(resource: &DavResource) -> Self {
+    /// Converts a remote entry into a diff-relevant node.
+    pub fn from_entry(entry: &RemoteEntry) -> Self {
         Self {
-            is_dir: resource.is_dir,
-            etag: resource.etag.clone(),
-            size: resource.size.map(|size| size as i64),
+            is_dir: entry.is_dir,
+            etag: entry.etag.clone(),
+            size: entry.size.map(|size| size as i64),
         }
     }
 }
@@ -227,63 +227,61 @@ pub fn remove_part_files(root: &Path) -> Result<(), SyncError> {
     Ok(())
 }
 
-/// Traverses the remote tree level by level (PROPFIND `Depth: 1` per
-/// folder, strictly serially to keep the server load bounded), starting
-/// from an already-fetched root listing. Traversal stops at folders
+/// Traverses the remote tree level by level (one listing per folder,
+/// strictly serially to keep the server load bounded), starting from an
+/// already-fetched root listing. Traversal stops at folders
 /// outside the filter. `pause` is slept between two folder listings —
 /// the configurable server-load throttle (`propfind_pause_ms`).
 /// Folders whose listing fails with a server error (5xx) are recorded
 /// in [`RemoteSnapshot::unreadable`] instead of aborting the scan;
 /// everything else (network, auth, protocol) is fatal as before.
-pub async fn scan_remote_from_root<P: TokenProvider>(
-    dav: &WebDavClient<P>,
+pub async fn scan_remote_from_root(
+    storage: &dyn RemoteStorage,
     filter: &Filter,
-    root_listing: &[DavResource],
+    root_listing: &Listing,
     pause: Duration,
 ) -> Result<RemoteSnapshot, SyncError> {
     let mut snapshot = RemoteSnapshot {
-        root_etag: root_listing
-            .first()
-            .and_then(|resource| resource.etag.clone()),
+        root_etag: root_listing.dir.etag.clone(),
         ..RemoteSnapshot::default()
     };
     // Folders to list, by their server path (for the request) and their
     // normalized path (for reporting), see `ServerNames`.
     let mut pending: VecDeque<(String, String)> = VecDeque::new();
-    for resource in root_listing.iter().skip(1) {
-        add_remote_child(resource, filter, &mut snapshot, &mut pending);
+    for entry in &root_listing.children {
+        add_remote_child(entry, filter, &mut snapshot, &mut pending);
     }
     while let Some((dir, path)) = pending.pop_front() {
         if !pause.is_zero() {
             tokio::time::sleep(pause).await;
         }
-        let children = match dav.propfind(&dir, Depth::One).await {
-            Ok(children) => children,
+        let listing = match storage.list(&dir).await {
+            Ok(listing) => listing,
             // The folder vanished between the parent listing and this
             // request: its contents are gone; keep syncing the rest.
-            Err(oc_api::ApiError::NotFound) => continue,
+            Err(StorageError::NotFound) => continue,
             // The server failed to produce this listing (e.g. a 500 for
             // a folder with more entries than the server's internal
             // gRPC message limit). The folder's contents are unknown:
             // record it so the engine can freeze the subtree instead of
             // aborting the whole pass.
-            Err(source @ oc_api::ApiError::Server { .. }) => {
-                snapshot.unreadable.push((path, SyncError::Api(source)));
+            Err(source @ StorageError::Server { .. }) => {
+                snapshot.unreadable.push((path, SyncError::Storage(source)));
                 continue;
             }
             Err(source) => return Err(source.into()),
         };
-        for resource in children.iter().skip(1) {
-            add_remote_child(resource, filter, &mut snapshot, &mut pending);
+        for entry in &listing.children {
+            add_remote_child(entry, filter, &mut snapshot, &mut pending);
         }
     }
     Ok(snapshot)
 }
 
-/// Records one PROPFIND child if it passes the filter; folders are queued
+/// Records one listed child if it passes the filter; folders are queued
 /// for traversal.
 fn add_remote_child(
-    resource: &DavResource,
+    resource: &RemoteEntry,
     filter: &Filter,
     snapshot: &mut RemoteSnapshot,
     pending: &mut VecDeque<(String, String)>,
@@ -296,11 +294,13 @@ fn add_remote_child(
             .server_names
             .insert(resource.path.clone(), resource.server_path.clone());
     }
-    let node = RemoteNode::from_resource(resource);
+    let node = RemoteNode::from_entry(resource);
     if node.is_dir {
         pending.push_back((resource.server_path.clone(), resource.path.clone()));
-    } else if let Some(sha1) = resource.sha1() {
-        snapshot.checksums.insert(resource.path.clone(), sha1);
+    } else if let Some(sha1) = &resource.sha1 {
+        snapshot
+            .checksums
+            .insert(resource.path.clone(), sha1.clone());
     }
     snapshot.entries.insert(resource.path.clone(), node);
 }

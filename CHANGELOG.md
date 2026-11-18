@@ -14,6 +14,50 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (Phase 10 — Nextcloud als zweiter Storage-Provider)
+
+- **Nextcloud-Konten**: Neben OpenCloud lassen sich Nextcloud-Server als
+  Konto anlegen (Anbieter-Auswahl im Formular „Konto hinzufügen“,
+  `accounts[].provider` in `config.json`). Die Anmeldung läuft über den
+  Nextcloud Login Flow v2 im Browser (auch mit Zwei-Faktor-Anmeldung
+  und SSO); das erzeugte App-Passwort liegt im OS-Schlüsselbund und wird
+  beim Abmelden auf dem Server widerrufen. Ein vom Server abgelehntes
+  App-Passwort wird nicht wiederholt gesendet. Jobs beider Anbieter
+  laufen nebeneinander in derselben Engine.
+- **Chunked Upload für Nextcloud**: Dateien ab 50 MiB werden in
+  25-MiB-Stücken hochgeladen (Nextcloud Chunked Upload v2) und auf dem
+  Server zusammengesetzt. Die Konfliktprüfung (ETag bzw. „Datei darf
+  noch nicht existieren“) gilt auch hier und wird vor dem Hochladen
+  geprüft; ändert sich die lokale Datei währenddessen oder bricht der
+  Upload ab, wird das Upload-Verzeichnis auf dem Server aufgeräumt.
+- **Speicher und Quota von Nextcloud-Konten** in Kontokarte, Wizard
+  (die einzige Wurzel ist vorausgewählt) und `--list-spaces`; die
+  Benutzer-ID landet als `space_id` im Job.
+- **Neue Crate `oc-storage`**: anbieterneutrale Traits `RemoteStorage` und
+  `StorageProvider`; die Sync-Engine kennt nur noch diese Schnittstelle.
+
+### Changed (Phase 10)
+
+- **Konfigurationsschema v2**: `config.json` und `jobs.json` werden beim
+  Laden migriert (bestehende Konten werden OpenCloud-Konten) und mit
+  `"version": 2` gespeichert. Ältere Programmversionen lehnen die Dateien
+  danach ab.
+- **Gemeinsame Provider-Factory** für CLI und GUI statt mehrfach
+  duplizierter Client-Konstruktion; weiterhin genau eine
+  Token-Verwaltung pro Konto.
+- **Leere Server-Antwort für die Wurzel** bricht den Lauf jetzt als
+  Protokollfehler ab, statt als leerer Remote-Stand zu gelten (der lokale
+  Löschungen hätte planen können).
+
+### Fixed (Phase 10)
+
+- **Uploads brachen nach 120 s ab, obwohl noch Daten flossen**: Der als
+  Leerlauf-Timeout gedachte `read_timeout` lief ab dem Senden bis zur
+  Serverantwort durch. Uploads brechen jetzt nur noch ab, wenn
+  tatsächlich keine Daten mehr fließen (bzw. nach dem Senden fünfmal so
+  lange keine Antwort kommt) — große Dateien über langsame Leitungen
+  scheitern nicht mehr.
+
 ### Added
 
 - **Schalter „Dateien im Hauptordner“**: Sync-Jobs mit Ordnerauswahl
@@ -52,6 +96,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Job-Assistent: Kontowechsel lädt die Spaces neu**: Wurde im Assistenten
+  ein anderes Konto gewählt, blieb die Space-/Speicherliste des zuvor
+  gewählten Kontos stehen, sodass kein Space des neuen Kontos auswählbar war.
+  Der Kontowechsel verwirft jetzt Liste, Lade- und Fehlerzustand; die Liste
+  des neuen Kontos wird übernommen bzw. angefordert.
 - **GTK-Warnung beim Tray-Start unter Linux unterdrückt**: Beim Start
   schrieb das Systempaket libayatana-appindicator (die Basis des
   Tray-Icons unter Linux) jedes Mal die Meldung

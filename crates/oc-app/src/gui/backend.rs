@@ -18,12 +18,14 @@ use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
-use oc_api::{DavResource, Depth, GraphClient, Space, WebDavClient};
-use oc_auth::{AuthClient, DEFAULT_LOGIN_TIMEOUT, KeyringStore, TokenManager};
-use oc_config::{Config, Jobs, SyncJob};
+use oc_auth::DEFAULT_LOGIN_TIMEOUT;
+use oc_config::{Account, Config, Jobs, SyncJob};
 use oc_db::{Conflict, ConflictResolution, Stats, StatusDb, db_path};
+use oc_storage::{RemoteEntry, RemoteStorage, StorageRoot};
 use oc_sync::{Engine, EngineEvent, EngineOptions, Job, JobCommand};
 use tokio::sync::mpsc;
+
+use crate::provider::{Provider, Providers};
 
 /// What the GUI asks the backend to do. Sent through an unbounded channel;
 /// sending is synchronous and never blocks.
@@ -51,30 +53,30 @@ pub enum UiCommand {
         /// Which side wins.
         resolution: ConflictResolution,
     },
-    /// Interactive OIDC login (opens the browser).
+    /// Interactive login (opens the browser).
     Login {
         /// The account to log in.
         account_id: String,
     },
-    /// Logout: revoke and clear the stored refresh token.
+    /// Logout: revoke and clear the stored credential.
     Logout {
         /// The account to log out.
         account_id: String,
     },
-    /// List the spaces of an account (Graph API) for the wizard.
+    /// List the syncable roots (spaces) of an account for the wizard.
     ListSpaces {
         /// The account whose spaces to list.
         account_id: String,
     },
-    /// List the direct subfolders of a remote folder (PROPFIND Depth 1)
-    /// for the wizard's folder tree.
+    /// List the direct subfolders of a remote folder for the wizard's
+    /// folder tree.
     FetchChildren {
         /// The account (login).
         account_id: String,
         /// The space to traverse.
         space_id: String,
         /// The folder's server path inside the space (`""` = root), as
-        /// reported by `DavResource::server_path`.
+        /// reported by `RemoteEntry::server_path`.
         path: String,
         /// Correlation token; the answer arrives as
         /// [`BackendEvent::Children`] with the same token.
@@ -119,7 +121,7 @@ pub enum BackendEvent {
     LoginFinished {
         /// The account.
         account_id: String,
-        /// `Ok` when the refresh token is stored.
+        /// `Ok` when the credential is stored.
         result: Result<(), String>,
     },
     /// A logout finished.
@@ -134,14 +136,14 @@ pub enum BackendEvent {
         /// The account.
         account_id: String,
         /// The spaces, or an error message.
-        result: Result<Vec<Space>, String>,
+        result: Result<Vec<StorageRoot>, String>,
     },
     /// The subfolders of a wizard tree node (correlated by token).
     Children {
         /// The correlation token of the request.
         token: u32,
         /// The folders, or an error message.
-        result: Result<Vec<DavResource>, String>,
+        result: Result<Vec<RemoteEntry>, String>,
     },
     /// A conflict resolution finished; `Ok(false)` means the server
     /// changed again and the conflict stayed pending.
@@ -216,8 +218,8 @@ impl BackendHandle {
 pub fn spawn(config_dir: PathBuf) -> Result<(BackendHandle, Receiver<BackendEvent>), String> {
     let (config, jobs) = load_workspace(&config_dir)?;
     prune_orphan_dbs(&config_dir, &jobs);
-    let managers = Managers::default();
-    let (mut engine, notices) = start_engine(&config_dir, &managers, &config, &jobs)?;
+    let providers = Providers::default();
+    let (mut engine, notices) = start_engine(&config_dir, &providers, &config, &jobs)?;
     let (gui_tx, gui_rx) = std_mpsc::channel::<BackendEvent>();
     let repaint = Arc::new(std::sync::OnceLock::new());
     let gui = GuiSink {
@@ -232,7 +234,7 @@ pub fn spawn(config_dir: PathBuf) -> Result<(BackendHandle, Receiver<BackendEven
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let backend = Backend {
         config_dir,
-        managers,
+        providers,
         gui,
         // Weak: the backend must not keep its own command channel open,
         // or it would never notice the GUI quitting.
@@ -255,8 +257,8 @@ pub fn spawn(config_dir: PathBuf) -> Result<(BackendHandle, Receiver<BackendEven
 struct Backend {
     /// The configuration directory.
     config_dir: PathBuf,
-    /// Token managers per account.
-    managers: Managers,
+    /// Storage providers per account.
+    providers: Providers,
     /// The GUI's event channel.
     gui: GuiSink,
     /// The backend's own command channel (e.g. to restart the engine after
@@ -311,9 +313,13 @@ async fn backend_task(
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
                     .clear();
-                engine =
-                    restart_engine(&backend.config_dir, &backend.managers, &backend.gui, engine)
-                        .await;
+                engine = restart_engine(
+                    &backend.config_dir,
+                    &backend.providers,
+                    &backend.gui,
+                    engine,
+                )
+                .await;
             }
             UiCommand::RefreshSnapshots { job_ids } => {
                 use std::sync::atomic::Ordering;
@@ -335,7 +341,7 @@ async fn backend_task(
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     let result =
-                        run_login(&backend.config_dir, &backend.managers, &account_id).await;
+                        run_login(&backend.config_dir, &backend.providers, &account_id).await;
                     let ok = result.is_ok();
                     backend.report(BackendEvent::LoginFinished { account_id, result });
                     if ok {
@@ -347,7 +353,7 @@ async fn backend_task(
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     let result =
-                        run_logout(&backend.config_dir, &backend.managers, &account_id).await;
+                        run_logout(&backend.config_dir, &backend.providers, &account_id).await;
                     let ok = result.is_ok();
                     backend.report(BackendEvent::LogoutFinished { account_id, result });
                     if ok {
@@ -359,7 +365,7 @@ async fn backend_task(
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     let result =
-                        run_list_spaces(&backend.config_dir, &backend.managers, &account_id).await;
+                        run_list_spaces(&backend.config_dir, &backend.providers, &account_id).await;
                     backend.report(BackendEvent::Spaces {
                         account_id,
                         result: result.map_err(|error| error.to_string()),
@@ -376,7 +382,7 @@ async fn backend_task(
                 tokio::spawn(async move {
                     let result = run_fetch_children(
                         &backend.config_dir,
-                        &backend.managers,
+                        &backend.providers,
                         &account_id,
                         &space_id,
                         &path,
@@ -418,7 +424,7 @@ async fn backend_task(
 /// stopped: an unreadable file keeps the current engine running.
 async fn restart_engine(
     config_dir: &std::path::Path,
-    managers: &Managers,
+    providers: &Providers,
     gui: &GuiSink,
     mut engine: Engine,
 ) -> Engine {
@@ -436,7 +442,7 @@ async fn restart_engine(
     };
     engine.stop().await;
     prune_orphan_dbs(config_dir, &jobs);
-    match start_engine(config_dir, managers, &config, &jobs) {
+    match start_engine(config_dir, providers, &config, &jobs) {
         Ok((mut new_engine, notices)) => {
             for message in notices {
                 gui.send(BackendEvent::Message { message });
@@ -550,52 +556,28 @@ fn engine_options(config: &Config) -> EngineOptions {
     }
 }
 
-/// The concrete token manager type used throughout the backend.
-type Manager = TokenManager<KeyringStore>;
-
-/// One token manager per account, shared by the engine's jobs and the
-/// GUI's one-off requests (login, spaces, folder tree, conflicts). With a
-/// manager per client, two of them would refresh with the same refresh
-/// token; the server rotates it on the first use and rejects the second,
-/// which used to clear the account's login.
-#[derive(Clone, Default)]
-struct Managers(Arc<std::sync::Mutex<ManagerMap>>);
-
-/// Account id → (server URL, shared manager).
-type ManagerMap = HashMap<String, (String, Arc<Manager>)>;
-
-impl Managers {
-    /// The shared manager of `account_id` at `server_url`; a changed
-    /// server URL replaces the cached manager.
-    fn get(&self, account_id: &str, server_url: &str) -> Result<Arc<Manager>, String> {
-        let mut cache = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
-        if let Some((server, manager)) = cache.get(account_id)
-            && server == server_url
-        {
-            return Ok(manager.clone());
-        }
-        let auth = AuthClient::new(server_url).map_err(|error| error.to_string())?;
-        let manager = Arc::new(TokenManager::new(auth, KeyringStore::new(), account_id));
-        cache.insert(
-            account_id.to_owned(),
-            (server_url.to_owned(), manager.clone()),
-        );
-        Ok(manager)
-    }
+/// Looks up an account in `config.json`.
+fn account_of(config_dir: &std::path::Path, account_id: &str) -> Result<Account, String> {
+    let config = oc_config::load_config(config_dir).map_err(|error| error.to_string())?;
+    config
+        .accounts
+        .into_iter()
+        .find(|account| account.id == account_id)
+        .ok_or_else(|| format!("unbekanntes Konto '{account_id}'"))
 }
 
-/// The shared token manager of an account; fails on unknown accounts.
-fn manager(
+/// The shared provider of an account; fails on unknown accounts.
+fn provider_of(
     config_dir: &std::path::Path,
-    managers: &Managers,
+    providers: &Providers,
     account_id: &str,
-) -> Result<Arc<Manager>, String> {
-    let server = server_of(config_dir, account_id)?;
-    managers.get(account_id, &server)
+) -> Result<Provider, String> {
+    let account = account_of(config_dir, account_id)?;
+    providers.get(&account).map_err(|error| error.to_string())
 }
 
-/// Looks up a job and its account's server URL.
-fn job_server(config_dir: &std::path::Path, job_id: &str) -> Result<(SyncJob, String), String> {
+/// Looks up a job and its account.
+fn job_account(config_dir: &std::path::Path, job_id: &str) -> Result<(SyncJob, Account), String> {
     let (config, jobs) = load_workspace(config_dir)?;
     let job = jobs
         .jobs
@@ -605,15 +587,15 @@ fn job_server(config_dir: &std::path::Path, job_id: &str) -> Result<(SyncJob, St
         .clone();
     let account = config
         .accounts
-        .iter()
+        .into_iter()
         .find(|account| account.id == job.account_id)
         .ok_or_else(|| format!("Job '{job_id}' verweist auf unbekanntes Konto"))?;
-    Ok((job, account.server_url.clone()))
+    Ok((job, account))
 }
 
 /// Requires a stored login for the account.
-fn require_login(manager: &Manager, account_id: &str) -> Result<(), String> {
-    if !manager.has_stored_login() {
+fn require_login(provider: &Provider, account_id: &str) -> Result<(), String> {
+    if !provider.has_stored_login() {
         return Err(format!(
             "Konto '{account_id}' ist nicht angemeldet (zuerst einloggen)"
         ));
@@ -621,74 +603,61 @@ fn require_login(manager: &Manager, account_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The server URL of an account.
-fn server_of(config_dir: &std::path::Path, account_id: &str) -> Result<String, String> {
-    let config = oc_config::load_config(config_dir).map_err(|error| error.to_string())?;
-    config
-        .accounts
-        .iter()
-        .find(|account| account.id == account_id)
-        .map(|account| account.server_url.clone())
-        .ok_or_else(|| format!("unbekanntes Konto '{account_id}'"))
-}
-
 /// Interactive browser login for one account.
 async fn run_login(
     config_dir: &std::path::Path,
-    managers: &Managers,
+    providers: &Providers,
     account_id: &str,
 ) -> Result<(), String> {
-    let manager = manager(config_dir, managers, account_id)?;
-    manager
+    let provider = provider_of(config_dir, providers, account_id)?;
+    provider
         .login(true, DEFAULT_LOGIN_TIMEOUT)
         .await
-        .map_err(|error| error.to_string())?;
-    Ok(())
+        .map_err(|error| error.to_string())
 }
 
-/// Logout of one account: revokes the refresh token and clears the store.
+/// Logout of one account: revokes the stored credential and clears it.
 async fn run_logout(
     config_dir: &std::path::Path,
-    managers: &Managers,
+    providers: &Providers,
     account_id: &str,
 ) -> Result<(), String> {
-    let manager = manager(config_dir, managers, account_id)?;
-    manager.logout().await.map_err(|error| error.to_string())?;
-    Ok(())
+    let provider = provider_of(config_dir, providers, account_id)?;
+    provider.logout().await.map_err(|error| error.to_string())
 }
 
-/// Lists the spaces of an account via the Graph API.
+/// Lists the syncable roots (OpenCloud spaces) of an account.
 async fn run_list_spaces(
     config_dir: &std::path::Path,
-    managers: &Managers,
+    providers: &Providers,
     account_id: &str,
-) -> Result<Vec<Space>, String> {
-    let manager = manager(config_dir, managers, account_id)?;
-    require_login(&manager, account_id)?;
-    let server = server_of(config_dir, account_id)?;
-    let graph = GraphClient::new(&server, manager).map_err(|error| error.to_string())?;
-    graph.list_spaces().await.map_err(|error| error.to_string())
+) -> Result<Vec<StorageRoot>, String> {
+    let provider = provider_of(config_dir, providers, account_id)?;
+    require_login(&provider, account_id)?;
+    provider.roots().await.map_err(|error| error.to_string())
 }
 
 /// Lists the direct subfolders of a remote folder (wizard folder tree).
 async fn run_fetch_children(
     config_dir: &std::path::Path,
-    managers: &Managers,
+    providers: &Providers,
     account_id: &str,
     space_id: &str,
     path: &str,
-) -> Result<Vec<DavResource>, String> {
-    let manager = manager(config_dir, managers, account_id)?;
-    require_login(&manager, account_id)?;
-    let server = server_of(config_dir, account_id)?;
-    let dav = WebDavClient::new(&server, space_id, manager).map_err(|error| error.to_string())?;
-    let listing = dav
-        .propfind(path, Depth::One)
+) -> Result<Vec<RemoteEntry>, String> {
+    let provider = provider_of(config_dir, providers, account_id)?;
+    require_login(&provider, account_id)?;
+    let storage = provider
+        .storage(space_id)
+        .map_err(|error| error.to_string())?;
+    let listing = storage
+        .list(path)
         .await
         .map_err(|error| error.to_string())?;
-    let mut folders: Vec<DavResource> = listing
+    let mut folders: Vec<RemoteEntry> = listing
+        .children
         .into_iter()
-        .filter(|resource| resource.is_dir && resource.server_path != path)
+        .filter(|entry| entry.is_dir)
         .collect();
     folders.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(folders)
@@ -702,8 +671,8 @@ async fn run_resolve(
     conflict_ids: &[i64],
     resolution: ConflictResolution,
 ) {
-    let setup = resolve_setup(&backend.config_dir, &backend.managers, job_id);
-    let (dav, db, local_path) = match setup {
+    let setup = resolve_setup(&backend.config_dir, &backend.providers, job_id);
+    let (storage, db, local_path) = match setup {
         Ok(setup) => setup,
         Err(error) => {
             for &conflict_id in conflict_ids {
@@ -718,10 +687,17 @@ async fn run_resolve(
     };
     let chunk = EngineOptions::default().download_chunk_size;
     for &conflict_id in conflict_ids {
-        let result = oc_sync::resolve(&dav, &db, &local_path, conflict_id, resolution, chunk)
-            .await
-            .map(|outcome| matches!(outcome, oc_sync::ResolveOutcome::Resolved))
-            .map_err(|error| error.to_string());
+        let result = oc_sync::resolve(
+            storage.as_ref(),
+            &db,
+            &local_path,
+            conflict_id,
+            resolution,
+            chunk,
+        )
+        .await
+        .map(|outcome| matches!(outcome, oc_sync::ResolveOutcome::Resolved))
+        .map_err(|error| error.to_string());
         backend.report(BackendEvent::ResolveFinished {
             job_id: job_id.to_owned(),
             conflict_id,
@@ -730,27 +706,24 @@ async fn run_resolve(
     }
 }
 
-/// Client, database, and local root for resolving a job's conflicts.
-type ResolveSetup = (
-    WebDavClient<Arc<Manager>>,
-    std::sync::Mutex<StatusDb>,
-    PathBuf,
-);
+/// Storage, database, and local root for resolving a job's conflicts.
+type ResolveSetup = (Arc<dyn RemoteStorage>, std::sync::Mutex<StatusDb>, PathBuf);
 
 /// Builds what [`run_resolve`] needs for one job.
 fn resolve_setup(
     config_dir: &std::path::Path,
-    managers: &Managers,
+    providers: &Providers,
     job_id: &str,
 ) -> Result<ResolveSetup, String> {
-    let (job, server) = job_server(config_dir, job_id)?;
-    let manager = managers.get(&job.account_id, &server)?;
-    require_login(&manager, &job.account_id)?;
-    let dav =
-        WebDavClient::new(&server, &job.space_id, manager).map_err(|error| error.to_string())?;
+    let (job, account) = job_account(config_dir, job_id)?;
+    let provider = providers.get(&account).map_err(|error| error.to_string())?;
+    require_login(&provider, &job.account_id)?;
+    let storage = provider
+        .storage(&job.space_id)
+        .map_err(|error| error.to_string())?;
     let db_path = db_path(config_dir, &job.id).map_err(|error| error.to_string())?;
     let db = StatusDb::open(db_path).map_err(|error| error.to_string())?;
-    Ok((dav, std::sync::Mutex::new(db), job.local_path))
+    Ok((storage, std::sync::Mutex::new(db), job.local_path))
 }
 
 /// Builds the engine jobs from config + jobs, skipping accounts without
@@ -758,14 +731,14 @@ fn resolve_setup(
 /// engine and human-readable notices (skipped jobs, reset databases).
 fn start_engine(
     config_dir: &std::path::Path,
-    managers: &Managers,
+    providers: &Providers,
     config: &Config,
     jobs: &Jobs,
 ) -> Result<(Engine, Vec<String>), String> {
-    let servers: HashMap<&str, &str> = config
+    let accounts: HashMap<&str, &Account> = config
         .accounts
         .iter()
-        .map(|account| (account.id.as_str(), account.server_url.as_str()))
+        .map(|account| (account.id.as_str(), account))
         .collect();
     let enabled = Jobs {
         version: jobs.version,
@@ -795,28 +768,28 @@ fn start_engine(
             );
             continue;
         }
-        let Some(server) = servers.get(job.account_id.as_str()) else {
+        let Some(account) = accounts.get(job.account_id.as_str()) else {
             skip(&job.id, format!("unbekanntes Konto '{}'", job.account_id));
             continue;
         };
-        let manager = match managers.get(&job.account_id, server) {
-            Ok(manager) => manager,
+        let provider = match providers.get(account) {
+            Ok(provider) => provider,
             Err(error) => {
-                skip(&job.id, format!("Auth-Client: {error}"));
+                skip(&job.id, format!("Anbieter: {error}"));
                 continue;
             }
         };
-        if !manager.has_stored_login() {
+        if !provider.has_stored_login() {
             skip(
                 &job.id,
                 format!("Konto '{}' ist nicht angemeldet", job.account_id),
             );
             continue;
         }
-        let dav = match WebDavClient::new(server, &job.space_id, manager) {
-            Ok(dav) => dav,
+        let storage = match provider.storage(&job.space_id) {
+            Ok(storage) => storage,
             Err(error) => {
-                skip(&job.id, format!("WebDAV-Client: {error}"));
+                skip(&job.id, format!("Speicher-Client: {error}"));
                 continue;
             }
         };
@@ -848,7 +821,7 @@ fn start_engine(
             &job.include,
             &job.exclude,
             job.sync_root_files,
-            dav,
+            storage,
             db,
         ) {
             Ok(engine_job) => engine_jobs.push(engine_job),
@@ -857,7 +830,7 @@ fn start_engine(
     }
     for job_id in resets {
         notices.push(format!(
-            "Status-Datenbank von Job '{job_id}' gehörte zu einem anderen Space oder Ordner \
+            "Status-Datenbank von Job '{job_id}' gehörte zu einem anderen Speicherort oder Ordner \
              und wurde zurückgesetzt"
         ));
     }

@@ -9,8 +9,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use oc_api::{DavResource, Space};
 use oc_config::SyncJob;
+use oc_storage::{RemoteEntry, StorageRoot};
 
 use super::backend::UiCommand;
 
@@ -33,7 +33,7 @@ pub struct SpacesState {
     /// A `ListSpaces` request is in flight.
     pub loading: bool,
     /// The loaded spaces, once available.
-    pub list: Option<Vec<Space>>,
+    pub list: Option<Vec<StorageRoot>>,
     /// Why the last request failed; no new request is sent until the
     /// user retries (otherwise every frame would send one).
     pub error: Option<String>,
@@ -44,7 +44,7 @@ pub struct SpacesState {
 pub struct FolderTree {
     /// Loaded subfolders per path (`""` = space root); shared slices, so
     /// rendering a node does not copy its children every frame.
-    pub children: HashMap<String, Rc<[DavResource]>>,
+    pub children: HashMap<String, Rc<[RemoteEntry]>>,
     /// Pending child requests: path -> correlation token.
     pub loading: HashMap<String, u32>,
     /// Failed child requests: path -> error. Not re-sent automatically;
@@ -61,7 +61,7 @@ pub struct FolderTree {
 impl FolderTree {
     /// Sends a child request for `path` unless it is loaded or pending.
     /// `server_path` addresses the folder on the server (its spelling may
-    /// differ from the normalized `path`, see `DavResource::server_path`).
+    /// differ from the normalized `path`, see `RemoteEntry::server_path`).
     pub fn fetch(
         &mut self,
         account_id: &str,
@@ -90,7 +90,7 @@ impl FolderTree {
     /// Applies a `Children` answer: resolves the token to its path and
     /// stores (and expands) the loaded subfolders. Returns false when
     /// the token is unknown (stale answer).
-    pub fn apply_children(&mut self, token: u32, result: Result<Vec<DavResource>, String>) -> bool {
+    pub fn apply_children(&mut self, token: u32, result: Result<Vec<RemoteEntry>, String>) -> bool {
         let Some(path) = self
             .loading
             .iter()
@@ -252,7 +252,7 @@ impl Wizard {
     }
 
     /// Applies a `Spaces` answer of the backend.
-    pub fn apply_spaces(&mut self, result: Result<Vec<Space>, String>) {
+    pub fn apply_spaces(&mut self, result: Result<Vec<StorageRoot>, String>) {
         self.spaces.loading = false;
         match result {
             Ok(list) => {
@@ -266,7 +266,7 @@ impl Wizard {
     /// Applies a `Children` answer of the backend (stale tokens are
     /// ignored); reports whether the answer was consumed. Errors land
     /// in the wizard's status line.
-    pub fn apply_children(&mut self, token: u32, result: Result<Vec<DavResource>, String>) -> bool {
+    pub fn apply_children(&mut self, token: u32, result: Result<Vec<RemoteEntry>, String>) -> bool {
         let status = result.as_ref().err().cloned();
         let consumed = self.tree.apply_children(token, result);
         if consumed {
@@ -285,8 +285,22 @@ impl Wizard {
         }
     }
 
+    /// Switches to another account: the spaces list (and any request or
+    /// error state) belongs to the previous account, so it is dropped
+    /// together with the chosen space; the next frame requests or takes
+    /// the new account's list. A late answer for the old account is
+    /// ignored because `BackendEvent::Spaces` is matched by account id.
+    pub fn select_account(&mut self, account_id: Option<String>) {
+        if self.account_id == account_id {
+            return;
+        }
+        self.account_id = account_id;
+        self.spaces = SpacesState::default();
+        self.reset_space(None);
+    }
+
     /// Resets the space-dependent state (after choosing another space).
-    pub fn reset_space(&mut self, space: Option<&Space>) {
+    pub fn reset_space(&mut self, space: Option<&StorageRoot>) {
         self.space_id = space.map(|space| space.id.clone());
         self.space_name = space.map(|space| space.name.clone());
         self.tree = FolderTree::default();
@@ -357,6 +371,33 @@ mod tests {
         // An existing choice is not overwritten.
         wizard.preselect_account("konto-2");
         assert_eq!(wizard.account_id.as_deref(), Some("konto-1"));
+    }
+
+    #[test]
+    fn select_account_drops_previous_spaces() {
+        let root = StorageRoot {
+            id: "space-1".into(),
+            name: "Persönlich".into(),
+            kind: "personal".into(),
+            quota: None,
+        };
+        let mut wizard = Wizard::default();
+        wizard.preselect_account("konto-1");
+        wizard.apply_spaces(Ok(vec![root.clone()]));
+        wizard.reset_space(Some(&root));
+        wizard.spaces.error = Some("alt".into());
+
+        // Same account: nothing changes.
+        wizard.select_account(Some("konto-1".into()));
+        assert_eq!(wizard.space_id.as_deref(), Some("space-1"));
+
+        wizard.select_account(Some("konto-2".into()));
+        assert_eq!(wizard.account_id.as_deref(), Some("konto-2"));
+        assert!(wizard.spaces.list.is_none(), "old account's spaces must go");
+        assert!(wizard.spaces.error.is_none());
+        assert!(!wizard.spaces.loading);
+        assert!(wizard.space_id.is_none());
+        assert!(wizard.space_name.is_none());
     }
 
     #[test]

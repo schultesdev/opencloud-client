@@ -18,10 +18,10 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use oc_api::{ApiError, Depth, TokenProvider, WebDavClient};
 use oc_config::ConflictPolicy;
 use oc_db::StatusDb;
 use oc_db::{ConflictResolution, EntryState, NewConflict, NewEntry};
+use oc_storage::{RemoteStorage, StorageError};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -40,21 +40,31 @@ use crate::transfer::{self, LocalGuard, TransferPaths, TransferResult};
 use crate::watch::LocalWatcher;
 
 /// Configuration of a sync job handed to [`Engine::start`].
-#[derive(Debug)]
-pub struct Job<P: TokenProvider> {
+pub struct Job {
     /// Stable job identifier (also the database file name).
     pub id: String,
-    /// Absolute local root directory mirroring the space.
+    /// Absolute local root directory mirroring the remote root.
     pub local_root: PathBuf,
     /// Selective-sync filter of the job.
     pub filter: Filter,
-    /// WebDAV client of the space.
-    pub dav: Arc<WebDavClient<P>>,
+    /// The remote storage (provider-neutral) the job syncs with.
+    pub storage: Arc<dyn RemoteStorage>,
     /// Status database of the job.
     pub db: StatusDb,
 }
 
-impl<P: TokenProvider> Job<P> {
+impl fmt::Debug for Job {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Job")
+            .field("id", &self.id)
+            .field("local_root", &self.local_root)
+            .field("filter", &self.filter)
+            .field("db", &self.db)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Job {
     /// Assembles a job from its config parts; the filter is built from
     /// the job's `include`/`exclude` patterns and the root-files toggle.
     #[allow(clippy::too_many_arguments)]
@@ -64,14 +74,14 @@ impl<P: TokenProvider> Job<P> {
         include: &[String],
         exclude: &[String],
         sync_root_files: bool,
-        dav: WebDavClient<P>,
+        storage: Arc<dyn RemoteStorage>,
         db: StatusDb,
     ) -> Result<Self, SyncError> {
         Ok(Self {
             id: id.into(),
             local_root: local_root.into(),
             filter: Filter::new(include, exclude, sync_root_files)?,
-            dav: Arc::new(dav),
+            storage,
             db,
         })
     }
@@ -137,21 +147,21 @@ impl Default for EngineOptions {
 /// behind a mutex — rusqlite connections are `Send` but not `Sync`, and
 /// the task future must be `Send` for `tokio::spawn`. The guard is never
 /// held across an `await`.
-struct JobTask<P: TokenProvider> {
+struct JobTask {
     id: String,
     local_root: PathBuf,
     filter: Filter,
-    dav: Arc<WebDavClient<P>>,
+    storage: Arc<dyn RemoteStorage>,
     db: std::sync::Mutex<StatusDb>,
 }
 
-impl<P: TokenProvider> From<Job<P>> for JobTask<P> {
-    fn from(job: Job<P>) -> Self {
+impl From<Job> for JobTask {
+    fn from(job: Job) -> Self {
         Self {
             id: job.id,
             local_root: job.local_root,
             filter: job.filter,
-            dav: job.dav,
+            storage: job.storage,
             db: std::sync::Mutex::new(job.db),
         }
     }
@@ -363,10 +373,7 @@ impl Engine {
     /// runs a sync pass immediately, then on watcher triggers and the
     /// periodic interval. A job whose watcher cannot be installed runs
     /// with the interval only (reported as [`EngineEvent::Failed`]).
-    pub fn start<P: TokenProvider + 'static>(
-        jobs: Vec<Job<P>>,
-        options: EngineOptions,
-    ) -> Result<Self, SyncError> {
+    pub fn start(jobs: Vec<Job>, options: EngineOptions) -> Result<Self, SyncError> {
         // The global excludes are merged into every job up front, so an
         // invalid pattern fails the start instead of a single job later.
         let mut jobs = jobs;
@@ -480,8 +487,8 @@ impl Engine {
 /// is unreachable no passes run; triggers stay pending and are applied
 /// once the connection is back (the queue survives). Explicit commands
 /// (`SyncNow`, `Resume`) cancel a running backoff.
-async fn job_loop<P: TokenProvider + 'static>(
-    job: JobTask<P>,
+async fn job_loop(
+    job: JobTask,
     options: EngineOptions,
     mut commands: mpsc::Receiver<JobCommand>,
     mut triggers: mpsc::UnboundedReceiver<()>,
@@ -640,18 +647,13 @@ impl<'a> PassFailures<'a> {
 
     /// Records one failed path: counts it, emits the event, and notes
     /// the first throttling error. [`SyncError`] cannot be cloned (it
-    /// wraps io errors), so a fresh representative of the throttling
-    /// kind is kept; the per-path event carries the original.
+    /// wraps io errors), so a copy of the storage error is kept; the
+    /// per-path event carries the original.
     fn fail(&mut self, path: &str, error: &SyncError) {
         if self.throttled.is_none() {
             self.throttled = match error {
-                SyncError::Api(ApiError::Status { code }) if *code == 425 => {
-                    Some(SyncError::Api(ApiError::Status { code: *code }))
-                }
-                SyncError::Api(ApiError::RateLimited { retry_after }) => {
-                    Some(SyncError::Api(ApiError::RateLimited {
-                        retry_after: *retry_after,
-                    }))
+                SyncError::Storage(error) if error.is_throttled() => {
+                    Some(SyncError::Storage(error.clone()))
                 }
                 _ => None,
             };
@@ -688,8 +690,8 @@ fn finish_pass(
 /// the aborting error is returned alongside the summary so the job loop
 /// can classify it (a connectivity failure or server throttling switches
 /// the job to offline backoff, Phase 8).
-async fn run_once<P: TokenProvider + 'static>(
-    job: &JobTask<P>,
+async fn run_once(
+    job: &JobTask,
     options: &EngineOptions,
     events: &UnboundedSender<EngineEvent>,
 ) -> (RunSummary, Option<SyncError>) {
@@ -737,15 +739,25 @@ async fn run_once<P: TokenProvider + 'static>(
 
     // Remote snapshot; the root ETag shortcuts the traversal when the
     // server reports no change since the last completed pass.
-    let root = match job.dav.propfind("", Depth::Zero).await {
-        Ok(root) => root,
+    let root = match job.storage.stat("").await {
+        Ok(Some(root)) => root,
+        // The root itself is gone (e.g. a deleted space): never read
+        // that as an empty remote tree.
+        Ok(None) => {
+            abort_pass(
+                &mut failures,
+                &mut aborted,
+                SyncError::Storage(StorageError::NotFound),
+            );
+            return finish_pass(summary, failures, aborted);
+        }
         Err(error) => {
             let error = SyncError::from(error);
             abort_pass(&mut failures, &mut aborted, error);
             return finish_pass(summary, failures, aborted);
         }
     };
-    let root_etag = root.first().and_then(|resource| resource.etag.clone());
+    let root_etag = root.etag;
     let stored_etag = db_lock(&job.db).meta("space_etag").ok().flatten();
     // The ETag only vouches for the state the filter covered when it was
     // recorded. A changed include/exclude set has removed entries from
@@ -769,7 +781,7 @@ async fn run_once<P: TokenProvider + 'static>(
             Vec::new(),
         )
     } else {
-        let listing = match job.dav.propfind("", Depth::One).await {
+        let listing = match job.storage.list("").await {
             Ok(listing) => listing,
             Err(error) => {
                 let error = SyncError::from(error);
@@ -778,7 +790,7 @@ async fn run_once<P: TokenProvider + 'static>(
             }
         };
         match scan::scan_remote_from_root(
-            job.dav.as_ref(),
+            job.storage.as_ref(),
             &job.filter,
             &listing,
             options.propfind_pause,
@@ -881,7 +893,7 @@ async fn run_once<P: TokenProvider + 'static>(
     }
 
     let context = TransferContext {
-        dav: job.dav.clone(),
+        storage: job.storage.clone(),
         root: job.local_root.clone(),
         chunk_size: options.download_chunk_size,
         semaphore: Arc::new(Semaphore::new(options.max_parallel_transfers.max(1))),
@@ -900,24 +912,27 @@ async fn run_once<P: TokenProvider + 'static>(
             break;
         }
         match action {
-            SyncAction::MkcolRemote { path } => match job.dav.mkcol(&names.resolve(&path)).await {
-                // 405: the folder already exists (created concurrently).
-                Ok(()) | Err(ApiError::Status { code: 405 }) => {
-                    summary.folders_created += 1;
-                    match local_node_at(&job.local_root, &path) {
-                        Ok(Some(node)) => {
-                            if let Err(error) =
-                                upsert_synced(&job.db, &path, true, node, None, None, now)
-                            {
-                                failures.fail(&path, &error);
+            SyncAction::MkcolRemote { path } => {
+                match job.storage.create_dir(&names.resolve(&path)).await {
+                    // An existing folder (created concurrently) counts as
+                    // success.
+                    Ok(()) => {
+                        summary.folders_created += 1;
+                        match local_node_at(&job.local_root, &path) {
+                            Ok(Some(node)) => {
+                                if let Err(error) =
+                                    upsert_synced(&job.db, &path, true, node, None, None, now)
+                                {
+                                    failures.fail(&path, &error);
+                                }
                             }
+                            Ok(None) => {}
+                            Err(error) => failures.fail(&path, &error),
                         }
-                        Ok(None) => {}
-                        Err(error) => failures.fail(&path, &error),
                     }
+                    Err(error) => failures.fail(&path, &SyncError::from(error)),
                 }
-                Err(error) => failures.fail(&path, &SyncError::from(error)),
-            },
+            }
             SyncAction::MkcolLocal { path } => match scan::abs_local_path(&job.local_root, &path) {
                 Ok(target) => {
                     if let Err(source) = std::fs::create_dir_all(&target) {
@@ -947,10 +962,10 @@ async fn run_once<P: TokenProvider + 'static>(
                 Err(error) => failures.fail(&path, &error),
             },
             SyncAction::DeleteRemote { path, is_dir } => {
-                match job.dav.delete(&names.resolve(&path)).await {
-                    // 404: already gone (e.g. the parent folder was deleted
-                    // first) — the outcome is the same.
-                    Ok(()) | Err(ApiError::NotFound) => {
+                match job.storage.delete(&names.resolve(&path)).await {
+                    // Already gone (e.g. the parent folder was deleted
+                    // first) counts as success.
+                    Ok(()) => {
                         let result = if is_dir {
                             db_lock(&job.db).delete_subtree(&path)
                         } else {
@@ -1078,7 +1093,7 @@ async fn run_once<P: TokenProvider + 'static>(
     for (is_upload, path, task) in transfers {
         let result = match task.await {
             Ok(result) => result,
-            Err(source) => Err(SyncError::Api(ApiError::protocol(format!(
+            Err(source) => Err(SyncError::Storage(StorageError::protocol(format!(
                 "transfer task for '{path}' failed: {source}"
             )))),
         };
@@ -1110,15 +1125,20 @@ async fn run_once<P: TokenProvider + 'static>(
                 // network) must not read as "deleted remotely", so the
                 // path is left to the next pass instead of freezing it
                 // behind a conflict with a made-up remote side.
-                let current_remote =
-                    match current_remote(job.dav.as_ref(), &names.resolve(&path), &path).await {
-                        Ok(remote) => remote,
-                        Err(error) => {
-                            failures.fail(&path, &error);
-                            let _ = mark_state(&job.db, &path, EntryState::Synced);
-                            continue;
-                        }
-                    };
+                let current_remote = match current_remote(
+                    job.storage.as_ref(),
+                    &names.resolve(&path),
+                    &path,
+                )
+                .await
+                {
+                    Ok(remote) => remote,
+                    Err(error) => {
+                        failures.fail(&path, &error);
+                        let _ = mark_state(&job.db, &path, EntryState::Synced);
+                        continue;
+                    }
+                };
                 let local_node = local.get(&path).copied();
                 if local_node.is_none() && current_remote.is_none() {
                     // The path vanished on both sides since the scan:
@@ -1191,9 +1211,9 @@ async fn run_once<P: TokenProvider + 'static>(
 }
 
 /// What every transfer task of one pass shares.
-struct TransferContext<P: TokenProvider> {
-    /// The job's WebDAV client.
-    dav: Arc<WebDavClient<P>>,
+struct TransferContext {
+    /// The job's remote storage.
+    storage: Arc<dyn RemoteStorage>,
     /// The job's local root.
     root: PathBuf,
     /// Chunk size of range downloads.
@@ -1210,15 +1230,15 @@ struct TransferContext<P: TokenProvider> {
 /// lists running transfers only — and settles there on every outcome:
 /// a completed transfer counts its `planned` bytes, any other result
 /// (conflict, kept local edit, error) is abandoned.
-fn spawn_transfer<P: TokenProvider + 'static>(
-    context: &TransferContext<P>,
+fn spawn_transfer(
+    context: &TransferContext,
     kind: PendingTransfer,
     path: String,
     remote_path: String,
     planned: u64,
 ) -> JoinHandle<Result<TransferResult, SyncError>> {
     let tracker = context.tracker.clone();
-    let dav = context.dav.clone();
+    let storage = context.storage.clone();
     let root = context.root.clone();
     let chunk_size = context.chunk_size;
     let semaphore = context.semaphore.clone();
@@ -1226,7 +1246,7 @@ fn spawn_transfer<P: TokenProvider + 'static>(
         let _permit = semaphore
             .acquire_owned()
             .await
-            .map_err(|_| SyncError::Api(ApiError::protocol("transfer semaphore closed")))?;
+            .map_err(|_| SyncError::Storage(StorageError::protocol("transfer semaphore closed")))?;
         let direction = match kind {
             PendingTransfer::Upload { .. } => TransferDirection::Upload,
             PendingTransfer::Download { .. } => TransferDirection::Download,
@@ -1239,11 +1259,11 @@ fn spawn_transfer<P: TokenProvider + 'static>(
         };
         let result = match kind {
             PendingTransfer::Upload { base_etag, create } => {
-                transfer::upload(dav.as_ref(), paths, base_etag, create, Some(&handle)).await
+                transfer::upload(storage.as_ref(), paths, base_etag, create, Some(&handle)).await
             }
             PendingTransfer::Download { remote, guard } => {
                 transfer::download(
-                    dav.as_ref(),
+                    storage.as_ref(),
                     paths,
                     &remote,
                     chunk_size,
@@ -1494,27 +1514,21 @@ pub(crate) fn local_node_at(
 
 /// The current remote state of a path, as needed after a rejected
 /// optimistic write: `Ok(None)` — the path is gone on the server; `Err`
-/// — the state could not be determined (the PROPFIND failed or returned
+/// — the state could not be determined (the lookup failed or returned
 /// nothing). `None` must never be guessed from a failed lookup: a
 /// conflict row would read it as "deleted remotely", and resolutions
 /// would delete or discard local data on that guess.
-async fn current_remote<P: TokenProvider>(
-    dav: &WebDavClient<P>,
+async fn current_remote(
+    storage: &dyn RemoteStorage,
     remote_path: &str,
     path: &str,
 ) -> Result<Option<RemoteNode>, SyncError> {
-    match dav.propfind(remote_path, Depth::Zero).await {
-        Ok(resources) => resources
-            .first()
-            .map(RemoteNode::from_resource)
-            .map(Some)
-            .ok_or_else(|| {
-                SyncError::Api(ApiError::protocol(format!(
-                    "'{path}' rejected the write and reported no current state"
-                )))
-            }),
-        Err(ApiError::NotFound) => Ok(None),
-        Err(source) => Err(SyncError::Api(source)),
+    match storage.stat(remote_path).await {
+        Ok(entry) => Ok(entry.map(|entry| RemoteNode::from_entry(&entry))),
+        Err(StorageError::Protocol(message)) => Err(SyncError::Storage(StorageError::protocol(
+            format!("'{path}' rejected the write and reported no current state: {message}"),
+        ))),
+        Err(source) => Err(SyncError::Storage(source)),
     }
 }
 
@@ -1642,8 +1656,8 @@ fn record_conflict(
 /// and `conflict_copy` resolve it right away. Whatever needs the user
 /// after all (remote changed again mid-resolution, unresolvable kind,
 /// failed transfer) surfaces as a conflict event.
-async fn handle_conflict<P: TokenProvider>(
-    job: &JobTask<P>,
+async fn handle_conflict(
+    job: &JobTask,
     options: &EngineOptions,
     events: &UnboundedSender<EngineEvent>,
     summary: &mut RunSummary,
@@ -1714,8 +1728,8 @@ enum PolicyOutcome {
 /// Applies the configured conflict policy to a freshly recorded
 /// conflict. Keeps the engine's bookkeeping in one place; the actual
 /// resolution logic lives in [`crate::conflict`].
-async fn apply_policy<P: TokenProvider>(
-    job: &JobTask<P>,
+async fn apply_policy(
+    job: &JobTask,
     options: &EngineOptions,
     conflict_id: i64,
     path: &str,
@@ -1737,7 +1751,7 @@ async fn apply_policy<P: TokenProvider>(
         }
     };
     match conflict::resolve(
-        job.dav.as_ref(),
+        job.storage.as_ref(),
         &job.db,
         &job.local_root,
         conflict_id,

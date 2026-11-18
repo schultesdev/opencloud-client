@@ -4,12 +4,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use oc_storage::WriteCondition;
 use reqwest::header::{CONTENT_TYPE, ETAG};
 use reqwest::{Method, Response};
 use url::Url;
 
 use crate::error::ApiError;
-use crate::http::{AuthedHttp, Replay, parse_server_url};
+use crate::http::{Activity, AuthedHttp, Replay, parse_server_url};
 use crate::path::{build_url, encode_segment, href_to_server_path, normalize_nfc};
 use crate::propfind::{PROPFIND_BODY, RawResource, parse_multistatus};
 use crate::retry::RetryConfig;
@@ -32,20 +33,6 @@ impl Depth {
             Self::One => "1",
         }
     }
-}
-
-/// Optimistic-write condition for [`WebDavClient::put_with`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WriteCondition {
-    /// Only write when the remote ETag still matches the recorded one
-    /// (`If-Match`); a mismatch yields [`ApiError::PreconditionFailed`].
-    IfMatch {
-        /// The recorded remote ETag (quoted form, e.g. `"abc"`).
-        etag: String,
-    },
-    /// Only create the file when it does not yet exist remotely
-    /// (`If-None-Match: *`).
-    CreateNew,
 }
 
 /// One WebDAV resource as returned by [`WebDavClient::propfind`].
@@ -150,6 +137,11 @@ impl<P: TokenProvider> WebDavClient<P> {
         &self.base
     }
 
+    /// The shared HTTP core (token, retries, timeouts).
+    pub(crate) fn http(&self) -> &AuthedHttp<P> {
+        &self.http
+    }
+
     /// Lists the resource itself and, with [`Depth::One`], its direct
     /// children, with ETag, size, mtime, and collection flag. The first
     /// entry is the requested resource; for the root its `path` is `""`.
@@ -161,11 +153,10 @@ impl<P: TokenProvider> WebDavClient<P> {
         let propfind = self.propfind_method()?;
         let response = self
             .http
-            .send(Some(self.http.request_timeout()), Replay::Safe, |token| {
+            .send(Some(self.http.request_timeout()), Replay::Safe, || {
                 self.http
                     .http()
                     .request(propfind.clone(), url.clone())
-                    .bearer_auth(token)
                     .header("Depth", depth.as_str())
                     .header(CONTENT_TYPE, "application/xml")
                     .body(PROPFIND_BODY)
@@ -181,12 +172,7 @@ impl<P: TokenProvider> WebDavClient<P> {
     /// Downloads a file; the returned [`Response`] streams the body. The
     /// ETag is available in its `ETag` header.
     pub async fn get(&self, path: &str) -> Result<Response, ApiError> {
-        let url = build_url(&self.base, path)?;
-        self.http
-            .send(None, Replay::Safe, |token| {
-                self.http.http().get(url.clone()).bearer_auth(token)
-            })
-            .await
+        self.fetch(path, None, None).await
     }
 
     /// Downloads a byte range of a file (`Range: bytes=<start>-<end>`,
@@ -206,15 +192,23 @@ impl<P: TokenProvider> WebDavClient<P> {
         end: u64,
         if_match: Option<&str>,
     ) -> Result<Response, ApiError> {
+        self.fetch(path, Some((start, end)), if_match).await
+    }
+
+    /// Shared GET: optional inclusive byte range and `If-Match`.
+    pub(crate) async fn fetch(
+        &self,
+        path: &str,
+        range: Option<(u64, u64)>,
+        if_match: Option<&str>,
+    ) -> Result<Response, ApiError> {
         let url = build_url(&self.base, path)?;
         self.http
-            .send(None, Replay::Safe, |token| {
-                let request = self
-                    .http
-                    .http()
-                    .get(url.clone())
-                    .bearer_auth(token)
-                    .header("Range", format!("bytes={start}-{end}"));
+            .send(None, Replay::Safe, || {
+                let mut request = self.http.http().get(url.clone());
+                if let Some((start, end)) = range {
+                    request = request.header("Range", format!("bytes={start}-{end}"));
+                }
                 match if_match {
                     Some(etag) => request.header("If-Match", etag),
                     None => request,
@@ -263,11 +257,12 @@ impl<P: TokenProvider> WebDavClient<P> {
         let url = build_url(&self.base, path)?;
         // One copy into a shared buffer; attempts and chunks slice it.
         let content = bytes::Bytes::copy_from_slice(content.as_ref());
-        let progress: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(progress);
+        let activity = Activity::new();
+        let progress = watched_progress(&activity, content.len() as u64, progress);
         let response = self
             .http
-            .send(None, put_replay(&condition), move |token| {
-                let request = self.http.http().put(url.clone()).bearer_auth(token);
+            .send_upload(&activity, put_replay(&condition), move || {
+                let request = self.http.upload_http().put(url.clone());
                 apply_condition(request, &condition)
                     .body(progress_body(content.clone(), progress.clone()))
             })
@@ -290,18 +285,19 @@ impl<P: TokenProvider> WebDavClient<P> {
         progress: impl Fn(u64) + Send + Sync + 'static,
     ) -> Result<Option<String>, ApiError> {
         let url = build_url(&self.base, path)?;
-        let progress: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(progress);
+        let activity = Activity::new();
+        let progress = watched_progress(&activity, length, progress);
         let response = self
             .http
-            .send(None, put_replay(&condition), move |token| {
+            .send_upload(&activity, put_replay(&condition), move || {
                 let request = self
                     .http
-                    .http()
+                    .upload_http()
                     .put(url.clone())
-                    .bearer_auth(token)
                     .header(reqwest::header::CONTENT_LENGTH, length);
                 apply_condition(request, &condition).body(file_body(
                     source,
+                    0,
                     length,
                     progress.clone(),
                 ))
@@ -315,11 +311,8 @@ impl<P: TokenProvider> WebDavClient<P> {
         let url = build_url(&self.base, path)?;
         let mkcol = webdav_method(b"MKCOL")?;
         self.http
-            .send(Some(self.http.request_timeout()), Replay::Safe, |token| {
-                self.http
-                    .http()
-                    .request(mkcol.clone(), url.clone())
-                    .bearer_auth(token)
+            .send(Some(self.http.request_timeout()), Replay::Safe, || {
+                self.http.http().request(mkcol.clone(), url.clone())
             })
             .await?;
         Ok(())
@@ -329,8 +322,8 @@ impl<P: TokenProvider> WebDavClient<P> {
     pub async fn delete(&self, path: &str) -> Result<(), ApiError> {
         let url = build_url(&self.base, path)?;
         self.http
-            .send(Some(self.http.request_timeout()), Replay::Safe, |token| {
-                self.http.http().delete(url.clone()).bearer_auth(token)
+            .send(Some(self.http.request_timeout()), Replay::Safe, || {
+                self.http.http().delete(url.clone())
             })
             .await?;
         Ok(())
@@ -369,11 +362,10 @@ impl<P: TokenProvider> WebDavClient<P> {
             .send(
                 Some(self.http.request_timeout()),
                 Replay::OnlyUnprocessed,
-                |token| {
+                || {
                     self.http
                         .http()
                         .request(method.clone(), source.clone())
-                        .bearer_auth(token)
                         .header("Destination", destination.as_str())
                         .header("Overwrite", overwrite)
                 },
@@ -408,7 +400,7 @@ impl<P: TokenProvider> WebDavClient<P> {
 }
 
 /// Builds a WebDAV-specific HTTP method (`PROPFIND`, `MKCOL`, ...).
-fn webdav_method(name: &[u8]) -> Result<Method, ApiError> {
+pub(crate) fn webdav_method(name: &[u8]) -> Result<Method, ApiError> {
     Method::from_bytes(name).map_err(|_| {
         ApiError::protocol(format!(
             "invalid WebDAV method '{}'",
@@ -444,7 +436,7 @@ fn put_replay(condition: &Option<WriteCondition>) -> Replay {
 }
 
 /// The `ETag` header of a response, if present.
-fn etag_header(response: &Response) -> Option<String> {
+pub(crate) fn etag_header(response: &Response) -> Option<String> {
     response
         .headers()
         .get(ETAG)
@@ -477,17 +469,41 @@ fn progress_body(content: bytes::Bytes, progress: Arc<dyn Fn(u64) + Send + Sync>
     ))
 }
 
-/// A request body streaming `length` bytes of the file at `source`, in
-/// chunks, with progress like [`progress_body`]. Opening or reading
-/// errors (and a file shorter than `length`) fail the attempt.
-fn file_body(
+/// Wraps an upload progress callback so every report of a body of
+/// `total` bytes also counts as activity for the upload watchdog.
+pub(crate) fn watched_progress(
+    activity: &Activity,
+    total: u64,
+    progress: impl Fn(u64) + Send + Sync + 'static,
+) -> Arc<dyn Fn(u64) + Send + Sync> {
+    let activity = activity.clone();
+    Arc::new(move |sent| {
+        activity.progress(sent, total);
+        progress(sent);
+    })
+}
+
+/// A request body streaming `length` bytes of the file at `source`,
+/// starting at byte `offset`, in chunks, with progress like
+/// [`progress_body`] (counted from the start of this body). Opening or
+/// reading errors (and a file shorter than `offset + length`) fail the
+/// attempt.
+pub(crate) fn file_body(
     source: &std::path::Path,
+    offset: u64,
     length: u64,
     progress: Arc<dyn Fn(u64) + Send + Sync>,
 ) -> reqwest::Body {
     use futures_util::StreamExt;
+    use std::io::{Seek, SeekFrom};
     use tokio::io::AsyncReadExt;
-    let file = match std::fs::File::open(source) {
+    let opened = std::fs::File::open(source).and_then(|mut file| {
+        if offset > 0 {
+            file.seek(SeekFrom::Start(offset))?;
+        }
+        Ok(file)
+    });
+    let file = match opened {
         Ok(file) => tokio::fs::File::from_std(file),
         Err(error) => {
             return reqwest::Body::wrap_stream(futures_util::stream::once(async move {

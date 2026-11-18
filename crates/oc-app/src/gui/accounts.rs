@@ -15,7 +15,8 @@ impl SyncApp {
                 ui,
                 "Noch kein Konto",
                 theme.text,
-                "Verbinde einen OpenCloud-Server, um Spaces synchronisieren zu können.",
+                "Verbinde einen OpenCloud- oder Nextcloud-Server, um Ordner synchronisieren \
+                 zu können.",
                 Some("Konto hinzufügen…"),
             ) {
                 self.show_new_account = true;
@@ -43,6 +44,7 @@ impl SyncApp {
     /// and actions on the right; the loaded spaces with quota bars below.
     pub(super) fn show_account_card(&mut self, ui: &mut egui::Ui, account: &Account) {
         let theme = theme::palette();
+        let terms = RootTerms::of(account.provider);
         let state = self.accounts.entry(account.id.clone()).or_default();
         let logged_in = state.logged_in == Some(true);
         theme::card().show(ui, |ui| {
@@ -55,8 +57,12 @@ impl SyncApp {
                     if state.spaces_pending {
                         ui.spinner();
                     } else if logged_in
-                        && theme::icon_button(ui, "\u{21bb}", "Spaces & Quota aktualisieren")
-                            .clicked()
+                        && theme::icon_button(
+                            ui,
+                            "\u{21bb}",
+                            &format!("{} & Quota aktualisieren", terms.many),
+                        )
+                        .clicked()
                     {
                         state.spaces_pending = true;
                         self.backend.send(UiCommand::ListSpaces {
@@ -104,8 +110,10 @@ impl SyncApp {
                         theme::ellipsis(
                             ui,
                             egui::RichText::new(format!(
-                                "{} · {}",
-                                account.server_url, account.username
+                                "{} · {} · {}",
+                                account.provider.label(),
+                                account.server_url,
+                                account.username
                             ))
                             .small()
                             .color(theme.text_dim),
@@ -117,12 +125,12 @@ impl SyncApp {
                 return;
             };
             theme::divider(ui);
-            theme::section_label(ui, "Spaces");
+            theme::section_label(ui, terms.many);
             ui.add_space(2.0);
             match spaces {
                 Ok(spaces) if spaces.is_empty() => {
                     ui.label(
-                        egui::RichText::new("Keine Spaces.")
+                        egui::RichText::new(format!("Keine {}.", terms.many))
                             .small()
                             .color(theme.text_dim),
                     );
@@ -156,6 +164,13 @@ impl SyncApp {
                 .num_columns(2)
                 .spacing(egui::Vec2::new(14.0, 8.0))
                 .show(ui, |ui| {
+                    ui.label("Anbieter");
+                    ui.horizontal(|ui| {
+                        for kind in oc_config::ProviderKind::ALL {
+                            ui.selectable_value(&mut self.new_account.provider, kind, kind.label());
+                        }
+                    });
+                    ui.end_row();
                     ui.label("Konto-ID");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.new_account.id)
@@ -199,6 +214,7 @@ impl SyncApp {
     pub(super) fn add_account(&mut self) -> bool {
         let account = Account {
             id: self.new_account.id.trim().to_owned(),
+            provider: self.new_account.provider,
             server_url: self.new_account.server_url.trim().to_owned(),
             username: self.new_account.username.trim().to_owned(),
         };

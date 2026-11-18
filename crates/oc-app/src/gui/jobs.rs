@@ -13,7 +13,7 @@ impl SyncApp {
                 ui,
                 "Noch keine Sync-Jobs",
                 theme.text,
-                "Lege den ersten Job an, um einen Space mit einem lokalen Ordner zu \
+                "Lege den ersten Job an, um einen Cloud-Ordner mit einem lokalen Ordner zu \
                  synchronisieren.",
                 Some("Neuen Job anlegen…"),
             ) {

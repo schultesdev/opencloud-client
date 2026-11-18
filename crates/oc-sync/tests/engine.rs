@@ -10,28 +10,37 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use oc_api::{RetryConfig, StaticToken, WebDavClient};
+use oc_api::{ChunkingConfig, NextcloudStorage, RetryConfig, StaticToken, WebDavClient};
 use oc_config::ConflictPolicy;
 use oc_db::{ConflictResolution, ConflictStatus, EntryState, NewConflict, NewEntry, StatusDb};
+use oc_storage::RemoteStorage;
 use oc_sync::{
     Engine, EngineEvent, EngineOptions, Job, JobCommand, ResolveOutcome, RunSummary, resolve,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // --- Mock-WebDAV helpers --------------------------------------------------
 
-/// One `<D:response>` of a PROPFIND multistatus body.
-fn response_xml(path: &str, is_dir: bool, etag: Option<&str>, size: Option<u64>) -> String {
-    let href = if path.is_empty() {
-        "/dav/spaces/sid/".to_owned()
-    } else {
-        format!("/dav/spaces/sid/{path}")
-    };
+/// WebDAV base path of the OpenCloud test space.
+const OC_BASE: &str = "/dav/spaces/sid/";
+/// WebDAV base path of the Nextcloud test user's file tree.
+const NC_BASE: &str = "/remote.php/dav/files/alice/";
+
+/// One `<D:response>` of a PROPFIND multistatus body below `base`.
+fn response_xml_at(
+    base: &str,
+    path: &str,
+    is_dir: bool,
+    etag: Option<&str>,
+    size: Option<u64>,
+) -> String {
+    let href = format!("{base}{path}");
     let resourcetype = if is_dir {
         "<D:resourcetype><D:collection/></D:resourcetype>"
     } else {
@@ -50,11 +59,21 @@ fn response_xml(path: &str, is_dir: bool, etag: Option<&str>, size: Option<u64>)
     )
 }
 
+/// One `<D:response>` of the OpenCloud test space.
+fn response_xml(path: &str, is_dir: bool, etag: Option<&str>, size: Option<u64>) -> String {
+    response_xml_at(OC_BASE, path, is_dir, etag, size)
+}
+
 /// A full multistatus body; `(path, is_dir, etag, size)` per response.
 fn multistatus(responses: &[(&str, bool, Option<&str>, Option<u64>)]) -> String {
+    multistatus_at(OC_BASE, responses)
+}
+
+/// A full multistatus body below `base`.
+fn multistatus_at(base: &str, responses: &[(&str, bool, Option<&str>, Option<u64>)]) -> String {
     let body = responses
         .iter()
-        .map(|(path, is_dir, etag, size)| response_xml(path, *is_dir, *etag, *size))
+        .map(|(path, is_dir, etag, size)| response_xml_at(base, path, *is_dir, *etag, *size))
         .collect::<Vec<_>>()
         .join("\n");
     format!(
@@ -71,15 +90,21 @@ async fn mount_propfind(
     depth: &str,
     responses: &[(&str, bool, Option<&str>, Option<u64>)],
 ) {
-    let url = if dav_path.is_empty() {
-        "/dav/spaces/sid/".to_owned()
-    } else {
-        format!("/dav/spaces/sid/{dav_path}")
-    };
+    mount_propfind_at(server, OC_BASE, dav_path, depth, responses).await;
+}
+
+/// Like [`mount_propfind`], below `base`.
+async fn mount_propfind_at(
+    server: &MockServer,
+    base: &str,
+    dav_path: &str,
+    depth: &str,
+    responses: &[(&str, bool, Option<&str>, Option<u64>)],
+) {
     Mock::given(method("PROPFIND"))
-        .and(path(url))
+        .and(path(format!("{base}{dav_path}")))
         .and(header("Depth", depth))
-        .respond_with(ResponseTemplate::new(207).set_body_string(multistatus(responses)))
+        .respond_with(ResponseTemplate::new(207).set_body_string(multistatus_at(base, responses)))
         .mount(server)
         .await;
 }
@@ -150,6 +175,11 @@ impl Setup {
     fn engine(&self, options: EngineOptions) -> Engine {
         let dav =
             WebDavClient::new(&self.server.uri(), "sid", StaticToken::new("tok")).expect("client");
+        self.engine_with(Arc::new(dav), options)
+    }
+
+    /// Starts the engine over the job with the given storage.
+    fn engine_with(&self, storage: Arc<dyn RemoteStorage>, options: EngineOptions) -> Engine {
         let db = StatusDb::open(&self.db_path).expect("db");
         let job = Job::new(
             "job-1",
@@ -157,7 +187,7 @@ impl Setup {
             &self.include,
             &self.exclude,
             self.root_files,
-            dav,
+            storage,
             db,
         )
         .expect("job");
@@ -177,18 +207,7 @@ impl Setup {
                 max_attempts: 1,
                 ..RetryConfig::immediate()
             });
-        let db = StatusDb::open(&self.db_path).expect("db");
-        let job = Job::new(
-            "job-1",
-            &self.root,
-            &self.include,
-            &self.exclude,
-            self.root_files,
-            dav,
-            db,
-        )
-        .expect("job");
-        Engine::start(vec![job], options).expect("engine")
+        self.engine_with(Arc::new(dav), options)
     }
 }
 
@@ -639,7 +658,7 @@ async fn server_error_on_folder_listing_freezes_it_and_syncs_the_rest() {
         &f.include,
         &f.exclude,
         f.root_files,
-        dav,
+        std::sync::Arc::new(dav),
         db,
     )
     .expect("job");
@@ -2785,5 +2804,103 @@ async fn case_only_name_collisions_are_frozen_on_case_folding_filesystems() {
         // A case-sensitive filesystem holds both files.
         assert_eq!(summary.downloads, 2);
     }
+    engine.stop().await;
+}
+
+// --- Nextcloud ------------------------------------------------------------
+
+/// The same engine against a Nextcloud user's file tree: downloads a
+/// remote file, uploads a new local one in chunks (v2), and records the
+/// assembled file's ETag — the sync logic is provider-independent.
+#[tokio::test]
+async fn nextcloud_file_tree_syncs_with_chunked_uploads() {
+    let f = fixture(&[], &[]).await;
+    std::fs::write(f.root.join("lokal.bin"), b"0123456789").expect("write");
+    mount_propfind_at(
+        &f.server,
+        NC_BASE,
+        "",
+        "0",
+        &[("", true, Some("\"root-1\""), None)],
+    )
+    .await;
+    mount_propfind_at(
+        &f.server,
+        NC_BASE,
+        "",
+        "1",
+        &[
+            ("", true, Some("\"root-1\""), None),
+            ("remote.txt", false, Some("\"r1\""), Some(3)),
+        ],
+    )
+    .await;
+    // The new local file does not exist remotely yet.
+    Mock::given(method("PROPFIND"))
+        .and(path(format!("{NC_BASE}lokal.bin")))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&f.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{NC_BASE}remote.txt")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("ETag", "\"r1\"")
+                .set_body_bytes(b"abc".to_vec()),
+        )
+        .expect(1)
+        .mount(&f.server)
+        .await;
+    Mock::given(method("MKCOL"))
+        .and(path_regex(
+            r"^/remote\.php/dav/uploads/alice/oc-sync-[0-9a-f]{16}/?$",
+        ))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/remote\.php/dav/uploads/alice/oc-sync-[0-9a-f]{16}/[0-9]+$",
+        ))
+        .and(header("OC-Total-Length", "10"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(3)
+        .mount(&f.server)
+        .await;
+    Mock::given(method("MOVE"))
+        .and(path_regex(
+            r"^/remote\.php/dav/uploads/alice/oc-sync-[0-9a-f]{16}/\.file$",
+        ))
+        .and(header(
+            "Destination",
+            format!("{}{NC_BASE}lokal.bin", f.server.uri()).as_str(),
+        ))
+        // A new file must not overwrite one created concurrently.
+        .and(header("Overwrite", "F"))
+        .respond_with(ResponseTemplate::new(201).insert_header("OC-ETag", "\"n1\""))
+        .expect(1)
+        .mount(&f.server)
+        .await;
+
+    let storage = NextcloudStorage::new(&f.server.uri(), "alice", StaticToken::new("tok"))
+        .expect("storage")
+        .with_retry(RetryConfig::immediate())
+        .with_chunking(ChunkingConfig {
+            threshold: 4,
+            chunk_size: 4,
+        });
+    let mut engine = f.engine_with(Arc::new(storage), test_options());
+    let (summary, events) = next_run(&mut engine).await;
+    assert_eq!(summary.errors, 0, "{events:?}");
+    assert_eq!(summary.downloads, 1);
+    assert_eq!(summary.uploads, 1);
+    assert_eq!(
+        std::fs::read(f.root.join("remote.txt")).expect("read"),
+        b"abc"
+    );
+    let db = open_db(&f.db_path);
+    let entry = db.get_entry("lokal.bin").expect("db").expect("entry");
+    assert_eq!(entry.entry.remote_etag.as_deref(), Some("\"n1\""));
     engine.stop().await;
 }

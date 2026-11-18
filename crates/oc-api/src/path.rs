@@ -3,10 +3,11 @@
 //! normalization for comparing local and remote names.
 
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use unicode_normalization::UnicodeNormalization;
 use url::Url;
 
 use crate::error::ApiError;
+
+pub(crate) use oc_storage::normalize_nfc;
 
 /// Characters that must not appear unencoded in a single path segment:
 /// everything outside the RFC 3986 `pchar` set (unreserved, sub-delims,
@@ -28,12 +29,6 @@ const SEGMENT_ENCODE: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'|')
     .add(b'}');
-
-/// NFC-normalizes text (file and folder names from local and remote
-/// sources, so both sides compare equal regardless of decomposition).
-pub fn normalize_nfc(input: &str) -> String {
-    input.nfc().collect()
-}
 
 /// Percent-encodes a single path segment.
 pub(crate) fn encode_segment(segment: &str) -> String {
@@ -78,7 +73,9 @@ pub(crate) fn href_to_path(base: &Url, href: &str) -> Result<String, ApiError> {
 /// Like [`href_to_path`], but keeps the server's spelling (no Unicode
 /// normalization) — the form that addresses the resource in requests.
 /// The href must lie below the space root on a segment boundary
-/// (`/dav/spaces/sid2/...` is not below `/dav/spaces/sid`).
+/// (`/dav/spaces/sid2/...` is not below `/dav/spaces/sid`). The prefix is
+/// compared after percent-decoding both sides, since servers encode
+/// characters differently (`'` vs. `%27`, `%c3` vs. `%C3`).
 pub(crate) fn href_to_server_path(base: &Url, href: &str) -> Result<String, ApiError> {
     let url = if href.contains("://") {
         Url::parse(href).map_err(|err| ApiError::invalid_url(href, err.to_string()))?
@@ -86,24 +83,27 @@ pub(crate) fn href_to_server_path(base: &Url, href: &str) -> Result<String, ApiE
         base.join(href)
             .map_err(|err| ApiError::invalid_url(href, err.to_string()))?
     };
-    let base_prefix = base.path().trim_end_matches('/');
-    let rest = url.path().strip_prefix(base_prefix).ok_or_else(|| {
+    let decode = |path: &str| {
+        percent_encoding::percent_decode_str(path)
+            .decode_utf8()
+            .map(|decoded| decoded.into_owned())
+            .map_err(|_| ApiError::protocol(format!("href '{href}' is not valid UTF-8")))
+    };
+    let base_path = decode(base.path())?;
+    let href_path = decode(url.path())?;
+    let outside = || {
         ApiError::protocol(format!(
             "href '{href}' does not lie below '{}'",
             base.as_str()
         ))
-    })?;
+    };
+    let rest = href_path
+        .strip_prefix(base_path.trim_end_matches('/'))
+        .ok_or_else(outside)?;
     if !(rest.is_empty() || rest.starts_with('/')) {
-        return Err(ApiError::protocol(format!(
-            "href '{href}' does not lie below '{}'",
-            base.as_str()
-        )));
+        return Err(outside());
     }
-    let rest = rest.trim_matches('/');
-    let decoded = percent_encoding::percent_decode_str(rest)
-        .decode_utf8()
-        .map_err(|_| ApiError::protocol(format!("href '{href}' is not valid UTF-8")))?;
-    Ok(decoded.into_owned())
+    Ok(rest.trim_matches('/').to_string())
 }
 
 #[cfg(test)]
@@ -176,6 +176,24 @@ mod tests {
         // A sibling space sharing the id as prefix is outside as well.
         let err = href_to_path(&base(), "/dav/spaces/sid2/file.txt").unwrap_err();
         assert!(matches!(err, ApiError::Protocol(_)));
+    }
+
+    #[test]
+    fn base_prefix_is_compared_decoded() {
+        // A user id the server encodes differently than `encode_segment`.
+        let base = Url::parse("https://nc.example.com/remote.php/dav/files/o'neil%40x/")
+            .expect("base url");
+        assert_eq!(
+            href_to_server_path(&base, "/remote.php/dav/files/o%27neil%40x/Ordner/a%20b.txt")
+                .expect("decoded prefix"),
+            "Ordner/a b.txt"
+        );
+        assert_eq!(
+            href_to_server_path(&base, "/remote.php/dav/files/o'neil@x/").expect("root"),
+            ""
+        );
+        let other = href_to_server_path(&base, "/remote.php/dav/files/o'neil@xy/a");
+        assert!(matches!(other, Err(ApiError::Protocol(_))));
     }
 
     #[test]

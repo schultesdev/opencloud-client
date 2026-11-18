@@ -45,10 +45,9 @@ use egui::Grid;
 use egui::ScrollArea;
 use egui::TopBottomPanel;
 use egui::ViewportCommand;
-use oc_api::Space;
-use oc_auth::{AuthClient, KeyringStore, TokenManager};
 use oc_config::{Account, Config, ConflictPolicy, Jobs, LogLevel, Settings, SyncJob};
 use oc_db::{Conflict, ConflictResolution, Stats, db_path};
+use oc_storage::StorageRoot;
 use oc_sync::EngineEvent;
 use oc_sync::JobCommand;
 use oc_sync::RunProgress;
@@ -94,7 +93,7 @@ struct AccountUi {
     /// A logout is in flight.
     logout_pending: bool,
     /// Loaded spaces (for the account's quota display).
-    spaces: Option<Result<Vec<Space>, String>>,
+    spaces: Option<Result<Vec<StorageRoot>, String>>,
     /// A spaces request is in flight.
     spaces_pending: bool,
 }
@@ -137,6 +136,8 @@ impl JobUi {
 struct NewAccountForm {
     /// Chosen account id.
     id: String,
+    /// The kind of server.
+    provider: oc_config::ProviderKind,
     /// Server URL.
     server_url: String,
     /// User name.
@@ -821,11 +822,51 @@ pub fn run(config_dir: Option<&Path>) -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
-/// Whether a refresh token is stored for the account (keyring).
+/// How the syncable roots of an account are called in the UI: OpenCloud
+/// has spaces, a Nextcloud account has one storage (the user's files).
+#[derive(Debug, Clone, Copy)]
+struct RootTerms {
+    /// Singular, e.g. for the wizard step.
+    one: &'static str,
+    /// Plural, e.g. for section labels and messages.
+    many: &'static str,
+}
+
+impl RootTerms {
+    /// The terms of a provider.
+    fn of(kind: oc_config::ProviderKind) -> Self {
+        match kind {
+            oc_config::ProviderKind::OpenCloud => Self {
+                one: "Space",
+                many: "Spaces",
+            },
+            oc_config::ProviderKind::Nextcloud => Self {
+                one: "Speicher",
+                many: "Speicher",
+            },
+        }
+    }
+}
+
+impl SyncApp {
+    /// The root terms of an account (OpenCloud terms for unknown ids).
+    fn root_terms(&self, account_id: &str) -> RootTerms {
+        let kind = self
+            .config
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .map(|account| account.provider)
+            .unwrap_or_default();
+        RootTerms::of(kind)
+    }
+}
+
+/// Whether a login is stored for the account (keyring only; a throwaway
+/// provider, the backend keeps its own shared instances).
 fn stored_login(account: &Account) -> Option<bool> {
-    let auth = AuthClient::new(&account.server_url).ok()?;
-    let manager = TokenManager::new(auth, KeyringStore::new(), &account.id);
-    Some(manager.has_stored_login())
+    let provider = crate::provider::create(account).ok()?;
+    Some(provider.has_stored_login())
 }
 
 /// A fresh, unused job id (`job-1`, `job-2`, ...); ids already in
@@ -955,12 +996,12 @@ fn pattern_editor(ui: &mut egui::Ui, patterns: &mut Vec<String>, input: &mut Str
 /// One space as three grid cells: name, type chip, quota bar (empty
 /// cell when the server reports no quota, e.g. for the virtual shares
 /// space).
-fn space_row(ui: &mut egui::Ui, space: &Space) {
+fn space_row(ui: &mut egui::Ui, space: &StorageRoot) {
     let theme = theme::palette();
     ui.label(egui::RichText::new(&space.name).strong().color(theme.text));
     theme::chip(theme.card_stroke).show(ui, |ui| {
         ui.label(
-            egui::RichText::new(&space.drive_type)
+            egui::RichText::new(&space.kind)
                 .small()
                 .color(theme.text_dim),
         );

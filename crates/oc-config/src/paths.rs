@@ -12,7 +12,7 @@ pub const CONFIG_FILE: &str = "config.json";
 pub const JOBS_FILE: &str = "jobs.json";
 
 /// Current schema version of both configuration files.
-pub const CONFIG_VERSION: u64 = 1;
+pub const CONFIG_VERSION: u64 = 2;
 
 /// Returns the per-OS config directory:
 ///

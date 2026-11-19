@@ -14,6 +14,32 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (Phase 11 — schneller Abgleich großer Ordnerbäume)
+
+- **Unveränderte Teilbäume werden nicht mehr abgefragt**: Ein Ordner,
+  dessen Server-ETag seit dem letzten Lauf gleich geblieben ist und dessen
+  Inhalt damals vollständig abgeglichen wurde, wird beim Remote-Scan nicht
+  mehr gelistet; sein Inhalt kommt aus der Statusdatenbank. Bisher wurde
+  jeder Ordner bei jedem Lauf per PROPFIND abgefragt, sobald der
+  Root-ETag-Shortcut nicht griff — und der greift nach Läufen mit
+  dauerhaften Einzelfehlern (z. B. Namen, die sich nur in der
+  Groß-/Kleinschreibung unterscheiden) nie. Bei zehntausenden Ordnern
+  dauerte so jeder Lauf über eine Stunde. Ordner rund um fehlgeschlagene,
+  eingefrorene oder konfliktbehaftete Pfade werden weiterhin jedes Mal
+  gelistet. Nach Filteränderungen und spätestens alle 24 Stunden listet
+  ein Lauf wieder alle Ordner (Sicherheitsnetz für Speicher, die
+  ETag-Änderungen nicht nach oben weitergeben).
+- **Parallele Ordnerabfragen**: Der Remote-Scan liest bis zu
+  `settings.max_parallel_listings` Ordner gleichzeitig (Standard 6,
+  1–16, in den Einstellungen als „Parallele Ordnerabfragen“). Mit einer
+  PROPFIND-Pause (`propfind_pause_ms` > 0) bleibt er seriell.
+- **Watcher-Auslöser werden zusammengefasst**: Lokale Änderungen während
+  eines laufenden Abgleichs führen zu genau einem Folgelauf statt zu
+  einem Lauf pro Änderungsschub.
+- Die Abschlusszeile eines Laufs im Log nennt die gelisteten und die
+  übersprungenen Ordner.
+- Statusdatenbank: Schema v4 (neue Spalte `entries.subtree_etag`).
+
 ### Added (Phase 10 — Nextcloud als zweiter Storage-Provider)
 
 - **Nextcloud-Konten**: Neben OpenCloud lassen sich Nextcloud-Server als

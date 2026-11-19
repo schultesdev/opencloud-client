@@ -15,6 +15,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use notify::Event;
+use notify::EventKind;
 use notify::RecommendedWatcher;
 use notify::RecursiveMode;
 use notify::Watcher;
@@ -79,6 +80,7 @@ fn watch_loop(
     trigger: UnboundedSender<()>,
 ) {
     while let Ok(Ok(event)) = rx.recv() {
+        eprintln!("DBG watch event at {:?}: {:#?}", std::time::Instant::now(), event);
         if !relevant(&event) {
             continue;
         }
@@ -89,6 +91,7 @@ fn watch_loop(
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
+        eprintln!("DBG trigger sent at {:?}", std::time::Instant::now());
         if trigger.send(()).is_err() {
             return;
         }
@@ -96,8 +99,12 @@ fn watch_loop(
 }
 
 /// Whether an event is worth a sync run: anything that touches a path
-/// other than a `.part` temp file.
+/// other than a `.part` temp file. Pure reads (the engine's own
+/// directory scans) change nothing and must not trigger a pass.
 fn relevant(event: &Event) -> bool {
+    if matches!(event.kind, EventKind::Access(_)) {
+        return false;
+    }
     event
         .paths
         .iter()

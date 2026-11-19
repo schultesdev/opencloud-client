@@ -35,7 +35,7 @@ use crate::filter::Filter;
 use crate::progress::RunProgress;
 use crate::progress::RunTracker;
 use crate::progress::TransferDirection;
-use crate::scan::{self, LocalNode, RemoteNode, ServerNames};
+use crate::scan::{self, LocalNode, RemoteNode, RemoteScanOptions, ServerNames};
 use crate::transfer::{self, LocalGuard, TransferPaths, TransferResult};
 use crate::watch::LocalWatcher;
 
@@ -111,6 +111,18 @@ pub struct EngineOptions {
     /// Pause between two folder PROPFINDs of the remote scan — the
     /// server-load throttle (`propfind_pause_ms`); zero disables it.
     pub propfind_pause: Duration,
+    /// How many folder listings a remote scan runs at the same time
+    /// (`max_parallel_listings`); a non-zero `propfind_pause` makes the
+    /// scan serial regardless.
+    pub remote_scan_concurrency: usize,
+    /// Whether the remote scan skips folders whose ETag matches the
+    /// verified subtree ETag recorded by an earlier pass (their contents
+    /// are then taken from the database).
+    pub subtree_etag_pruning: bool,
+    /// Maximum age of the verified subtree ETags: after this long a pass
+    /// forgets them and lists every folder again (a safety net for
+    /// server mounts that do not propagate ETag changes upwards).
+    pub full_remote_scan_interval: Duration,
     /// Delay before the first retry after a connectivity failure; the
     /// offline backoff doubles from here.
     pub offline_backoff_base: Duration,
@@ -135,6 +147,9 @@ impl Default for EngineOptions {
             root_etag_shortcut: true,
             conflict_policy: ConflictPolicy::default(),
             propfind_pause: Duration::ZERO,
+            remote_scan_concurrency: 6,
+            subtree_etag_pruning: true,
+            full_remote_scan_interval: Duration::from_secs(24 * 60 * 60),
             offline_backoff_base: Duration::from_secs(10),
             offline_backoff_cap: Duration::from_secs(60),
             progress_interval: Duration::from_millis(200),
@@ -339,6 +354,11 @@ pub struct RunSummary {
     pub errors: usize,
     /// Whether the remote scan was skipped (unchanged root ETag).
     pub remote_scan_skipped: bool,
+    /// Folders the remote scan listed.
+    pub folders_listed: usize,
+    /// Folders the remote scan skipped because their subtree was
+    /// verifiably unchanged.
+    pub folders_skipped: usize,
 }
 
 impl fmt::Display for RunSummary {
@@ -355,6 +375,13 @@ impl fmt::Display for RunSummary {
         )?;
         if self.auto_resolved > 0 {
             write!(f, ", {} auto-resolved", self.auto_resolved)?;
+        }
+        if self.folders_listed + self.folders_skipped > 0 {
+            write!(
+                f,
+                "; remote scan: {} folders listed, {} unchanged skipped",
+                self.folders_listed, self.folders_skipped
+            )?;
         }
         Ok(())
     }
@@ -515,6 +542,11 @@ async fn job_loop(
         if pending && (!paused || forced) && tokio::time::Instant::now() >= next_attempt {
             pending = false;
             forced = false;
+            eprintln!("DBG pass start at {:?}", std::time::Instant::now());
+            // The pass scans the whole tree: watcher triggers queued so
+            // far are covered by it. Only triggers arriving while it runs
+            // ask for (exactly one) follow-up pass.
+            while triggers.try_recv().is_ok() {}
             let _ = events.send(EngineEvent::RunStarted {
                 job_id: job.id.clone(),
             });
@@ -564,9 +596,11 @@ async fn job_loop(
                 }
             }
             trigger = triggers.recv() => {
+                eprintln!("DBG trigger woke");
                 if trigger.is_some() && !paused {
                     pending = true;
                 }
+                while triggers.try_recv().is_ok() {}
             }
             // Wake for the next offline retry attempt.
             _ = tokio::time::sleep_until(next_attempt), if pending && (!paused || forced) => {}
@@ -594,6 +628,10 @@ async fn job_loop(
         job_id: job.id.clone(),
     });
 }
+
+/// The folders a remote traversal listed (with the ETag their parent's
+/// listing reported) and the ones it pruned.
+type TraversedFolders = (Vec<(String, Option<String>)>, Vec<String>);
 
 /// A queued transfer: whether it is an upload, its path, and the running
 /// task.
@@ -633,6 +671,10 @@ struct PassFailures<'a> {
     errors: usize,
     /// The first throttling error seen, if any.
     throttled: Option<SyncError>,
+    /// Paths the pass did not bring in line with the server: failures,
+    /// conflicts, kept local edits. No verified subtree ETag is stored
+    /// for folders above or below them (`""` stands for the whole tree).
+    unsettled: HashSet<String>,
 }
 
 impl<'a> PassFailures<'a> {
@@ -642,7 +684,14 @@ impl<'a> PassFailures<'a> {
             events,
             errors: 0,
             throttled: None,
+            unsettled: HashSet::new(),
         }
+    }
+
+    /// Marks a path as not settled by this pass without counting an
+    /// error (conflicts, kept local edits).
+    fn unsettle(&mut self, path: &str) {
+        self.unsettled.insert(path.to_owned());
     }
 
     /// Records one failed path: counts it, emits the event, and notes
@@ -659,6 +708,7 @@ impl<'a> PassFailures<'a> {
             };
         }
         self.errors += 1;
+        self.unsettle(path);
         let _ = self.events.send(EngineEvent::Failed {
             job_id: self.job_id.to_owned(),
             path: path.to_owned(),
@@ -771,6 +821,9 @@ async fn run_once(
         && stored_etag == root_etag
         && !filter_changed;
 
+    // The folders a traversal listed or pruned; `None` when the shortcut
+    // skipped it (then there is nothing new to vouch for).
+    let mut traversed: Option<TraversedFolders> = None;
     let (remote, names, checksums, remote_unreadable) = if skip_remote {
         summary.remote_scan_skipped = true;
         let names = db_lock(&job.db).server_names().unwrap_or_default();
@@ -781,6 +834,24 @@ async fn run_once(
             Vec::new(),
         )
     } else {
+        let known = if options.subtree_etag_pruning {
+            match usable_subtree_etags(job, options, &db_entries, now) {
+                Ok(known) => known,
+                Err(error) => {
+                    // Without trustworthy bookkeeping the pass lists
+                    // everything and records nothing new.
+                    failures.fail("", &SyncError::from(error));
+                    HashMap::new()
+                }
+            }
+        } else {
+            HashMap::new()
+        };
+        let scan_options = RemoteScanOptions {
+            pause: options.propfind_pause,
+            concurrency: options.remote_scan_concurrency,
+            known,
+        };
         let listing = match job.storage.list("").await {
             Ok(listing) => listing,
             Err(error) => {
@@ -793,14 +864,36 @@ async fn run_once(
             job.storage.as_ref(),
             &job.filter,
             &listing,
-            options.propfind_pause,
+            &scan_options,
         )
         .await
         {
-            Ok(snapshot) => {
+            Ok(mut snapshot) => {
+                summary.folders_listed = snapshot.listed.len();
+                summary.folders_skipped = snapshot.pruned.len();
+                if !snapshot.pruned.is_empty() {
+                    // Pruned subtrees are known from the database, their
+                    // server spellings from the recorded names.
+                    let pruned: HashSet<&str> =
+                        snapshot.pruned.iter().map(String::as_str).collect();
+                    for (path, entry) in &db_entries {
+                        if strict_ancestors(path).any(|parent| pruned.contains(parent)) {
+                            snapshot
+                                .entries
+                                .insert(path.clone(), remote_node_from_db(entry));
+                        }
+                    }
+                    let stored = db_lock(&job.db).server_names().unwrap_or_default();
+                    for (path, server_path) in stored {
+                        if strict_ancestors(&path).any(|parent| pruned.contains(parent)) {
+                            snapshot.server_names.insert(path, server_path);
+                        }
+                    }
+                }
                 if let Err(error) = db_lock(&job.db).replace_server_names(&snapshot.server_names) {
                     failures.fail("", &SyncError::from(error));
                 }
+                traversed = Some((snapshot.listed, snapshot.pruned));
                 (
                     snapshot.entries,
                     snapshot.server_names,
@@ -1041,6 +1134,7 @@ async fn run_once(
                 local,
                 remote,
             } => {
+                failures.unsettle(&path);
                 let sighting = ConflictSighting {
                     path,
                     local,
@@ -1119,6 +1213,7 @@ async fn run_once(
                 }
             }
             Ok(TransferResult::PreconditionFailed) => {
+                failures.unsettle(&path);
                 // The remote side changed while we uploaded: conflict,
                 // with the server's current state as its remote half.
                 // That lookup must succeed — a failed one (throttling,
@@ -1162,6 +1257,7 @@ async fn run_once(
                 // next pass sees both sides changed and records a
                 // conflict. Reset the transfer state for that pass.
                 let _ = mark_state(&job.db, &path, EntryState::Synced);
+                failures.unsettle(&path);
                 rescan_needed = true;
             }
             Err(error) => {
@@ -1199,6 +1295,17 @@ async fn run_once(
     };
     if let Err(error) = sig_result {
         failures.fail("", &SyncError::from(error));
+    }
+    // Folders whose subtree the database now records exactly as listed
+    // get their ETag as verified subtree ETag; a throttled pass left part
+    // of its plan unapplied and records nothing.
+    if let Some((listed, pruned)) = traversed.filter(|_| failures.throttled.is_none()) {
+        let mut unsettled = std::mem::take(&mut failures.unsettled);
+        unsettled.extend(frozen.iter().cloned());
+        let updates = subtree_etag_updates(listed, pruned, &unsettled);
+        if let Err(error) = db_lock(&job.db).set_subtree_etags(&updates) {
+            failures.fail("", &SyncError::from(error));
+        }
     }
     if let Err(error) = db_lock(&job.db).set_last_sync(now) {
         failures.fail("", &SyncError::from(error));
@@ -1476,17 +1583,112 @@ fn remove_empty_local_dir(root: &std::path::Path, rel: &str) -> bool {
 fn remote_from_db(db_entries: &HashMap<String, NewEntry>) -> HashMap<String, RemoteNode> {
     db_entries
         .iter()
-        .map(|(path, entry)| {
-            (
-                path.clone(),
-                RemoteNode {
-                    is_dir: entry.is_dir,
-                    etag: entry.remote_etag.clone(),
-                    size: entry.remote_size,
-                },
-            )
-        })
+        .map(|(path, entry)| (path.clone(), remote_node_from_db(entry)))
         .collect()
+}
+
+/// The remote state of one path as the database recorded it.
+fn remote_node_from_db(entry: &NewEntry) -> RemoteNode {
+    RemoteNode {
+        is_dir: entry.is_dir,
+        etag: entry.remote_etag.clone(),
+        size: entry.remote_size,
+    }
+}
+
+/// The ancestor folders of a space-relative path, nearest first; the
+/// root (`""`) is not included.
+fn strict_ancestors(path: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(path.rsplit_once('/').map(|(parent, _)| parent), |current| {
+        current.rsplit_once('/').map(|(parent, _)| parent)
+    })
+}
+
+/// `meta` key: filter signature the verified subtree ETags belong to.
+const SUBTREE_FILTER_SIG: &str = "subtree_filter_sig";
+/// `meta` key: when the verified subtree ETags were last reset (unix
+/// seconds); every recorded value is younger.
+const FULL_SCAN_AT: &str = "full_scan_at";
+
+/// The verified subtree ETags the remote scan of this pass may prune
+/// with. They are dropped — and the pass lists every folder — when the
+/// filter changed since they were recorded (the database then covers a
+/// different tree) or when they are older than
+/// `full_remote_scan_interval`. Folders above entries left in a
+/// non-synced state (errors, conflicts) are always listed again.
+fn usable_subtree_etags(
+    job: &JobTask,
+    options: &EngineOptions,
+    db_entries: &HashMap<String, NewEntry>,
+    now: i64,
+) -> Result<HashMap<String, String>, oc_db::DbError> {
+    let db = db_lock(&job.db);
+    let signature = job.filter.signature();
+    let max_age = i64::try_from(options.full_remote_scan_interval.as_secs()).unwrap_or(i64::MAX);
+    let fresh = db
+        .meta(FULL_SCAN_AT)?
+        .and_then(|value| value.parse::<i64>().ok())
+        .is_some_and(|at| at <= now && now - at < max_age);
+    let same_filter = db.meta(SUBTREE_FILTER_SIG)?.as_deref() == Some(signature.as_str());
+    if fresh && same_filter {
+        let mut known = db.subtree_etags()?;
+        if !known.is_empty() {
+            for (path, entry) in db_entries {
+                if entry.state != EntryState::Synced {
+                    known.remove(path);
+                    for parent in strict_ancestors(path) {
+                        known.remove(parent);
+                    }
+                }
+            }
+        }
+        return Ok(known);
+    }
+    db.transaction(|db| {
+        db.clear_subtree_etags()?;
+        db.set_meta(SUBTREE_FILTER_SIG, &signature)?;
+        db.set_meta(FULL_SCAN_AT, &now.to_string())
+    })?;
+    Ok(HashMap::new())
+}
+
+/// The verified subtree ETag updates after a pass. A listed folder
+/// vouches for its subtree with the ETag its parent's listing reported,
+/// unless an unsettled path lies inside it, is the folder itself, or
+/// contains it (a frozen folder's children were not applied either).
+/// Pruned folders keep their value unless an unsettled path touches
+/// them; `""` among the unsettled paths blocks everything.
+fn subtree_etag_updates(
+    listed: Vec<(String, Option<String>)>,
+    pruned: Vec<String>,
+    unsettled: &HashSet<String>,
+) -> Vec<(String, Option<String>)> {
+    let everything = unsettled.contains("");
+    // The unsettled paths and all their ancestors.
+    let mut above: HashSet<&str> = HashSet::new();
+    for path in unsettled {
+        above.insert(path.as_str());
+        above.extend(strict_ancestors(path));
+    }
+    let blocked = |folder: &str| {
+        everything
+            || above.contains(folder)
+            || strict_ancestors(folder).any(|parent| unsettled.contains(parent))
+    };
+    let mut updates: Vec<(String, Option<String>)> = listed
+        .into_iter()
+        .map(|(path, etag)| {
+            let etag = etag.filter(|_| !blocked(&path));
+            (path, etag)
+        })
+        .collect();
+    updates.extend(
+        pruned
+            .into_iter()
+            .filter(|path| blocked(path))
+            .map(|path| (path, None)),
+    );
+    updates
 }
 
 /// The local state of a path, read from the filesystem after an
@@ -1780,4 +1982,58 @@ pub(crate) fn unix_now() -> i64 {
 /// A transfer's planned byte count; unknown sizes count as 0.
 fn planned_bytes(size: Option<i64>) -> u64 {
     size.map(|size| size.max(0) as u64).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn etag(value: &str) -> Option<String> {
+        Some(value.to_owned())
+    }
+
+    #[test]
+    fn strict_ancestors_walk_up_to_the_top_level() {
+        let parents: Vec<&str> = strict_ancestors("a/b/c.txt").collect();
+        assert_eq!(parents, ["a/b", "a"]);
+        assert_eq!(strict_ancestors("top").count(), 0);
+    }
+
+    #[test]
+    fn subtree_etags_skip_folders_around_unsettled_paths() {
+        let listed = vec![
+            ("a".to_owned(), etag("a1")),
+            ("a/b".to_owned(), etag("b1")),
+            ("a/b/c".to_owned(), etag("c1")),
+            ("a/other".to_owned(), etag("o1")),
+            ("z".to_owned(), etag("z1")),
+        ];
+        let pruned = vec!["a/kept".to_owned(), "q".to_owned()];
+        // `a/b` is frozen (e.g. a conflicted folder): neither its
+        // ancestors nor its descendants may vouch for their subtree.
+        let unsettled: HashSet<String> = ["a/b".to_owned()].into();
+        let updates: HashMap<_, _> = subtree_etag_updates(listed, pruned, &unsettled)
+            .into_iter()
+            .collect();
+        assert_eq!(updates["a"], None);
+        assert_eq!(updates["a/b"], None);
+        assert_eq!(updates["a/b/c"], None);
+        assert_eq!(updates["a/other"], etag("o1"));
+        assert_eq!(updates["z"], etag("z1"));
+        // Untouched pruned folders keep their recorded value.
+        assert!(!updates.contains_key("a/kept"));
+        assert!(!updates.contains_key("q"));
+    }
+
+    #[test]
+    fn a_tree_wide_failure_blocks_every_subtree_etag() {
+        let listed = vec![("a".to_owned(), etag("a1"))];
+        let pruned = vec!["q".to_owned()];
+        let unsettled: HashSet<String> = [String::new()].into();
+        let updates = subtree_etag_updates(listed, pruned, &unsettled);
+        assert_eq!(
+            updates,
+            vec![("a".to_owned(), None), ("q".to_owned(), None)]
+        );
+    }
 }

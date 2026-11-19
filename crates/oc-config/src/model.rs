@@ -18,6 +18,13 @@ fn default_max_parallel_transfers() -> u32 {
     DEFAULT_MAX_PARALLEL_TRANSFERS
 }
 
+/// Default number of folder listings a remote scan runs in parallel.
+pub const DEFAULT_MAX_PARALLEL_LISTINGS: u32 = 6;
+
+fn default_max_parallel_listings() -> u32 {
+    DEFAULT_MAX_PARALLEL_LISTINGS
+}
+
 fn default_propfind_pause_ms() -> u64 {
     0
 }
@@ -145,6 +152,10 @@ pub struct Settings {
     /// Maximum number of transfers (uploads/downloads) running in parallel.
     #[serde(default = "default_max_parallel_transfers")]
     pub max_parallel_transfers: u32,
+    /// Maximum number of folder listings (PROPFIND) a remote scan runs in
+    /// parallel; only applies while `propfind_pause_ms` is 0.
+    #[serde(default = "default_max_parallel_listings")]
+    pub max_parallel_listings: u32,
     /// Server-load throttle: pause in milliseconds between two folder
     /// PROPFINDs of a remote scan; 0 disables it.
     #[serde(default = "default_propfind_pause_ms")]
@@ -173,6 +184,7 @@ impl Default for Settings {
         Self {
             sync_interval_secs: DEFAULT_SYNC_INTERVAL_SECS,
             max_parallel_transfers: DEFAULT_MAX_PARALLEL_TRANSFERS,
+            max_parallel_listings: DEFAULT_MAX_PARALLEL_LISTINGS,
             propfind_pause_ms: 0,
             conflict_policy: ConflictPolicy::Ask,
             log_level: LogLevel::Info,
@@ -187,6 +199,8 @@ impl Default for Settings {
 pub const MAX_SYNC_INTERVAL_SECS: u64 = 86_400;
 /// Upper bound of `max_parallel_transfers`.
 pub const MAX_PARALLEL_TRANSFERS: u32 = 32;
+/// Upper bound of `max_parallel_listings`.
+pub const MAX_PARALLEL_LISTINGS: u32 = 16;
 /// Upper bound of `propfind_pause_ms` (ten seconds per folder).
 pub const MAX_PROPFIND_PAUSE_MS: u64 = 10_000;
 
@@ -203,6 +217,11 @@ impl Settings {
         if !(1..=MAX_PARALLEL_TRANSFERS).contains(&self.max_parallel_transfers) {
             return Err(ConfigError::invalid(format!(
                 "settings.max_parallel_transfers must be between 1 and {MAX_PARALLEL_TRANSFERS}"
+            )));
+        }
+        if !(1..=MAX_PARALLEL_LISTINGS).contains(&self.max_parallel_listings) {
+            return Err(ConfigError::invalid(format!(
+                "settings.max_parallel_listings must be between 1 and {MAX_PARALLEL_LISTINGS}"
             )));
         }
         if self.propfind_pause_ms > MAX_PROPFIND_PAUSE_MS {

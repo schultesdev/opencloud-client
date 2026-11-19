@@ -549,6 +549,7 @@ async fn run_headless(
         sync_interval: Duration::from_secs(config.settings.sync_interval_secs),
         max_parallel_transfers: config.settings.max_parallel_transfers as usize,
         propfind_pause: Duration::from_millis(config.settings.propfind_pause_ms),
+        remote_scan_concurrency: config.settings.max_parallel_listings as usize,
         conflict_policy: config.settings.conflict_policy,
         global_exclude: config.settings.global_exclude.clone(),
         ..oc_sync::EngineOptions::default()

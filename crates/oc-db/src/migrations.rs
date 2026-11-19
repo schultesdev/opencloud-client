@@ -5,7 +5,7 @@ use rusqlite::OptionalExtension;
 use rusqlite::TransactionBehavior;
 
 /// Highest schema version this build understands.
-pub const SCHEMA_VERSION: u64 = 3;
+pub const SCHEMA_VERSION: u64 = 4;
 
 /// All known migrations, ordered by target version. Each entry upgrades a
 /// database from `version - 1` to `version`.
@@ -78,6 +78,15 @@ const MIGRATIONS: &[(u64, &str)] = &[
           WHERE local_mtime IS NOT NULL;
         UPDATE conflicts SET local_mtime = local_mtime * 1000
           WHERE local_mtime IS NOT NULL;
+        "#,
+    ),
+    (
+        4,
+        r#"
+        -- Server ETag of a folder whose whole subtree the database records
+        -- exactly as the server had it (a remote scan may skip listing it
+        -- while the ETag still matches). NULL = unverified.
+        ALTER TABLE entries ADD COLUMN subtree_etag TEXT;
         "#,
     ),
 ];
@@ -187,6 +196,32 @@ mod tests {
         )
         .unwrap();
         assert!(migrate(&mut conn).is_err());
+    }
+
+    #[test]
+    fn v3_database_gains_an_empty_subtree_etag_column() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
+        for (_, sql) in &MIGRATIONS[..3] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO meta VALUES ('schema_version', '3');
+             INSERT INTO entries (path, is_dir, remote_etag, state)
+               VALUES ('docs', 1, '\"e1\"', 'synced');",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 4);
+        let subtree: Option<String> = conn
+            .query_row(
+                "SELECT subtree_etag FROM entries WHERE path = 'docs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(subtree, None);
     }
 
     #[test]

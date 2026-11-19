@@ -153,6 +153,7 @@ Jede Phase endet mit lauffähigem, testbarem Code (Commits pro Phase).
   "settings": {
     "sync_interval_secs": 30,
     "max_parallel_transfers": 4,
+    "max_parallel_listings": 6,
     "propfind_pause_ms": 0,
     "conflict_policy": "ask",
     "log_level": "info"
@@ -285,7 +286,8 @@ Remote geändert? = ETag != DB-Werte
       zusätzlicher Periodik-Scan (`sync_interval_secs`) als Fallback und für
       remote-Änderungen.
 - [x] **Remote-Änderungserkennung**: PROPFIND Depth:1 pro beobachtetem Ordner,
-      gestaffelt; Root-ETag als Shortcut. (Später Ausbaustufe: Server-Events
+      gestaffelt; Root-ETag als Shortcut, unveränderte Teilbäume per
+      Ordner-ETag übersprungen (Phase 11). (Später Ausbaustufe: Server-Events
       via Notifications-API statt Polling.)
 - [x] **Transfers**: Queue mit `max_parallel_transfers`, partielle Downloads
       (`Range`) mit `.part`-Tempdateien, atomares Umbenennen nach Abschluss,
@@ -358,7 +360,9 @@ Remote geändert? = ETag != DB-Werte
   OpenCloud bietet ihn, der Nutzen beschränkt sich aber auf Uploads
   jenseits mehrerer GB; Aufnahme als Ausbaustufe nach v1 (TUS-Client plus
   Fallback auf PUT nötig).
-- [x] Ratenlimit / Serverlast: PROPFINDs laufen strikt seriell pro Job;
+- [x] Ratenlimit / Serverlast: PROPFINDs laufen pro Job mit begrenzter
+  Parallelität (`settings.max_parallel_listings`, seit Phase 11; vorher
+  strikt seriell);
   `Retry-After` bei 429 wird bereits beachtet; zusätzlich ist eine Pause
   zwischen Ordner-PROPFINDs konfigurierbar (`settings.propfind_pause_ms`,
   Default 0).
@@ -445,6 +449,35 @@ Transfers und Konfliktbehandlung bleiben identisch und anbieterneutral.
 - [ ] **Manueller Test gegen echte Nextcloud** (z. B. Docker-Image
   `nextcloud`): Login/Logout, Erstsync, Datei > 50 MiB, Konflikt mit
   zweitem Client, parallel ein OpenCloud-Job.
+
+### Phase 11 — Schneller Abgleich großer Ordnerbäume
+
+Anlass: Ein Nextcloud-Job mit ~87 GB, 254.000 Dateien und 62.000 Ordnern
+brauchte pro Lauf 66–75 Minuten, auch ohne nennenswerte Änderungen. Die
+Zeit steckte nicht im Transfer, sondern im strikt seriellen Remote-Scan
+(ein PROPFIND pro Ordner, ~64 ms je Anfrage). Der Root-ETag-Shortcut
+griff nie, weil jeder Lauf dauerhafte Einzelfehler hatte (Kollisionen
+nur in Groß-/Kleinschreibung, vom Server abgelehnte Namen).
+
+- [x] **Teilbaum-ETags** (`oc-db` Schema v4, `entries.subtree_etag`):
+  Nach einem Lauf bekommt jeder gelistete Ordner den ETag aus dem
+  Listing seines Elternordners als „geprüften Teilbaum-ETag“ — aber nur,
+  wenn kein fehlgeschlagener, eingefrorener oder konfliktbehafteter Pfad
+  in ihm, über ihm oder er selbst ist. Nach gedrosselten Läufen wird
+  nichts gespeichert.
+- [x] **Pruning im Remote-Scan**: Meldet der Server für einen Ordner
+  denselben ETag, wird er nicht gelistet; der Inhalt (Einträge und
+  Servernamen) kommt aus der Datenbank. Ordner über Einträgen mit
+  Status ≠ `synced` werden immer gelistet.
+- [x] **Volltraversierung** nach Filteränderung (`meta.subtree_filter_sig`)
+  und spätestens nach 24 h (`meta.full_scan_at`).
+- [x] **Parallele Ordnerabfragen** (`settings.max_parallel_listings`,
+  Standard 6, 1–16); eine PROPFIND-Pause erzwingt weiterhin seriell.
+- [x] **Watcher-Auslöser zusammenfassen**: Auslöser aus der Zeit vor einem
+  Lauf deckt der Lauf ab; Auslöser während eines Laufs ergeben genau
+  einen Folgelauf.
+- [ ] **Manuelle Messung** am betroffenen Nextcloud-Job: zweiter Lauf
+  soll fast alle Ordner überspringen.
 
 ---
 

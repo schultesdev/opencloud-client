@@ -105,6 +105,39 @@ fn all_entries_returns_every_path_ordered() {
 }
 
 #[test]
+fn subtree_etags_survive_upserts_and_can_be_cleared() {
+    let db = StatusDb::open_in_memory().unwrap();
+    db.upsert_entry(&NewEntry::new("docs", true, EntryState::Synced))
+        .unwrap();
+    db.upsert_entry(&NewEntry::new("docs/a.txt", false, EntryState::Synced))
+        .unwrap();
+    db.upsert_entry(&NewEntry::new("pics", true, EntryState::Synced))
+        .unwrap();
+    db.set_subtree_etags(&[
+        ("docs".into(), Some("\"d1\"".into())),
+        ("pics".into(), Some("\"p1\"".into())),
+        // Files and unknown paths are ignored.
+        ("docs/a.txt".into(), Some("\"x\"".into())),
+        ("missing".into(), Some("\"x\"".into())),
+    ])
+    .unwrap();
+    let etags = db.subtree_etags().unwrap();
+    assert_eq!(etags.len(), 2);
+    assert_eq!(etags["docs"], "\"d1\"");
+
+    // A regular upsert of the folder keeps the verified subtree ETag.
+    db.upsert_entry(&NewEntry::new("docs", true, EntryState::Synced))
+        .unwrap();
+    assert_eq!(db.subtree_etags().unwrap()["docs"], "\"d1\"");
+
+    db.set_subtree_etags(&[("pics".into(), None)]).unwrap();
+    assert!(!db.subtree_etags().unwrap().contains_key("pics"));
+
+    db.clear_subtree_etags().unwrap();
+    assert!(db.subtree_etags().unwrap().is_empty());
+}
+
+#[test]
 fn delete_subtree_removes_only_the_prefix_tree() {
     let db = StatusDb::open_in_memory().unwrap();
     for (path, is_dir) in [

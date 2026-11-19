@@ -30,6 +30,16 @@ impl SyncApp {
                                     .range(1..=oc_config::MAX_PARALLEL_TRANSFERS),
                             );
                             ui.end_row();
+                            ui.label("Parallele Ordnerabfragen");
+                            ui.add(
+                                DragValue::new(&mut self.settings_edit.max_parallel_listings)
+                                    .range(1..=oc_config::MAX_PARALLEL_LISTINGS),
+                            )
+                            .on_hover_text(
+                                "Wie viele Ordner beim Abgleich gleichzeitig vom Server \
+                                 gelesen werden (gilt nur ohne PROPFIND-Pause).",
+                            );
+                            ui.end_row();
                             ui.label("Bei Konflikten");
                             ComboBox::from_id_salt("conflict-policy")
                                 .selected_text(conflict_policy_label(

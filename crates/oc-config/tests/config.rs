@@ -42,6 +42,7 @@ fn sample_config() -> Config {
         settings: Settings {
             sync_interval_secs: 45,
             max_parallel_transfers: 8,
+            max_parallel_listings: 3,
             propfind_pause_ms: 250,
             conflict_policy: ConflictPolicy::KeepLocal,
             log_level: LogLevel::Debug,
@@ -324,6 +325,12 @@ fn settings_upper_bounds_are_enforced() {
     config.settings.sync_interval_secs = oc_config::MAX_SYNC_INTERVAL_SECS + 1;
     assert!(config.validate().is_err());
     config.settings.sync_interval_secs = 60;
+    config.settings.max_parallel_listings = 0;
+    assert!(config.validate().is_err());
+    config.settings.max_parallel_listings = oc_config::MAX_PARALLEL_LISTINGS + 1;
+    assert!(config.validate().is_err());
+    config.settings.max_parallel_listings = oc_config::MAX_PARALLEL_LISTINGS;
+    assert!(config.validate().is_ok());
     config.settings.propfind_pause_ms = oc_config::MAX_PROPFIND_PAUSE_MS + 1;
     assert!(config.validate().is_err());
     config.settings.propfind_pause_ms = 0;

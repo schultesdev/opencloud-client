@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::SystemTime;
 
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use oc_storage::{Listing, RemoteEntry, RemoteStorage, StorageError, normalize_nfc};
 
 use crate::error::SyncError;
@@ -67,6 +69,28 @@ pub struct RemoteSnapshot {
     /// error. Their state is unknown: the engine freezes them (and
     /// everything below) for the pass and keeps syncing the rest.
     pub unreadable: Vec<(String, SyncError)>,
+    /// Folders this scan listed, with the ETag their parent's listing
+    /// reported for them — the value that may later vouch for the
+    /// folder's subtree (see [`RemoteScanOptions::known`]).
+    pub listed: Vec<(String, Option<String>)>,
+    /// Folders the scan did not list because their ETag still matched
+    /// the verified subtree ETag: their contents are taken from the
+    /// database. Only the folders themselves are in [`Self::entries`].
+    pub pruned: Vec<String>,
+}
+
+/// How a remote scan traverses the tree.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteScanOptions {
+    /// Pause slept before each folder listing — the server-load throttle
+    /// (`propfind_pause_ms`). A non-zero pause also makes the scan serial.
+    pub pause: Duration,
+    /// How many folder listings may run at the same time (at least one).
+    pub concurrency: usize,
+    /// Verified subtree ETags (folder path → ETag): a folder reported
+    /// with exactly this ETag is not listed (see
+    /// [`RemoteSnapshot::pruned`]).
+    pub known: HashMap<String, String>,
 }
 
 /// Maps normalized (NFC) paths — the keys of scans, diff, and database —
@@ -227,11 +251,12 @@ pub fn remove_part_files(root: &Path) -> Result<(), SyncError> {
     Ok(())
 }
 
-/// Traverses the remote tree level by level (one listing per folder,
-/// strictly serially to keep the server load bounded), starting from an
-/// already-fetched root listing. Traversal stops at folders
-/// outside the filter. `pause` is slept between two folder listings —
-/// the configurable server-load throttle (`propfind_pause_ms`).
+/// Traverses the remote tree, starting from an already-fetched root
+/// listing: one listing per folder, at most `options.concurrency` at a
+/// time (serially while a `pause` is configured). Traversal stops at
+/// folders outside the filter, and at folders whose ETag matches their
+/// verified subtree ETag in `options.known` — their contents are then
+/// known from the database ([`RemoteSnapshot::pruned`]).
 /// Folders whose listing fails with a server error (5xx) are recorded
 /// in [`RemoteSnapshot::unreadable`] instead of aborting the scan;
 /// everything else (network, auth, protocol) is fatal as before.
@@ -239,23 +264,41 @@ pub async fn scan_remote_from_root(
     storage: &dyn RemoteStorage,
     filter: &Filter,
     root_listing: &Listing,
-    pause: Duration,
+    options: &RemoteScanOptions,
 ) -> Result<RemoteSnapshot, SyncError> {
     let mut snapshot = RemoteSnapshot {
         root_etag: root_listing.dir.etag.clone(),
         ..RemoteSnapshot::default()
     };
+    let concurrency = if options.pause.is_zero() {
+        options.concurrency.max(1)
+    } else {
+        1
+    };
     // Folders to list, by their server path (for the request) and their
     // normalized path (for reporting), see `ServerNames`.
     let mut pending: VecDeque<(String, String)> = VecDeque::new();
     for entry in &root_listing.children {
-        add_remote_child(entry, filter, &mut snapshot, &mut pending);
+        add_remote_child(entry, filter, &options.known, &mut snapshot, &mut pending);
     }
-    while let Some((dir, path)) = pending.pop_front() {
-        if !pause.is_zero() {
-            tokio::time::sleep(pause).await;
+    let mut in_flight = FuturesUnordered::new();
+    loop {
+        while in_flight.len() < concurrency {
+            let Some((dir, path)) = pending.pop_front() else {
+                break;
+            };
+            if !options.pause.is_zero() {
+                tokio::time::sleep(options.pause).await;
+            }
+            in_flight.push(async move {
+                let result = storage.list(&dir).await;
+                (path, result)
+            });
         }
-        let listing = match storage.list(&dir).await {
+        let Some((path, result)) = in_flight.next().await else {
+            break;
+        };
+        let listing = match result {
             Ok(listing) => listing,
             // The folder vanished between the parent listing and this
             // request: its contents are gone; keep syncing the rest.
@@ -272,17 +315,20 @@ pub async fn scan_remote_from_root(
             Err(source) => return Err(source.into()),
         };
         for entry in &listing.children {
-            add_remote_child(entry, filter, &mut snapshot, &mut pending);
+            add_remote_child(entry, filter, &options.known, &mut snapshot, &mut pending);
         }
     }
+    // Listings complete in any order; keep the reports deterministic.
+    snapshot.unreadable.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(snapshot)
 }
 
 /// Records one listed child if it passes the filter; folders are queued
-/// for traversal.
+/// for traversal unless their verified subtree ETag still matches.
 fn add_remote_child(
     resource: &RemoteEntry,
     filter: &Filter,
+    known: &HashMap<String, String>,
     snapshot: &mut RemoteSnapshot,
     pending: &mut VecDeque<(String, String)>,
 ) {
@@ -296,7 +342,18 @@ fn add_remote_child(
     }
     let node = RemoteNode::from_entry(resource);
     if node.is_dir {
-        pending.push_back((resource.server_path.clone(), resource.path.clone()));
+        let unchanged = node
+            .etag
+            .as_ref()
+            .is_some_and(|etag| known.get(&resource.path) == Some(etag));
+        if unchanged {
+            snapshot.pruned.push(resource.path.clone());
+        } else {
+            snapshot
+                .listed
+                .push((resource.path.clone(), node.etag.clone()));
+            pending.push_back((resource.server_path.clone(), resource.path.clone()));
+        }
     } else if let Some(sha1) = &resource.sha1 {
         snapshot
             .checksums

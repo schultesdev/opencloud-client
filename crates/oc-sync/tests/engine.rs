@@ -128,6 +128,11 @@ fn test_options() -> EngineOptions {
         root_etag_shortcut: false,
         conflict_policy: ConflictPolicy::Ask,
         propfind_pause: Duration::ZERO,
+        remote_scan_concurrency: 1,
+        // Like the root-ETag shortcut, pruning is off by default here:
+        // most fixtures change files without touching folder ETags.
+        subtree_etag_pruning: false,
+        full_remote_scan_interval: Duration::from_secs(24 * 60 * 60),
         offline_backoff_base: Duration::from_millis(100),
         offline_backoff_cap: Duration::from_millis(400),
         // Every progress report becomes an event, so tests can assert on
@@ -1451,6 +1456,279 @@ async fn unchanged_root_etag_skips_the_remote_scan() {
     assert!(second.remote_scan_skipped);
     assert_eq!(second.uploads, 1);
     assert_eq!(second.errors, 0);
+    engine.stop().await;
+}
+
+// --- Subtree-ETag pruning ---------------------------------------------------
+
+/// Options with subtree pruning and a few parallel listings.
+fn pruning_options() -> EngineOptions {
+    let mut options = test_options();
+    options.subtree_etag_pruning = true;
+    options.remote_scan_concurrency = 4;
+    options
+}
+
+/// Mounts a folder listing that must be requested exactly `times` times.
+async fn expect_listing(
+    server: &MockServer,
+    dav_path: &str,
+    responses: &[(&str, bool, Option<&str>, Option<u64>)],
+    times: u64,
+) {
+    Mock::given(method("PROPFIND"))
+        .and(path(format!("{OC_BASE}{dav_path}")))
+        .and(header("Depth", "1"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(multistatus(responses)))
+        .expect(times)
+        .mount(server)
+        .await;
+}
+
+/// The two-branch tree of the pruning tests: `x/f.txt` and
+/// `y/sub/g.txt`, with the given ETags for `y`, `y/sub`, and `g.txt`.
+async fn mount_pruning_tree(server: &MockServer, y: &str, sub: &str, g: &str, times: [u64; 3]) {
+    mount_propfind(server, "", "0", ROOT_ZERO).await;
+    mount_propfind(
+        server,
+        "",
+        "1",
+        &[
+            ("", true, Some("\"root-1\""), None),
+            ("x", true, Some("\"x1\""), None),
+            ("y", true, Some(y), None),
+        ],
+    )
+    .await;
+    expect_listing(
+        server,
+        "x",
+        &[
+            ("x", true, Some("\"x1\""), None),
+            ("x/f.txt", false, Some("\"f1\""), Some(3)),
+        ],
+        times[0],
+    )
+    .await;
+    expect_listing(
+        server,
+        "y",
+        &[("y", true, Some(y), None), ("y/sub", true, Some(sub), None)],
+        times[1],
+    )
+    .await;
+    expect_listing(
+        server,
+        "y/sub",
+        &[
+            ("y/sub", true, Some(sub), None),
+            ("y/sub/g.txt", false, Some(g), Some(4)),
+        ],
+        times[2],
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/x/f.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("fff"))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/y/sub/g.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("gggg")
+                .append_header("ETag", g),
+        )
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn unchanged_subtrees_are_not_listed_again() {
+    let f = fixture(&[], &[]).await;
+    mount_pruning_tree(&f.server, "\"y1\"", "\"s1\"", "\"g1\"", [1, 1, 1]).await;
+
+    // First pass: full traversal, everything downloaded and verified.
+    let mut engine = f.engine(pruning_options());
+    let (first, events) = next_run(&mut engine).await;
+    assert_eq!(first.errors, 0, "events: {events:?}");
+    assert_eq!(first.downloads, 2);
+    assert_eq!((first.folders_listed, first.folders_skipped), (3, 0));
+    f.server.verify().await;
+
+    // Second pass: the server is unchanged — no folder is listed, and
+    // the pruned subtrees still count as present (nothing is deleted).
+    f.server.reset().await;
+    mount_pruning_tree(&f.server, "\"y1\"", "\"s1\"", "\"g1\"", [0, 0, 0]).await;
+    engine
+        .send("job-1", JobCommand::SyncNow)
+        .await
+        .expect("send");
+    let (second, events) = next_run(&mut engine).await;
+    assert_eq!(second.errors, 0, "events: {events:?}");
+    assert_eq!((second.downloads, second.deletes), (0, 0));
+    assert_eq!((second.folders_listed, second.folders_skipped), (0, 2));
+    assert!(f.root.join("x/f.txt").exists());
+    assert!(f.root.join("y/sub/g.txt").exists());
+    f.server.verify().await;
+
+    // Third pass: a file deep in `y` changed, so `y` and `y/sub` report
+    // new ETags. Only that branch is listed; `x` stays pruned.
+    f.server.reset().await;
+    mount_pruning_tree(&f.server, "\"y2\"", "\"s2\"", "\"g2\"", [0, 1, 1]).await;
+    engine
+        .send("job-1", JobCommand::SyncNow)
+        .await
+        .expect("send");
+    let (third, events) = next_run(&mut engine).await;
+    assert_eq!(third.errors, 0, "events: {events:?}");
+    assert_eq!(third.downloads, 1);
+    assert_eq!((third.folders_listed, third.folders_skipped), (2, 1));
+    f.server.verify().await;
+    let entry = open_db(&f.db_path)
+        .get_entry("y/sub/g.txt")
+        .expect("db")
+        .expect("entry");
+    assert_eq!(entry.entry.remote_etag.as_deref(), Some("\"g2\""));
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn failed_download_keeps_its_folder_unverified() {
+    let f = fixture(&[], &[]).await;
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    mount_propfind(
+        &f.server,
+        "",
+        "1",
+        &[
+            ("", true, Some("\"root-1\""), None),
+            ("x", true, Some("\"x1\""), None),
+        ],
+    )
+    .await;
+    expect_listing(
+        &f.server,
+        "x",
+        &[
+            ("x", true, Some("\"x1\""), None),
+            ("x/f.txt", false, Some("\"f1\""), Some(3)),
+        ],
+        2,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/dav/spaces/sid/x/f.txt"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&f.server)
+        .await;
+
+    let mut engine = f.engine(pruning_options());
+    let (first, _) = next_run(&mut engine).await;
+    assert_eq!(first.errors, 1);
+    assert!(open_db(&f.db_path).subtree_etags().expect("db").is_empty());
+
+    // The folder is listed again, so the download is retried.
+    engine
+        .send("job-1", JobCommand::SyncNow)
+        .await
+        .expect("send");
+    let (second, _) = next_run(&mut engine).await;
+    assert_eq!(second.errors, 1);
+    assert_eq!((second.folders_listed, second.folders_skipped), (1, 0));
+    f.server.verify().await;
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn expired_subtree_etags_force_a_full_traversal() {
+    let f = fixture(&[], &[]).await;
+    mount_pruning_tree(&f.server, "\"y1\"", "\"s1\"", "\"g1\"", [2, 2, 2]).await;
+
+    let mut options = pruning_options();
+    options.full_remote_scan_interval = Duration::ZERO;
+    let mut engine = f.engine(options);
+    let (first, _) = next_run(&mut engine).await;
+    assert_eq!(first.errors, 0);
+    engine
+        .send("job-1", JobCommand::SyncNow)
+        .await
+        .expect("send");
+    let (second, _) = next_run(&mut engine).await;
+    assert_eq!(second.errors, 0);
+    assert_eq!((second.folders_listed, second.folders_skipped), (3, 0));
+    f.server.verify().await;
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn changed_filter_forces_a_full_traversal() {
+    let mut f = fixture(&[], &[]).await;
+    mount_pruning_tree(&f.server, "\"y1\"", "\"s1\"", "\"g1\"", [2, 2, 2]).await;
+
+    let mut engine = f.engine(pruning_options());
+    let (first, _) = next_run(&mut engine).await;
+    assert_eq!(first.errors, 0);
+    engine.stop().await;
+
+    // A new exclude pattern changes the covered tree: the recorded
+    // subtree ETags no longer vouch for it.
+    f.exclude = vec!["*.tmp".to_owned()];
+    let mut engine = f.engine(pruning_options());
+    let (second, _) = next_run(&mut engine).await;
+    assert_eq!(second.errors, 0);
+    assert_eq!((second.folders_listed, second.folders_skipped), (3, 0));
+    f.server.verify().await;
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn watcher_triggers_during_a_pass_cause_one_follow_up_pass() {
+    let mut options = test_options();
+    options.watch = true;
+    options.debounce = Duration::from_millis(100);
+    let f = fixture(&[], &[]).await;
+
+    // A slow root listing keeps each pass busy for a while.
+    mount_propfind(&f.server, "", "0", ROOT_ZERO).await;
+    Mock::given(method("PROPFIND"))
+        .and(path(OC_BASE))
+        .and(header("Depth", "1"))
+        .respond_with(
+            ResponseTemplate::new(207)
+                .set_body_string(multistatus(&[("", true, Some("\"root-1\""), None)]))
+                .set_delay(Duration::from_millis(1500)),
+        )
+        .mount(&f.server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(201).append_header("ETag", "\"p1\""))
+        .expect(3)
+        .mount(&f.server)
+        .await;
+
+    let mut engine = f.engine(options);
+    // Several separate change bursts while the first pass waits.
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        std::fs::write(f.root.join(name), name).expect("write");
+    }
+    let (first, _) = next_run(&mut engine).await;
+    assert_eq!(first.errors, 0);
+    let (second, _) = next_run(&mut engine).await;
+    assert_eq!(second.uploads, 3);
+
+    // No further pass follows: the queued triggers were coalesced.
+    let extra = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(EngineEvent::RunStarted { .. }) = engine.events_mut().recv().await {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(extra.is_err(), "an extra pass ran");
+    f.server.verify().await;
     engine.stop().await;
 }
 

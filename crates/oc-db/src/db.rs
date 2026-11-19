@@ -165,7 +165,8 @@ impl StatusDb {
                     "DELETE FROM entries;
                      DELETE FROM conflicts;
                      DELETE FROM server_names;
-                     DELETE FROM meta WHERE key IN ('space_etag', 'filter_sig', 'last_sync');",
+                     DELETE FROM meta WHERE key IN ('space_etag', 'filter_sig', 'last_sync',
+                                                    'subtree_filter_sig', 'full_scan_at');",
                 )?;
                 true
             }
@@ -214,6 +215,47 @@ impl StatusDb {
                 entry.last_synced_at,
                 entry.state.as_str(),
             ],
+        )?;
+        Ok(())
+    }
+
+    /// The verified subtree ETags of folders (path → ETag): folders whose
+    /// whole subtree the database records exactly as the server had it
+    /// when its listing carried that ETag. A remote scan may skip listing
+    /// such a folder while the server still reports the same ETag.
+    pub fn subtree_etags(&self) -> Result<std::collections::HashMap<String, String>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, subtree_etag FROM entries
+             WHERE is_dir = 1 AND subtree_etag IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Sets (`Some`) or clears (`None`) the verified subtree ETag of each
+    /// listed folder, in one transaction. Paths without an entry are
+    /// skipped. Entry upserts never touch this column.
+    pub fn set_subtree_etags(&self, updates: &[(String, Option<String>)]) -> Result<(), DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut update =
+                tx.prepare("UPDATE entries SET subtree_etag = ?2 WHERE path = ?1 AND is_dir = 1")?;
+            for (path, etag) in updates {
+                update.execute(params![path, etag])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Forgets every verified subtree ETag (the next remote scan lists
+    /// every folder again).
+    pub fn clear_subtree_etags(&self) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE entries SET subtree_etag = NULL WHERE subtree_etag IS NOT NULL",
+            [],
         )?;
         Ok(())
     }

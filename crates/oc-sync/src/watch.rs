@@ -80,7 +80,11 @@ fn watch_loop(
     trigger: UnboundedSender<()>,
 ) {
     while let Ok(Ok(event)) = rx.recv() {
-        eprintln!("DBG watch event at {:?}: {:#?}", std::time::Instant::now(), event);
+        eprintln!(
+            "DBG watch event at {:?}: {:#?}",
+            std::time::Instant::now(),
+            event
+        );
         if !relevant(&event) {
             continue;
         }

@@ -14,6 +14,32 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-20
+
+### Fixed
+
+- **Dauerlast durch Watcher-Schleife**: Bis v0.1.3 lösten die Leseereignisse
+  des eigenen lokalen Scans (Ordner öffnen/lesen) den Dateisystem-Watcher
+  erneut aus — ein Job lief so etwa jede Sekunde, die CPU war permanent
+  belastet. Der Access-Filter aus Phase 11 behebt das; ein
+  Regressionstest sichert es jetzt ab. Zusätzlich sind die übrig gebliebenen
+  `DBG`-Ausgaben in Watcher und Job-Schleife entfernt, die jedes
+  Dateisystem-Ereignis formatiert auf stderr geschrieben haben.
+- **Watcher beachtet die Filter des Jobs**: Änderungen in ausgeschlossenen
+  oder nicht ausgewählten Ordnern (`exclude`, `global_exclude`,
+  `include`), etwa Build-Ausgaben in `target/`, lösen keinen Lauf mehr aus.
+- **Weniger Watches unter Linux**: Statt den ganzen lokalen Ordner
+  rekursiv zu beobachten, bekommt nur noch jeder abgedeckte Ordner einen
+  eigenen inotify-Watch; ausgeschlossene Teilbäume kosten weder Watches
+  noch Ereignisse. Neue, verschobene und umbenannte Ordner werden
+  nachgeführt. macOS/Windows beobachten weiter rekursiv und filtern nur.
+- **Überlauf der Ereignis-Warteschlange**: Gehen Ereignisse verloren
+  (inotify-Queue-Overflow), baut der Watcher seine Watches neu auf und
+  stößt einen Lauf an — höchstens einmal pro Minute, damit ein vom eigenen
+  Scan verursachter Überlauf keine neue Dauerschleife erzeugt.
+
+## [0.2.0] und früher
+
 ### CI
 
 - Fedora-Verifikation in der Pipeline: Ein neuer CI-Job baut die `.rpm`

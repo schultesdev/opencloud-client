@@ -417,7 +417,12 @@ impl Engine {
             // the other jobs from starting: the job falls back to the
             // periodic scan, and the failure is reported.
             let watcher = if options.watch {
-                match LocalWatcher::start(job.local_root.clone(), options.debounce, trigger_tx) {
+                match LocalWatcher::start(
+                    job.local_root.clone(),
+                    job.filter.clone(),
+                    options.debounce,
+                    trigger_tx,
+                ) {
                     Ok(watcher) => Some(watcher),
                     Err(error) => {
                         let _ = event_tx.send(EngineEvent::Failed {
@@ -542,7 +547,6 @@ async fn job_loop(
         if pending && (!paused || forced) && tokio::time::Instant::now() >= next_attempt {
             pending = false;
             forced = false;
-            eprintln!("DBG pass start at {:?}", std::time::Instant::now());
             // The pass scans the whole tree: watcher triggers queued so
             // far are covered by it. Only triggers arriving while it runs
             // ask for (exactly one) follow-up pass.
@@ -596,7 +600,6 @@ async fn job_loop(
                 }
             }
             trigger = triggers.recv() => {
-                eprintln!("DBG trigger woke");
                 if trigger.is_some() && !paused {
                     pending = true;
                 }

@@ -50,6 +50,13 @@ jobs:
       - name: Install build dependencies
         run: |
           dnf install -y git curl gcc pkgconf-pkg-config gtk3-devel libxdo-devel
+      # rustup statt dnf-cargo: rust-toolchain.toml (stable) wird nur von
+      # rustup beachtet, und der MSRV (1.99) liegt über Fedoras Distro-Rust.
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSfL https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary

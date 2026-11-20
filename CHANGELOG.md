@@ -14,6 +14,13 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### CI
+
+- Fedora-Verifikation in der Pipeline: Ein neuer CI-Job baut die `.rpm`
+  (nfpm) in einem Fedora-Container und installiert sie, damit
+  Abhängigkeitsauflösung und Paketlayout gegen Fedora geprüft werden und
+  nicht erst beim Endanwender auffallen.
+
 ### Changed (Phase 11 — schneller Abgleich großer Ordnerbäume)
 
 - **Unveränderte Teilbäume werden nicht mehr abgefragt**: Ein Ordner,

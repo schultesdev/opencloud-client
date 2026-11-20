@@ -42,6 +42,33 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
 
+  fedora:
+    name: fedora (rpm build + install)
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y git curl gcc pkgconf-pkg-config gtk3-devel libxdo-devel
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release -p oc-app --locked
+      - name: Build .rpm
+        run: |
+          curl -sSfL https://github.com/goreleaser/nfpm/releases/download/v2.40.0/nfpm_2.40.0_Linux_x86_64.tar.gz \
+            | tar -xz -C /tmp nfpm
+          /tmp/nfpm package -f packaging/nfpm.yaml -p rpm -t dist/OpenCloud-Sync.rpm
+      # Smoke test: the RPM must install against a clean Fedora and the
+      # binary must start (links gtk3, libxdo etc. from the base image).
+      - name: Install .rpm
+        run: |
+          dnf install -y dist/OpenCloud-Sync.rpm
+      - name: Smoke test
+        run: |
+          test -x /usr/bin/opencloud-sync
+          opencloud-sync --version
+
   build-test:
     name: build + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

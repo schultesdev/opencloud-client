@@ -4,7 +4,7 @@ platform: linux
 version: "${VERSION}"
 section: net
 priority: optional
-maintainer: Gregor Schulte <mail@schultes.dev>
+maintainer: Gregor Schulte <gregor@schultes.dev>
 description: |
   Cross-platform sync client for OpenCloud: synchronize any number of
   folders with OpenCloud spaces, with a GUI, tray icon, conflict

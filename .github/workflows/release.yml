@@ -132,6 +132,12 @@ jobs:
             exit 1
           fi
           target/release/opencloud-sync --version
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux-rpm-package
+          path: dist/*.rpm
+          if-no-files-found: error
 
   macos:
     name: macOS (universal .dmg)

@@ -6,7 +6,9 @@
 //! Only events on paths the job's [`Filter`] covers count: changes in
 //! excluded or non-included folders (build output, `.git`, …) and on
 //! `.part` transfer temp files (the engine's own downloads) are ignored,
-//! as are pure reads (the engine's own directory scans).
+//! as are pure reads (the engine's own directory scans). Bare modifies on
+//! folders — what Windows reports for a watched folder whenever a child
+//! inside it is added, renamed or removed — count neither.
 //!
 //! With inotify (Linux) the watcher does not watch the whole tree
 //! recursively but each covered folder on its own, so excluded subtrees
@@ -159,6 +161,22 @@ impl Scope {
         }
     }
 
+    /// Whether an event of `kind` at `path` can matter to a sync pass.
+    /// Windows reports the parent folder of a created, renamed or removed
+    /// child as a bare modify (`ReadDirectoryChangesW` cannot say what
+    /// changed); that must not count even when the folder is covered —
+    /// the child's own event does the counting.
+    fn counts(&self, kind: &EventKind, path: &Path) -> bool {
+        if matches!(
+            kind,
+            EventKind::Modify(ModifyKind::Any | ModifyKind::Metadata(_))
+        ) && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        {
+            return false;
+        }
+        self.covers(path)
+    }
+
     /// Whether `path` is an existing, covered folder (not a symlink).
     fn covers_dir(&self, path: &Path) -> bool {
         let is_dir = std::fs::symlink_metadata(path)
@@ -300,7 +318,10 @@ impl Burst {
             return false;
         }
         let restructure = watches.restructures(scope, &event);
-        let relevant = event.paths.iter().any(|path| scope.covers(path));
+        let relevant = event
+            .paths
+            .iter()
+            .any(|path| scope.counts(&event.kind, path));
         self.restructure |= restructure;
         self.relevant |= relevant;
         relevant || restructure

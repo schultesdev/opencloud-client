@@ -405,6 +405,14 @@ mod tests {
         let _watcher = LocalWatcher::start(dir.path(), Filter::everything(), DEBOUNCE, tx).unwrap();
 
         // What a scan does: list directories, stat and read files.
+        // A preliminary wait for the backend's initial event window lets
+        // FSEvents replay the setup writes above before the read phase
+        // starts — so what passes below can no longer come from them.
+        #[cfg(target_os = "macos")]
+        assert!(
+            !triggered(&mut rx).await,
+            "the setup writes must have triggered once"
+        );
         for _ in 0..5 {
             for entry in std::fs::read_dir(dir.path().join("sub")).unwrap() {
                 let path = entry.unwrap().path();
@@ -415,18 +423,22 @@ mod tests {
         }
         // Pure reads are invisible to every backend: notify never subscribes
         // last-access changes, and Windows' bare metadata modifies on
-        // folders are filtered out (see `Scope::counts`). What remains on
-        // Windows in this window is external processes — antivirus on
-        // shared CI runners touching the freshly created temp files — and
-        // reacting to those is correct sync behavior (they are
-        // indistinguishable from real writes). So the silence is asserted
-        // on Unix only; elsewhere an external trigger is consumed.
-        #[cfg(unix)]
+        // folders are filtered out (see `Scope::counts`). What remains in
+        // this window are external processes — antivirus on shared CI
+        // runners touching the freshly created temp files — and reacting
+        // to those is correct sync behavior (they are indistinguishable
+        // from real writes). Plus a startup quirk of FSEvents (macOS): a
+        // stream created with `kFSEventStreamEventIdSinceNow` can still
+        // replay events coalesced from just before the stream started —
+        // the setup writes above. So the silence is asserted on Linux
+        // only; elsewhere such a trigger is consumed before the writes
+        // are compared.
+        #[cfg(all(unix, not(target_os = "macos")))]
         assert!(
             !triggered(&mut rx).await,
             "pure reads must not trigger a sync pass"
         );
-        #[cfg(not(unix))]
+        #[cfg(any(not(unix), target_os = "macos"))]
         triggered(&mut rx).await;
 
         std::fs::write(dir.path().join("sub/new.txt"), b"y").unwrap();

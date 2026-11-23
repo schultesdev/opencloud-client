@@ -15,7 +15,7 @@ env:
 
 jobs:
   linux:
-    name: Linux (deb, rpm, AppImage)
+    name: Linux (deb, AppImage)
     # 22.04 keeps the glibc baseline low; the gtk3 of 22.04 is fine.
     runs-on: ubuntu-22.04
     steps:
@@ -31,12 +31,16 @@ jobs:
           curl -sSfL https://github.com/goreleaser/nfpm/releases/download/v2.40.0/nfpm_2.40.0_Linux_x86_64.tar.gz \
             | tar -xz -C /tmp nfpm
           /tmp/nfpm --version
-      - name: Build .deb and .rpm
+      # Only the .deb is packaged here. The .rpm must come from a Fedora
+      # build (see the linux-rpm job): Fedora 45+ ships xdotool 4 with
+      # libxdo.so.4, while Ubuntu 22.04 links libxdo.so.3 — a binary built
+      # here would fail on Fedora with "cannot open shared object file:
+      # libxdo.so.3".
+      - name: Build .deb
         run: |
           export VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p dist
           /tmp/nfpm package -f packaging/nfpm.yaml -p deb -t "dist/OpenCloud-Sync-${VERSION}-linux-amd64.deb"
-          /tmp/nfpm package -f packaging/nfpm.yaml -p rpm -t "dist/OpenCloud-Sync-${VERSION}-linux-amd64.rpm"
       # The AppImage bundles GTK via linuxdeploy's gtk plugin. It is the
       # most fragile leg of packaging; a failure must not keep the other
       # artifacts from releasing, so it may skip without failing the job.
@@ -74,9 +78,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: linux-packages
-          path: |
-            dist/*.deb
-            dist/*.rpm
+          path: dist/*.deb
           if-no-files-found: error
       - name: Upload AppImage
         if: steps.appimage.outcome == 'success'
@@ -85,6 +87,51 @@ jobs:
           name: linux-appimage
           path: dist/*.AppImage
           if-no-files-found: error
+
+  linux-rpm:
+    name: Linux .rpm (Fedora)
+    # The RPM is built inside a Fedora container so the binary links
+    # against the libxdo soname Fedora actually ships. Ubuntu 22.04 links
+    # libxdo.so.3, while Fedora 45+ only provides libxdo.so.4 — a binary
+    # built on Ubuntu would not start on Fedora. Same pattern as the
+    # fedora job in ci.yml.
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install build dependencies
+        run: dnf install -y git curl gcc pkgconf-pkg-config gtk3-devel libxdo-devel
+      # rustup statt dnf-cargo: rust-toolchain.toml (stable) wird nur von
+      # rustup beachtet, und der MSRV (1.99) liegt über Fedoras Distro-Rust.
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSfL https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release -p oc-app --locked
+      - name: Install nfpm
+        run: |
+          curl -sSfL https://github.com/goreleaser/nfpm/releases/download/v2.40.0/nfpm_2.40.0_Linux_x86_64.tar.gz \
+            | tar -xz -C /tmp nfpm
+          /tmp/nfpm --version
+      - name: Build .rpm
+        run: |
+          export VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          /tmp/nfpm package -f packaging/nfpm.yaml -p rpm -t "dist/OpenCloud-Sync-${VERSION}-linux-amd64.rpm"
+      # Smoke test: the built binary must resolve every shared library of
+      # this distro image, in particular the libxdo soname, before the
+      # artifact is uploaded.
+      - name: Smoke test (ldd)
+        run: |
+          test -x target/release/opencloud-sync
+          if ldd target/release/opencloud-sync | grep -q "not found"; then
+            ldd target/release/opencloud-sync
+            exit 1
+          fi
+          target/release/opencloud-sync --version
 
   macos:
     name: macOS (universal .dmg)
@@ -209,7 +256,7 @@ jobs:
 
   release:
     name: Publish GitHub release
-    needs: [linux, macos, windows]
+    needs: [linux, linux-rpm, macos, windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
